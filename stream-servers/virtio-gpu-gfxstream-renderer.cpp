@@ -156,6 +156,8 @@ extern "C" {
 using android::base::AutoLock;
 using android::base::Lock;
 using android::emulation::HostmemIdMapping;
+using emugl::ABORT_REASON_OTHER;
+using emugl::FatalError;
 
 using VirglResId = uint32_t;
 
@@ -187,6 +189,7 @@ struct PipeResEntry {
     uint64_t hvaSize;
     uint64_t hvaId;
     uint32_t hvSlot;
+    uint32_t caching;
 };
 
 static inline uint32_t align_up(uint32_t n, uint32_t a) {
@@ -1360,7 +1363,7 @@ public:
             mResourceContexts[resId] = ids;
         } else {
             auto& ids = contextsIt->second;
-            auto idIt = std::find(ids.begin(), ids.end(), resId);
+            auto idIt = std::find(ids.begin(), ids.end(), ctxId);
             if (idIt == ids.end())
                 ids.push_back(ctxId);
         }
@@ -1464,6 +1467,7 @@ public:
         e.hva = entry.hva;
         e.hvaSize = entry.size;
         e.args.width = entry.size;
+        e.caching = entry.caching;
         e.hvaId = hvaId;
         e.hvSlot = 0;
         e.iov = nullptr;
@@ -1473,22 +1477,6 @@ public:
 
         AutoLock lock(mLock);
         mResources[res_handle] = e;
-    }
-
-    uint64_t getResourceHva(uint32_t res_handle) {
-        AutoLock lock(mLock);
-        auto it = mResources.find(res_handle);
-        if (it == mResources.end()) return 0;
-        const auto& entry = it->second;
-        return entry.hva;
-    }
-
-    uint64_t getResourceHvaSize(uint32_t res_handle) {
-        AutoLock lock(mLock);
-        auto it = mResources.find(res_handle);
-        if (it == mResources.end()) return 0;
-        const auto& entry = it->second;
-        return entry.hvaSize;
     }
 
     int resourceMap(uint32_t res_handle, void** hvaOut, uint64_t* sizeOut) {
@@ -1529,22 +1517,6 @@ public:
         return 0;
     }
 
-    void setResourceHvSlot(uint32_t res_handle, uint32_t slot) {
-        AutoLock lock(mLock);
-        auto it = mResources.find(res_handle);
-        if (it == mResources.end()) return;
-        auto& entry = it->second;
-        entry.hvSlot = slot;
-    }
-
-    uint32_t getResourceHvSlot(uint32_t res_handle) {
-        AutoLock lock(mLock);
-        auto it = mResources.find(res_handle);
-        if (it == mResources.end()) return 0;
-        const auto& entry = it->second;
-        return entry.hvSlot;
-    }
-
     int platformImportResource(int res_handle, int res_type, void* resource) {
         AutoLock lock(mLock);
         auto it = mResources.find(res_handle);
@@ -1570,6 +1542,16 @@ public:
     int platformDestroySharedEglContext(void* context) {
         bool success = mVirtioGpuOps->platform_destroy_shared_egl_context(context);
         return success ? 0 : -1;
+    }
+
+    int resourceMapInfo(uint32_t res_handle, uint32_t *map_info) {
+        AutoLock lock(mLock);
+        auto it = mResources.find(res_handle);
+        if (it == mResources.end()) return -1;
+
+        const auto& entry = it->second;
+        *map_info = entry.caching;
+        return 0;
     }
 
 private:
@@ -1792,20 +1774,18 @@ VG_EXPORT void stream_renderer_resource_create_v2(
     sRenderer()->createResourceV2(res_handle, hvaId);
 }
 
-VG_EXPORT uint64_t stream_renderer_resource_get_hva(uint32_t res_handle) {
-    return sRenderer()->getResourceHva(res_handle);
+VG_EXPORT int stream_renderer_create_blob(uint32_t ctx_id, uint32_t res_handle,
+                                          const struct stream_renderer_create_blob* create_blob,
+                                          const struct iovec* iovecs, uint32_t num_iovs,
+                                          const struct stream_renderer_handle* handle) {
+    sRenderer()->createResourceV2(res_handle, create_blob->blob_id);
+    return 0;
 }
 
-VG_EXPORT uint64_t stream_renderer_resource_get_hva_size(uint32_t res_handle) {
-    return sRenderer()->getResourceHvaSize(res_handle);
-}
-
-VG_EXPORT void stream_renderer_resource_set_hv_slot(uint32_t res_handle, uint32_t slot) {
-    sRenderer()->setResourceHvSlot(res_handle, slot);
-}
-
-VG_EXPORT uint32_t stream_renderer_resource_get_hv_slot(uint32_t res_handle) {
-    return sRenderer()->getResourceHvSlot(res_handle);
+VG_EXPORT int stream_renderer_export_blob(uint32_t res_handle,
+                                          struct stream_renderer_handle* handle) {
+    // Unimplemented for now.
+    return -EINVAL;
 }
 
 VG_EXPORT int stream_renderer_resource_map(uint32_t res_handle, void** hvaOut, uint64_t* sizeOut) {
@@ -1836,6 +1816,10 @@ VG_EXPORT void* stream_renderer_platform_create_shared_egl_context() {
 
 VG_EXPORT int stream_renderer_platform_destroy_shared_egl_context(void* context) {
     return sRenderer()->platformDestroySharedEglContext(context);
+}
+
+VG_EXPORT int stream_renderer_resource_map_info(uint32_t res_handle, uint32_t *map_info) {
+    return sRenderer()->resourceMapInfo(res_handle, map_info);
 }
 
 #define VIRGLRENDERER_API_PIPE_STRUCT_DEF(api) pipe_##api,

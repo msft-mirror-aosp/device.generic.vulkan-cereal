@@ -972,11 +972,6 @@ const GLvoid* GLEScontext::setPointer(GLenum arrType,GLint size,GLenum type,GLsi
     return data;
 }
 
-GLint GLEScontext::getUnpackAlignment() {
-    return android::base::findOrDefault(m_glPixelStoreiList,
-            GL_UNPACK_ALIGNMENT, 4);
-}
-
 void GLEScontext::enableArr(GLenum arr,bool enable) {
     auto vertexAttrib = m_currVaoState.find(arr);
     if (vertexAttrib != m_currVaoState.end()) {
@@ -1878,6 +1873,12 @@ void GLEScontext::initCapsLocked(const GLubyte * extensionString)
     if (feature_is_enabled(kFeature_S3tcTextureSupport)) {
         if (strstr(cstring, "GL_EXT_texture_compression_s3tc") != NULL) {
             s_glSupport.hasS3tcSupport = true;
+        }
+    }
+
+    if (feature_is_enabled(kFeature_RgtcTextureSupport)) {
+        if (strstr(cstring, "GL_EXT_texture_compression_rgtc") != NULL) {
+            s_glSupport.hasRgtcSupport = true;
         }
     }
 }

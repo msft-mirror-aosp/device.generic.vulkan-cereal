@@ -87,10 +87,43 @@ VG_EXPORT void stream_renderer_flush_resource_and_readback(
 
 VG_EXPORT void stream_renderer_resource_create_v2(
     uint32_t res_handle, uint64_t hvaId);
-VG_EXPORT uint64_t stream_renderer_resource_get_hva(uint32_t res_handle);
-VG_EXPORT uint64_t stream_renderer_resource_get_hva_size(uint32_t res_handle);
-VG_EXPORT void stream_renderer_resource_set_hv_slot(uint32_t res_handle, uint32_t slot);
-VG_EXPORT uint32_t stream_renderer_resource_get_hv_slot(uint32_t res_handle);
+
+#define STREAM_MEM_HANDLE_TYPE_OPAQUE_FD 0x1
+#define STREAM_MEM_HANDLE_TYPE_DMABUF 0x2
+#define STREAM_MEM_HANDLE_TYPE_OPAQUE_WIN32 0x3
+#define STREAM_MEM_HANDLE_TYPE_SHM 0x4
+#define STREAM_FENCE_HANDLE_TYPE_OPAQUE_FD 0x10
+#define STREAM_FENCE_HANDLE_TYPE_SYNC_FD 0x11
+#define STREAM_FENCE_HANDLE_TYPE_OPAQUE_WIN32 0x12
+struct stream_renderer_handle {
+    int64_t os_handle;
+    uint32_t handle_type;
+};
+
+struct stream_renderer_create_blob {
+    uint32_t blob_mem;
+    uint32_t blob_flags;
+    uint64_t blob_id;
+    uint64_t size;
+};
+
+#define STREAM_BLOB_MEM_GUEST 1
+#define STREAM_BLOB_MEM_HOST3D 2
+#define STREAM_BLOB_MEM_HOST3D_GUEST 3
+
+#define STREAM_BLOB_FLAG_USE_MAPPABLE 1
+#define STREAM_BLOB_FLAG_USE_SHAREABLE 2
+#define STREAM_BLOB_FLAG_USE_CROSS_DEVICE 4
+#define STREAM_BLOB_FLAG_CREATE_GUEST_HANDLE 8
+
+VG_EXPORT int stream_renderer_create_blob(uint32_t ctx_id, uint32_t res_handle,
+                                          const struct stream_renderer_create_blob *create_blob,
+                                          const struct iovec *iovecs, uint32_t num_iovs,
+                                          const struct stream_renderer_handle *handle);
+
+VG_EXPORT int stream_renderer_export_blob(uint32_t res_handle,
+                                          struct stream_renderer_handle *handle);
+
 VG_EXPORT int stream_renderer_resource_map(uint32_t res_handle, void** hvaOut, uint64_t* sizeOut);
 VG_EXPORT int stream_renderer_resource_unmap(uint32_t res_handle);
 VG_EXPORT int stream_renderer_context_create_fence(
@@ -104,6 +137,13 @@ VG_EXPORT int stream_renderer_platform_import_resource(int res_handle, int res_t
 VG_EXPORT int stream_renderer_platform_resource_info(int res_handle, int* width, int*  height, int* internal_format);
 VG_EXPORT void* stream_renderer_platform_create_shared_egl_context(void);
 VG_EXPORT int stream_renderer_platform_destroy_shared_egl_context(void*);
+
+#define STREAM_RENDERER_MAP_CACHE_MASK      0x0f
+#define STREAM_RENDERER_MAP_CACHE_NONE      0x00
+#define STREAM_RENDERER_MAP_CACHE_CACHED    0x01
+#define STREAM_RENDERER_MAP_CACHE_UNCACHED  0x02
+#define STREAM_RENDERER_MAP_CACHE_WC        0x03
+VG_EXPORT int stream_renderer_resource_map_info(uint32_t res_handle, uint32_t *map_info);
 
 #else
 

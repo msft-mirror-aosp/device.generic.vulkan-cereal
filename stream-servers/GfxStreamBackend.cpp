@@ -45,6 +45,9 @@
 #include "render_api.h"
 #include "FrameBuffer.h"
 
+using emugl::ABORT_REASON_OTHER;
+using emugl::FatalError;
+
 #define GFXSTREAM_DEBUG_LEVEL 1
 
 #if GFXSTREAM_DEBUG_LEVEL >= 1
@@ -89,6 +92,9 @@ struct gfxstream_callbacks {
        int64_t event_code, int64_t descriptor);
    void (*add_instant_event_with_metric)(
        int64_t event_code, int64_t metric_value);
+   void (*set_annotation)(
+       const char* key, const char* value);
+   void (*abort)();
 };
 
 
@@ -293,6 +299,13 @@ extern "C" VG_EXPORT void gfxstream_backend_init(
             MetricsLogger::add_instant_event_with_descriptor_callback =
                 gfxstreamcallbacks->add_instant_event_with_descriptor;
         }
+        if (gfxstreamcallbacks->set_annotation) {
+            MetricsLogger::set_crash_annotation_callback =
+                gfxstreamcallbacks->set_annotation;
+        }
+        if (gfxstreamcallbacks->abort) {
+            emugl::setDieFunction(gfxstreamcallbacks->abort);
+        }
     }
 
 
@@ -401,6 +414,7 @@ extern "C" VG_EXPORT void gfxstream_backend_init(
             kFeature_BptcTextureSupport, bptcTextureSupport);
     feature_set_enabled_override(
             kFeature_S3tcTextureSupport, s3tcTextureSupport);
+    feature_set_enabled_override(kFeature_RgtcTextureSupport, true);
     feature_set_enabled_override(
             kFeature_GLDirectMem, false);
     feature_set_enabled_override(

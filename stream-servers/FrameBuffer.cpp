@@ -50,6 +50,8 @@
 using android::base::AutoLock;
 using android::base::Stream;
 using android::base::WorkerProcessingResult;
+using emugl::ABORT_REASON_OTHER;
+using emugl::FatalError;
 
 namespace {
 
@@ -375,9 +377,15 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow,
     // preventing new contexts from being created that share
     // against those contexts.
     goldfish_vk::VkEmulation* vkEmu = nullptr;
+    goldfish_vk::VulkanDispatch* vkDispatch = nullptr;
     if (feature_is_enabled(kFeature_Vulkan)) {
-        auto dispatch = emugl::vkDispatch(false /* not for testing */);
-        vkEmu = goldfish_vk::createOrGetGlobalVkEmulation(dispatch);
+        vkDispatch = emugl::vkDispatch(false /* not for testing */);
+        vkEmu = goldfish_vk::createOrGetGlobalVkEmulation(vkDispatch);
+        if (!vkEmu) {
+            ERR("Failed to initialize global Vulkan emulation. Disable the Vulkan support.");
+        }
+    }
+    if (vkEmu) {
         bool useDeferredCommands =
             android::base::getEnvironmentVariable("ANDROID_EMU_VK_DISABLE_DEFERRED_COMMANDS").empty();
         bool useCreateResourcesWithRequirements =
@@ -386,9 +394,8 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow,
         goldfish_vk::setUseCreateResourcesWithRequirements(vkEmu, useCreateResourcesWithRequirements);
         if (feature_is_enabled(kFeature_VulkanNativeSwapchain)) {
             fb->m_displayVk = std::make_shared<DisplayVk>(
-                *dispatch, vkEmu->physdev, vkEmu->queueFamilyIndex,
-                vkEmu->queueFamilyIndex, vkEmu->device, vkEmu->queue,
-                vkEmu->queueLock, vkEmu->queue, vkEmu->queueLock);
+                *vkEmu->ivk, vkEmu->physdev, vkEmu->queueFamilyIndex, vkEmu->queueFamilyIndex,
+                vkEmu->device, vkEmu->queue, vkEmu->queueLock, vkEmu->queue, vkEmu->queueLock);
             fb->m_vkInstance = vkEmu->instance;
         }
         if (vkEmu->deviceInfo.supportsIdProperties) {
@@ -1277,15 +1284,15 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
             // the last posted color buffer.
             m_dpr = dpr;
             m_zRot = zRot;
-            Post postCmd;
-            postCmd.cmd = PostCmd::Viewport;
-            postCmd.viewport.width = fbw;
-            postCmd.viewport.height = fbh;
-            std::future<void> completeFuture =
-                sendPostWorkerCmd(std::move(postCmd));
-            completeFuture.wait();
-
             if (m_displayVk == nullptr) {
+                Post postCmd;
+                postCmd.cmd = PostCmd::Viewport;
+                postCmd.viewport.width = fbw;
+                postCmd.viewport.height = fbh;
+                std::future<void> completeFuture =
+                    sendPostWorkerCmd(std::move(postCmd));
+                completeFuture.wait();
+
                 bool posted = false;
 
                 if (m_lastPostedColorBuffer) {
