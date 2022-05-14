@@ -1056,16 +1056,20 @@ WorkerProcessingResult FrameBuffer::postWorkerFunc(Post& post) {
             break;
         case PostCmd::Compose: {
             std::unique_ptr<FlatComposeRequest> composeRequest;
-            std::shared_ptr<Post::ComposeCallback> composeCallback;
+            std::unique_ptr<Post::ComposeCallback> composeCallback;
             if (post.composeVersion <= 1) {
                 composeCallback = std::move(post.composeCallback);
                 composeRequest = ToFlatComposeRequest((ComposeDevice*)post.composeBuffer.data());
             } else {
-                composeCallback = std::make_shared<Post::ComposeCallback>(
-                    [composeCallback =
-                         std::move(post.composeCallback)](std::shared_future<void> waitForGpu) {
+                // std::shared_ptr(std::move(...)) is WA for MSFT STL implementation bug:
+                // https://developercommunity.visualstudio.com/t/unable-to-move-stdpackaged-task-into-any-stl-conta/108672
+                auto packageComposeCallback =
+                    std::shared_ptr<Post::ComposeCallback>(std::move(post.composeCallback));
+                composeCallback = std::make_unique<Post::ComposeCallback>(
+                    [packageComposeCallback](
+                        std::shared_future<void> waitForGpu) {
                         SyncThread::get()->triggerGeneral(
-                            [composeCallback = std::move(composeCallback), waitForGpu] {
+                            [composeCallback = std::move(packageComposeCallback), waitForGpu] {
                                 (*composeCallback)(waitForGpu);
                             },
                             "Wait for host composition");
@@ -3070,8 +3074,7 @@ bool FrameBuffer::composeWithCallback(uint32_t bufferSize, void* buffer,
         composeCmd.composeVersion = 1;
         composeCmd.composeBuffer.resize(bufferSize);
         memcpy(composeCmd.composeBuffer.data(), buffer, bufferSize);
-        composeCmd.composeCallback =
-            std::make_shared<Post::ComposeCallback>(callback);
+        composeCmd.composeCallback = std::make_unique<Post::ComposeCallback>(callback);
         composeCmd.cmd = PostCmd::Compose;
         sendPostWorkerCmd(std::move(composeCmd));
         return true;
@@ -3089,8 +3092,7 @@ bool FrameBuffer::composeWithCallback(uint32_t bufferSize, void* buffer,
         composeCmd.composeVersion = 2;
         composeCmd.composeBuffer.resize(bufferSize);
         memcpy(composeCmd.composeBuffer.data(), buffer, bufferSize);
-        composeCmd.composeCallback =
-            std::make_shared<Post::ComposeCallback>(callback);
+        composeCmd.composeCallback = std::make_unique<Post::ComposeCallback>(callback);
         composeCmd.cmd = PostCmd::Compose;
         sendPostWorkerCmd(std::move(composeCmd));
         return true;
@@ -3561,7 +3563,7 @@ VkImageLayout FrameBuffer::getVkImageLayoutForComposeLayer() const {
     return VK_IMAGE_LAYOUT_GENERAL;
 }
 
-bool FrameBuffer::platformImportResource(uint32_t handle, uint32_t type, void* resource) {
+bool FrameBuffer::platformImportResource(uint32_t handle, uint32_t info, void* resource) {
     if (!resource) {
         ERR("Error: resource was null");
     }
@@ -3574,11 +3576,14 @@ bool FrameBuffer::platformImportResource(uint32_t handle, uint32_t type, void* r
         return false;
     }
 
+    uint32_t type = (info & RESOURCE_TYPE_MASK);
+    bool preserveContent = (info & RESOURCE_USE_PRESERVE);
+
     switch (type) {
         case RESOURCE_TYPE_EGL_NATIVE_PIXMAP:
-            return (*c).second.cb->importEglNativePixmap(resource);
+            return (*c).second.cb->importEglNativePixmap(resource, preserveContent);
         case RESOURCE_TYPE_EGL_IMAGE:
-            return (*c).second.cb->importEglImage(resource);
+            return (*c).second.cb->importEglImage(resource, preserveContent);
         default:
             ERR("Error: unsupported resource type: %u", type);
             return false;
