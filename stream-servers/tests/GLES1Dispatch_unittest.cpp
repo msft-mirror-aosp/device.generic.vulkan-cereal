@@ -1,4 +1,4 @@
-// Copyright (C) 2018 The Android Open Source Project
+// Copyright (C) 2022 The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,15 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#pragma once
 
-#include "vulkan/cereal/common/goldfish_vk_dispatch.h"
+#include <gtest/gtest.h>
 
-using goldfish_vk::VulkanDispatch;
+#include "GLEScmContext.h"
+#include "GLTestUtils.h"
+#include "OpenGLTestContext.h"
 
 namespace emugl {
-
-VulkanDispatch* vkDispatch(bool forTesting = false);
-bool vkDispatchValid(const VulkanDispatch* vk);
+// b/233094475: GLES1 frustumf crash on cmcontext should not crash when
+// core profile is not enabled.
+TEST_F(GLTest, TestGlFrustumNoCoreProfile) {
+    GLEScmContext context(1, 1, nullptr, nullptr);
+    context.setCoreProfile(false);
+    context.frustumf(0, 0, 0, 0, 0, 0);
+}
 
 }  // namespace emugl
