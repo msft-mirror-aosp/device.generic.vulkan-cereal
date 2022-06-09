@@ -47,8 +47,8 @@ cc_library_headers {
     export_include_dirs: [
         ".",
         "include",
-        "base",
-        "host-common",
+        "base/include",
+        "host-common/include",
         "snapshot",
         "stream-servers",
         "stream-servers/vulkan",
