@@ -1087,11 +1087,9 @@ class VkDecoderGlobalState::Impl {
                     featuresFiltered.textureCompressionETC2 = false;
                 }
             }
-            if (featuresFiltered.textureCompressionASTC_LDR) {
-                if (needEmulatedAstc(physicalDevice, vk)) {
-                    emulateTextureAstc = true;
-                    featuresFiltered.textureCompressionASTC_LDR = false;
-                }
+            if (needEmulatedAstc(physicalDevice, vk)) {
+                emulateTextureAstc = true;
+                featuresFiltered.textureCompressionASTC_LDR = false;
             }
             createInfoFiltered.pEnabledFeatures = &featuresFiltered;
         }
@@ -4604,7 +4602,7 @@ class VkDecoderGlobalState::Impl {
         return vk->vkGetFenceStatus(device, fence);
     }
 
-    VkResult registerQsriCallback(VkImage boxed_image, VkQsriTimeline::Callback callback) {
+    AsyncResult registerQsriCallback(VkImage boxed_image, VkQsriTimeline::Callback callback) {
         AutoLock lock(mLock);
 
         VkImage image = unbox_VkImage(boxed_image);
@@ -4616,7 +4614,7 @@ class VkDecoderGlobalState::Impl {
 
         if (image == VK_NULL_HANDLE || mImageInfo.find(image) == mImageInfo.end()) {
             // No image
-            return VK_SUCCESS;
+            return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
         }
 
         auto anbInfo = mImageInfo[image].anbInfo;  // shared ptr, take ref
@@ -4624,18 +4622,18 @@ class VkDecoderGlobalState::Impl {
 
         if (!anbInfo) {
             fprintf(stderr, "%s: warning: image %p doesn't ahve anb info\n", __func__, image);
-            return VK_SUCCESS;
+            return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
         }
         if (!anbInfo->vk) {
             fprintf(stderr, "%s:%p warning: image %p anb info not initialized\n", __func__,
                     anbInfo.get(), image);
-            return VK_SUCCESS;
+            return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
         }
         // Could be null or mismatched image, check later
         if (image != anbInfo->image) {
             fprintf(stderr, "%s:%p warning: image %p anb info has wrong image: %p\n", __func__,
                     anbInfo.get(), image, anbInfo->image);
-            return VK_SUCCESS;
+            return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
         }
 
         anbInfo->qsriTimeline->registerCallbackForNextPresentAndPoll(std::move(callback));
@@ -4643,7 +4641,7 @@ class VkDecoderGlobalState::Impl {
         if (mLogging) {
             fprintf(stderr, "%s:%p Done registering\n", __func__, anbInfo.get());
         }
-        return VK_SUCCESS;
+        return AsyncResult::OK_AND_CALLBACK_SCHEDULED;
     }
 
 #define GUEST_EXTERNAL_MEMORY_HANDLE_TYPES                                \
@@ -5818,6 +5816,9 @@ class VkDecoderGlobalState::Impl {
         VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT |
         VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
 
+    static const VkFormatFeatureFlags kEmulatedEtc2OptimalTilingFeatureMask =
+        kEmulatedEtc2BufferFeatureMask | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+
     void maskFormatPropertiesForEmulatedEtc2(VkFormatProperties* pFormatProperties) {
         pFormatProperties->bufferFeatures &= kEmulatedEtc2BufferFeatureMask;
         pFormatProperties->optimalTilingFeatures &= kEmulatedEtc2BufferFeatureMask;
@@ -5826,6 +5827,17 @@ class VkDecoderGlobalState::Impl {
     void maskFormatPropertiesForEmulatedEtc2(VkFormatProperties2* pFormatProperties) {
         pFormatProperties->formatProperties.bufferFeatures &= kEmulatedEtc2BufferFeatureMask;
         pFormatProperties->formatProperties.optimalTilingFeatures &= kEmulatedEtc2BufferFeatureMask;
+    }
+
+    void maskFormatPropertiesForEmulatedAstc(VkFormatProperties* pFormatProperties) {
+        pFormatProperties->bufferFeatures &= kEmulatedEtc2BufferFeatureMask;
+        pFormatProperties->optimalTilingFeatures &= kEmulatedEtc2OptimalTilingFeatureMask;
+    }
+
+    void maskFormatPropertiesForEmulatedAstc(VkFormatProperties2* pFormatProperties) {
+        pFormatProperties->formatProperties.bufferFeatures &= kEmulatedEtc2BufferFeatureMask;
+        pFormatProperties->formatProperties.optimalTilingFeatures &=
+            kEmulatedEtc2OptimalTilingFeatureMask;
     }
 
     template <class VkFormatProperties1or2>
@@ -5856,6 +5868,7 @@ class VkDecoderGlobalState::Impl {
                 getPhysicalDeviceFormatPropertiesFunc(physicalDevice, cmpInfo.decompFormat,
                                                       pFormatProperties);
                 maskFormatPropertiesForEmulatedEtc2(pFormatProperties);
+
                 break;
             }
             case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
@@ -5887,16 +5900,16 @@ class VkDecoderGlobalState::Impl {
             case VK_FORMAT_ASTC_12x10_SRGB_BLOCK:
             case VK_FORMAT_ASTC_12x12_SRGB_BLOCK: {
                 if (!needEmulatedAstc(physicalDevice, vk)) {
-                    // Hardware supported ETC2
+                    // Hardware supported ASTC
                     getPhysicalDeviceFormatPropertiesFunc(physicalDevice, format,
                                                           pFormatProperties);
                     return;
                 }
-                // Emulate ETC formats
+                // Emulate ASTC formats
                 CompressedImageInfo cmpInfo = createCompressedImageInfo(format);
                 getPhysicalDeviceFormatPropertiesFunc(physicalDevice, cmpInfo.decompFormat,
                                                       pFormatProperties);
-                maskFormatPropertiesForEmulatedEtc2(pFormatProperties);
+                maskFormatPropertiesForEmulatedAstc(pFormatProperties);
                 break;
             }
             default:
@@ -7544,7 +7557,7 @@ VkResult VkDecoderGlobalState::getFenceStatus(VkFence boxed_fence) {
     return mImpl->getFenceStatus(boxed_fence);
 }
 
-VkResult VkDecoderGlobalState::registerQsriCallback(VkImage image,
+AsyncResult VkDecoderGlobalState::registerQsriCallback(VkImage image,
                                                     VkQsriTimeline::Callback callback) {
     return mImpl->registerQsriCallback(image, std::move(callback));
 }
