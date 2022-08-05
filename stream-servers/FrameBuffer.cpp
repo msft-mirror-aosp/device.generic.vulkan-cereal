@@ -987,7 +987,8 @@ FrameBuffer::FrameBuffer(int p_width, int p_height, bool useSubWindow)
       m_readbackThread(
           [this](FrameBuffer::Readback&& readback) { return sendReadbackWorkerCmd(readback); }),
       m_refCountPipeEnabled(feature_is_enabled(kFeature_RefCountPipe)),
-      m_noDelayCloseColorBufferEnabled(feature_is_enabled(kFeature_NoDelayCloseColorBuffer)),
+      m_noDelayCloseColorBufferEnabled(feature_is_enabled(kFeature_NoDelayCloseColorBuffer) ||
+          feature_is_enabled(kFeature_Minigbm)),
       m_postThread([this](Post&& post) {
           AutoLock mutex(this->m_windowResizeLock);
           return postWorkerFunc(post);
@@ -3305,6 +3306,7 @@ void FrameBuffer::onSave(Stream* stream,
 
     {
         AutoLock colorBufferMapLock(m_colorBufferMapLock);
+        stream->putByte(m_guestManagedColorBufferLifetime);
         saveCollection(stream, m_colorbuffers,
                        [now](Stream* s, const ColorBufferMap::value_type& pair) {
                            pair.second.cb->onSave(s);
@@ -3480,6 +3482,7 @@ bool FrameBuffer::onLoad(Stream* stream,
     auto now = android::base::getUnixTimeUs();
     {
         AutoLock colorBufferMapLock(m_colorBufferMapLock);
+        m_guestManagedColorBufferLifetime = stream->getByte();
         loadCollection(
             stream, &m_colorbuffers, [this, now](Stream* stream) -> ColorBufferMap::value_type {
                 ColorBufferPtr cb(ColorBuffer::onLoad(stream, m_eglDisplay, m_colorBufferHelper,
@@ -3537,6 +3540,7 @@ bool FrameBuffer::onLoad(Stream* stream,
 
     }
 
+    repost(false);
     return true;
     // TODO: restore memory management
 }
@@ -3598,6 +3602,10 @@ void FrameBuffer::registerProcessSequenceNumberForPuid(uint64_t puid) {
 
     auto procIte = m_procOwnedSequenceNumbers.find(puid);
     if (procIte != m_procOwnedSequenceNumbers.end()) {
+        if (procIte->first != puid) {
+            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+                << "puid for the associated RenderThread already set.";
+        }
         return;
     }
     uint32_t* seqnoPtr = new uint32_t;
