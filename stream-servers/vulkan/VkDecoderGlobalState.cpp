@@ -402,15 +402,34 @@ class VkDecoderGlobalState::Impl {
             }
         }
 
-        VkInstanceCreateInfo createInfoFiltered = *pCreateInfo;
+        VkInstanceCreateInfo createInfoFiltered;
         VkApplicationInfo applicationInfo = {};
-        createInfoFiltered.enabledExtensionCount = (uint32_t)finalExts.size();
+        deepcopy_VkInstanceCreateInfo(pool,
+                                      VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                                      pCreateInfo, &createInfoFiltered);
+
+        createInfoFiltered.enabledExtensionCount =
+                static_cast<uint32_t>(finalExts.size());
         createInfoFiltered.ppEnabledExtensionNames = finalExts.data();
-        if (createInfoFiltered.pApplicationInfo) {
+        if (createInfoFiltered.pApplicationInfo != nullptr) {
+            const_cast<VkApplicationInfo*>(createInfoFiltered.pApplicationInfo)
+                    ->apiVersion = apiVersion;
             applicationInfo = *createInfoFiltered.pApplicationInfo;
-            createInfoFiltered.pApplicationInfo = &applicationInfo;
         }
-        applicationInfo.apiVersion = apiVersion;
+
+        // remove VkDebugReportCallbackCreateInfoEXT and
+        // VkDebugUtilsMessengerCreateInfoEXT from the chain.
+        auto* curr = reinterpret_cast<vk_struct_common*>(&createInfoFiltered);
+        while (curr != nullptr) {
+            if (curr->pNext != nullptr &&
+                (curr->pNext->sType ==
+                         VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT ||
+                 curr->pNext->sType ==
+                         VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT)) {
+                curr->pNext = curr->pNext->pNext;
+            }
+            curr = curr->pNext;
+        }
 
         // bug: 155795731
         bool swiftshader =
@@ -715,6 +734,7 @@ class VkDecoderGlobalState::Impl {
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
         bool emulatedEtc2 = needEmulatedEtc2(physicalDevice, vk);
         bool emulatedAstc = needEmulatedAstc(physicalDevice, vk);
+        bool needEmulateCompressedImage = false;
         if (emulatedEtc2 || emulatedAstc) {
             CompressedImageInfo cmpInfo = createCompressedImageInfo(format);
             if (cmpInfo.isCompressed &&
@@ -728,10 +748,19 @@ class VkDecoderGlobalState::Impl {
                 flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
                 usage |= VK_IMAGE_USAGE_STORAGE_BIT;
                 format = cmpInfo.sizeCompFormat;
+                needEmulateCompressedImage = true;
             }
         }
-        return vk->vkGetPhysicalDeviceImageFormatProperties(physicalDevice, format, type, tiling,
-                                                            usage, flags, pImageFormatProperties);
+        VkResult res = vk->vkGetPhysicalDeviceImageFormatProperties(
+                physicalDevice, format, type, tiling, usage, flags,
+                pImageFormatProperties);
+        if (res != VK_SUCCESS) {
+            return res;
+        }
+        if (needEmulateCompressedImage) {
+            maskImageFormatPropertiesForEmulatedEtc2(pImageFormatProperties);
+        }
+        return res;
     }
 
     VkResult on_vkGetPhysicalDeviceImageFormatProperties2(
@@ -743,6 +772,7 @@ class VkDecoderGlobalState::Impl {
         VkPhysicalDeviceImageFormatInfo2 imageFormatInfo;
         bool emulatedEtc2 = needEmulatedEtc2(physicalDevice, vk);
         bool emulatedAstc = needEmulatedAstc(physicalDevice, vk);
+        bool needEmulateCompressedImage = false;
         if (emulatedEtc2 || emulatedAstc) {
             CompressedImageInfo cmpInfo = createCompressedImageInfo(pImageFormatInfo->format);
             if (cmpInfo.isCompressed &&
@@ -760,6 +790,7 @@ class VkDecoderGlobalState::Impl {
                 imageFormatInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
                 imageFormatInfo.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
                 imageFormatInfo.format = cmpInfo.sizeCompFormat;
+                needEmulateCompressedImage = true;
             }
         }
         AutoLock lock(mLock);
@@ -803,6 +834,9 @@ class VkDecoderGlobalState::Impl {
                 pImageFormatInfo->tiling, pImageFormatInfo->usage, pImageFormatInfo->flags,
                 &pImageFormatProperties->imageFormatProperties);
         }
+        if (res != VK_SUCCESS) {
+            return res;
+        }
 
         const VkPhysicalDeviceExternalImageFormatInfo* extImageFormatInfo =
             vk_find_struct<VkPhysicalDeviceExternalImageFormatInfo>(pImageFormatInfo);
@@ -813,6 +847,11 @@ class VkDecoderGlobalState::Impl {
         if (extImageFormatInfo && extImageFormatProps) {
             extImageFormatProps->externalMemoryProperties.externalMemoryFeatures |=
                 VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT;
+        }
+
+        if (needEmulateCompressedImage) {
+            maskImageFormatPropertiesForEmulatedEtc2(
+                    &pImageFormatProperties->imageFormatProperties);
         }
 
         return res;
@@ -1688,7 +1727,9 @@ class VkDecoderGlobalState::Impl {
         AutoLock lock(mLock);
         auto& samplerInfo = mSamplerInfo[*pSampler];
         samplerInfo.device = device;
-        samplerInfo.createInfo = *pCreateInfo;
+        deepcopy_VkSamplerCreateInfo(
+                &samplerInfo.pool, VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, pCreateInfo,
+                &samplerInfo.createInfo);
         // We emulate RGB with RGBA for some compressed textures, which does not
         // handle translarent border correctly.
         samplerInfo.needEmulatedAlpha =
@@ -1696,7 +1737,9 @@ class VkDecoderGlobalState::Impl {
              pCreateInfo->addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
              pCreateInfo->addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) &&
             (pCreateInfo->borderColor == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK ||
-             pCreateInfo->borderColor == VK_BORDER_COLOR_INT_TRANSPARENT_BLACK);
+             pCreateInfo->borderColor == VK_BORDER_COLOR_INT_TRANSPARENT_BLACK ||
+             pCreateInfo->borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT ||
+             pCreateInfo->borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT);
 
         *pSampler = new_boxed_non_dispatchable_VkSampler(*pSampler);
 
@@ -2325,7 +2368,10 @@ class VkDecoderGlobalState::Impl {
                     SamplerInfo& samplerInfo = samplerIt->second;
                     if (samplerInfo.emulatedborderSampler == VK_NULL_HANDLE) {
                         // create the emulated sampler
-                        VkSamplerCreateInfo createInfo = samplerInfo.createInfo;
+                        VkSamplerCreateInfo createInfo;
+                        deepcopy_VkSamplerCreateInfo(
+                                pool, VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                                &samplerInfo.createInfo, &createInfo);
                         switch (createInfo.borderColor) {
                             case VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK:
                                 createInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
@@ -2333,6 +2379,30 @@ class VkDecoderGlobalState::Impl {
                             case VK_BORDER_COLOR_INT_TRANSPARENT_BLACK:
                                 createInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
                                 break;
+                            case VK_BORDER_COLOR_FLOAT_CUSTOM_EXT:
+                            case VK_BORDER_COLOR_INT_CUSTOM_EXT: {
+                                VkSamplerCustomBorderColorCreateInfoEXT*
+                                        customBorderColorCreateInfo = vk_find_struct<
+                                                VkSamplerCustomBorderColorCreateInfoEXT>(
+                                                &createInfo);
+                                if (customBorderColorCreateInfo) {
+                                    switch (createInfo.borderColor) {
+                                        case VK_BORDER_COLOR_FLOAT_CUSTOM_EXT:
+                                            customBorderColorCreateInfo
+                                                    ->customBorderColor
+                                                    .float32[3] = 1.0f;
+                                            break;
+                                        case VK_BORDER_COLOR_INT_CUSTOM_EXT:
+                                            customBorderColorCreateInfo
+                                                    ->customBorderColor
+                                                    .int32[3] = 128;
+                                            break;
+                                        default:
+                                            break;
+                                    }
+                                }
+                                break;
+                            }
                             default:
                                 break;
                         }
@@ -2796,7 +2866,10 @@ class VkDecoderGlobalState::Impl {
             // TODO: should we use image layout or access bit?
             if (srcBarrier.oldLayout == 0 ||
                 (srcBarrier.newLayout != VK_IMAGE_LAYOUT_GENERAL &&
-                 srcBarrier.newLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) {
+                 srcBarrier.newLayout !=
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL /* for samplers */ &&
+                 srcBarrier.newLayout !=
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL /* for blit */)) {
                 // TODO: might only need to push one of them?
                 persistentImageBarriers.push_back(decompBarrier);
                 persistentImageBarriers.insert(persistentImageBarriers.end(),
@@ -4216,6 +4289,28 @@ class VkDecoderGlobalState::Impl {
 
         AutoLock lock(mLock);
         destroyRenderPassLocked(device, deviceDispatch, renderPass, pAllocator);
+    }
+
+    void on_vkCmdCopyQueryPoolResults(android::base::BumpPool* pool,
+                                      VkCommandBuffer boxed_commandBuffer,
+                                      VkQueryPool queryPool,
+                                      uint32_t firstQuery,
+                                      uint32_t queryCount,
+                                      VkBuffer dstBuffer,
+                                      VkDeviceSize dstOffset,
+                                      VkDeviceSize stride,
+                                      VkQueryResultFlags flags) {
+        auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
+        auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
+        if (queryCount == 1 && stride == 0) {
+            // Some drivers don't seem to handle stride==0 very well.
+            // In fact, the spec does not say what should happen with stride==0.
+            // So we just use the largest stride possible.
+            stride = mBufferInfo[dstBuffer].size - dstOffset;
+        }
+        vk->vkCmdCopyQueryPoolResults(commandBuffer, queryPool, firstQuery,
+                                      queryCount, dstBuffer, dstOffset, stride,
+                                      flags);
     }
 
     VkResult on_vkCreateFramebuffer(android::base::BumpPool* pool, VkDevice boxed_device,
@@ -5880,31 +5975,50 @@ class VkDecoderGlobalState::Impl {
     }
 
     static const VkFormatFeatureFlags kEmulatedEtc2BufferFeatureMask =
-        VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+        VK_FORMAT_FEATURE_BLIT_SRC_BIT |
         VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
 
     static const VkFormatFeatureFlags kEmulatedEtc2OptimalTilingFeatureMask =
-        kEmulatedEtc2BufferFeatureMask | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+        VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
 
-    void maskFormatPropertiesForEmulatedEtc2(VkFormatProperties* pFormatProperties) {
-        pFormatProperties->bufferFeatures &= kEmulatedEtc2BufferFeatureMask;
-        pFormatProperties->optimalTilingFeatures &= kEmulatedEtc2BufferFeatureMask;
+    void maskFormatPropertiesForEmulatedEtc2(
+            VkFormatProperties* pFormatProperties) {
+        pFormatProperties->linearTilingFeatures &=
+            kEmulatedEtc2BufferFeatureMask;
+        pFormatProperties->optimalTilingFeatures &=
+            kEmulatedEtc2OptimalTilingFeatureMask;
+        pFormatProperties->bufferFeatures &=
+            kEmulatedEtc2BufferFeatureMask;
     }
 
-    void maskFormatPropertiesForEmulatedEtc2(VkFormatProperties2* pFormatProperties) {
-        pFormatProperties->formatProperties.bufferFeatures &= kEmulatedEtc2BufferFeatureMask;
-        pFormatProperties->formatProperties.optimalTilingFeatures &= kEmulatedEtc2BufferFeatureMask;
+    void maskFormatPropertiesForEmulatedEtc2(
+            VkFormatProperties2* pFormatProperties) {
+        pFormatProperties->formatProperties.linearTilingFeatures &=
+            kEmulatedEtc2BufferFeatureMask;
+        pFormatProperties->formatProperties.optimalTilingFeatures &=
+            kEmulatedEtc2OptimalTilingFeatureMask;
+        pFormatProperties->formatProperties.bufferFeatures &=
+            kEmulatedEtc2BufferFeatureMask;
     }
 
     void maskFormatPropertiesForEmulatedAstc(VkFormatProperties* pFormatProperties) {
-        pFormatProperties->bufferFeatures &= kEmulatedEtc2BufferFeatureMask;
-        pFormatProperties->optimalTilingFeatures &= kEmulatedEtc2OptimalTilingFeatureMask;
+        maskFormatPropertiesForEmulatedEtc2(pFormatProperties);
     }
 
     void maskFormatPropertiesForEmulatedAstc(VkFormatProperties2* pFormatProperties) {
-        pFormatProperties->formatProperties.bufferFeatures &= kEmulatedEtc2BufferFeatureMask;
-        pFormatProperties->formatProperties.optimalTilingFeatures &=
-            kEmulatedEtc2OptimalTilingFeatureMask;
+        maskFormatPropertiesForEmulatedEtc2(pFormatProperties);
+    }
+
+    void maskImageFormatPropertiesForEmulatedEtc2(
+            VkImageFormatProperties* pProperties) {
+        // dEQP-VK.api.info.image_format_properties.2d.optimal#etc2_r8g8b8_unorm_block
+        pProperties->sampleCounts &= VK_SAMPLE_COUNT_1_BIT;
     }
 
     template <class VkFormatProperties1or2>
@@ -6437,6 +6551,22 @@ class VkDecoderGlobalState::Impl {
         bool needEmulatedAlpha = false;
         VkSamplerCreateInfo createInfo = {};
         VkSampler emulatedborderSampler = VK_NULL_HANDLE;
+        android::base::BumpPool pool = android::base::BumpPool(256);
+        SamplerInfo() = default;
+        SamplerInfo& operator=(const SamplerInfo& other) {
+            deepcopy_VkSamplerCreateInfo(&pool,
+                    VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                    &other.createInfo, &createInfo);
+            device = other.device;
+            needEmulatedAlpha = other.needEmulatedAlpha;
+            emulatedborderSampler = other.emulatedborderSampler;
+            return *this;
+        }
+        SamplerInfo(const SamplerInfo& other) {
+            *this = other;
+        }
+        SamplerInfo(SamplerInfo&& other) = delete;
+        SamplerInfo& operator=(SamplerInfo&& other) = delete;
     };
 
     struct FenceInfo {
@@ -7540,6 +7670,21 @@ void VkDecoderGlobalState::on_vkQueueHostSyncGOOGLE(android::base::BumpPool* poo
                                                     uint32_t needHostSync,
                                                     uint32_t sequenceNumber) {
     mImpl->hostSyncQueue("hostSyncQueue", queue, needHostSync, sequenceNumber);
+}
+
+void VkDecoderGlobalState::on_vkCmdCopyQueryPoolResults(
+        android::base::BumpPool* pool,
+        VkCommandBuffer commandBuffer,
+        VkQueryPool queryPool,
+        uint32_t firstQuery,
+        uint32_t queryCount,
+        VkBuffer dstBuffer,
+        VkDeviceSize dstOffset,
+        VkDeviceSize stride,
+        VkQueryResultFlags flags) {
+    mImpl->on_vkCmdCopyQueryPoolResults(pool, commandBuffer, queryPool,
+                                        firstQuery, queryCount, dstBuffer,
+                                        dstOffset, stride, flags);
 }
 
 void VkDecoderGlobalState::on_vkQueueSubmitAsyncGOOGLE(android::base::BumpPool* pool, VkQueue queue,
