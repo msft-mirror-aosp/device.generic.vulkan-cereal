@@ -726,6 +726,11 @@ class VkDecoderGlobalState::Impl {
 
         pFeatures->features.textureCompressionETC2 = true;
         pFeatures->features.textureCompressionASTC_LDR |= m_emu->enableAstcLdrEmulation;
+        VkPhysicalDeviceSamplerYcbcrConversionFeatures* ycbcrFeatures =
+            vk_find_struct<VkPhysicalDeviceSamplerYcbcrConversionFeatures>(pFeatures);
+        if (ycbcrFeatures != nullptr) {
+            ycbcrFeatures->samplerYcbcrConversion |= m_emu->enableYcbcrEmulation;
+        }
     }
 
     VkResult on_vkGetPhysicalDeviceImageFormatProperties(
@@ -1078,7 +1083,7 @@ class VkDecoderGlobalState::Impl {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
 
-        if (!m_emu->instanceSupportsMoltenVK) {
+        if (!m_emu->instanceSupportsMoltenVK && !m_emu->enableYcbcrEmulation) {
             return vk->vkEnumerateDeviceExtensionProperties(physicalDevice, pLayerName,
                                                             pPropertyCount, pProperties);
         }
@@ -1092,7 +1097,8 @@ class VkDecoderGlobalState::Impl {
             return result;
         }
 
-        if (!hasDeviceExtension(properties, VK_MVK_MOLTENVK_EXTENSION_NAME)) {
+        if (m_emu->instanceSupportsMoltenVK && !hasDeviceExtension(properties,
+                                                                VK_MVK_MOLTENVK_EXTENSION_NAME)) {
             VkExtensionProperties mvk_props;
             strncpy(mvk_props.extensionName, VK_MVK_MOLTENVK_EXTENSION_NAME,
                     sizeof(mvk_props.extensionName));
@@ -1100,13 +1106,22 @@ class VkDecoderGlobalState::Impl {
             properties.push_back(mvk_props);
         }
 
-        if (*pPropertyCount == 0) {
+        if (m_emu->enableYcbcrEmulation &&
+            !hasDeviceExtension(properties, VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME)) {
+            VkExtensionProperties ycbcr_props;
+            strncpy(ycbcr_props.extensionName, VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME,
+                    sizeof(ycbcr_props.extensionName));
+            ycbcr_props.specVersion = VK_KHR_SAMPLER_YCBCR_CONVERSION_SPEC_VERSION;
+            properties.push_back(ycbcr_props);
+        }
+        if (pProperties == nullptr) {
             *pPropertyCount = properties.size();
         } else {
+            // return number of structures actually written to pProperties.
+            *pPropertyCount = std::min((uint32_t)properties.size(), *pPropertyCount);
             memcpy(pProperties, properties.data(), *pPropertyCount * sizeof(VkExtensionProperties));
         }
-
-        return VK_SUCCESS;
+        return *pPropertyCount < properties.size() ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
     VkResult on_vkCreateDevice(android::base::BumpPool* pool, VkPhysicalDevice boxed_physicalDevice,
@@ -1163,6 +1178,14 @@ class VkDecoderGlobalState::Impl {
                         emulateTextureAstc = true;
                         VkPhysicalDeviceFeatures2* features2 = (VkPhysicalDeviceFeatures2*)ext;
                         features2->features.textureCompressionASTC_LDR = false;
+                    }
+                    break;
+                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES:
+                    if (m_emu->enableYcbcrEmulation &&
+                        !m_emu->deviceInfo.supportsSamplerYcbcrConversion) {
+                        VkPhysicalDeviceSamplerYcbcrConversionFeatures* features2 =
+                            (VkPhysicalDeviceSamplerYcbcrConversionFeatures*)ext;
+                        features2->samplerYcbcrConversion = false;
                     }
                     break;
                 default:
@@ -4711,6 +4734,11 @@ class VkDecoderGlobalState::Impl {
         android::base::BumpPool*, VkDevice boxed_device,
         const VkSamplerYcbcrConversionCreateInfo* pCreateInfo,
         const VkAllocationCallbacks* pAllocator, VkSamplerYcbcrConversion* pYcbcrConversion) {
+        if (m_emu->enableYcbcrEmulation && !m_emu->deviceInfo.supportsSamplerYcbcrConversion) {
+            *pYcbcrConversion = new_boxed_non_dispatchable_VkSamplerYcbcrConversion(
+                (VkSamplerYcbcrConversion)((uintptr_t)0xffff0000ull));
+            return VK_SUCCESS;
+        }
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
         VkResult res =
@@ -4725,6 +4753,9 @@ class VkDecoderGlobalState::Impl {
     void on_vkDestroySamplerYcbcrConversion(android::base::BumpPool* pool, VkDevice boxed_device,
                                             VkSamplerYcbcrConversion boxed_ycbcrConversion,
                                             const VkAllocationCallbacks* pAllocator) {
+        if (m_emu->enableYcbcrEmulation && !m_emu->deviceInfo.supportsSamplerYcbcrConversion) {
+            return;
+        }
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
         VkSamplerYcbcrConversion ycbcrConversion =
@@ -5107,6 +5138,10 @@ class VkDecoderGlobalState::Impl {
         for (auto emulatedExt : kEmulatedExtensions) {
             if (!strcmp(emulatedExt, name)) return true;
         }
+        if (!strcmp(VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME, name)) {
+            return !m_emu->deviceInfo.hasSamplerYcbcrConversionExtension &&
+                   m_emu->enableYcbcrEmulation;
+        }
         return false;
     }
 
@@ -5123,6 +5158,7 @@ class VkDecoderGlobalState::Impl {
             auto extName = extNames[i];
             if (!isEmulatedExtension(extName)) {
                 res.push_back(extName);
+                continue;
             }
             if (m_emu->instanceSupportsMoltenVK) {
                 continue;
