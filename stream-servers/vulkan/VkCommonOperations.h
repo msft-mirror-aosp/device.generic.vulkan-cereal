@@ -92,10 +92,15 @@ struct VkEmulation {
     // conversion or not.
     bool enableYcbcrEmulation = false;
 
+    bool guestUsesAngle = false;
+
     // Instance and device for creating the system-wide shareable objects.
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physdev = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
+
+    // Physical device index
+    uint32_t physicalDeviceIndex = 0;
 
     // Global, instance and device dispatch tables.
     VulkanDispatch* gvk = nullptr;
@@ -368,6 +373,7 @@ struct VkEmulationFeatures {
     bool enableAstcLdrEmulation = false;
     bool enableEtc2Emulation = false;
     bool enableYcbcrEmulation = false;
+    bool guestUsesAngle = false;
 };
 void initVkEmulationFeatures(std::unique_ptr<VkEmulationFeatures>);
 
