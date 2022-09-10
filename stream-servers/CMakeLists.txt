@@ -8,12 +8,7 @@ add_subdirectory(gl)
 # Vulkan
 add_subdirectory(vulkan)
 
-# GLES translator
-add_subdirectory(glestranslator)
 add_subdirectory(libGLSnapshot)
-
-# GLES dispatch based on Translator
-add_subdirectory(OpenGLESDispatch)
 
 # RenderControl decoder
 add_subdirectory(renderControl_dec)
@@ -25,7 +20,6 @@ set(stream-server-core-sources
     VirtioGpuTimelines.cpp
     ChannelStream.cpp
     ColorBuffer.cpp
-    CompositorGl.cpp
     Debug.cpp
     FenceSync.cpp
     GLESVersionDetector.cpp
@@ -39,8 +33,6 @@ set(stream-server-core-sources
     RenderThreadInfoGl.cpp
     RingStream.cpp
     SyncThread.cpp
-    TextureDraw.cpp
-    TextureResize.cpp
     WindowSurface.cpp
     YUVConverter.cpp
     RenderThread.cpp
@@ -160,8 +152,8 @@ target_include_directories(
     ${GFXSTREAM_REPO_ROOT}/base/testing
     ${GFXSTREAM_REPO_ROOT}/include
     ${GFXSTREAM_REPO_ROOT}/stream-servers
-    ${GFXSTREAM_REPO_ROOT}/stream-servers/glestranslator/GLES_CM
-    ${GFXSTREAM_REPO_ROOT}/stream-servers/glestranslator/include
+    ${GFXSTREAM_REPO_ROOT}/stream-servers/gl/glestranslator/GLES_CM
+    ${GFXSTREAM_REPO_ROOT}/stream-servers/gl/glestranslator/include
     ${GFXSTREAM_REPO_ROOT}/stream-servers/apigen-codec-common
     ${GFXSTREAM_REPO_ROOT}/stream-servers/vulkan)
 target_link_libraries(
