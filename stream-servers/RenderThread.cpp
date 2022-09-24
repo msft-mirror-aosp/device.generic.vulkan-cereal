@@ -348,6 +348,7 @@ intptr_t RenderThread::main() {
     }
 
     GfxApiLogger gfxLogger;
+    auto& metricsLogger = FrameBuffer::getFB()->getMetricsLogger();
 
     uint32_t* seqnoPtr = nullptr;
 
@@ -430,10 +431,11 @@ intptr_t RenderThread::main() {
                     {{"renderthread_guest_process", tInfo.m_processName.value()}});
                 processName = tInfo.m_processName.value().c_str();
             }
-            HealthWatchdog watchdog(FrameBuffer::getFB()->getHealthMonitor(),
-                                    WATCHDOG_DATA("RenderThread decode operation",
-                                                  EventHangMetadata::HangType::kRenderThread,
-                                                  std::move(renderThreadData)));
+            auto watchdog = WATCHDOG_BUILDER(FrameBuffer::getFB()->getHealthMonitor(),
+                                             "RenderThread decode operation")
+                                .setHangType(EventHangMetadata::HangType::kRenderThread)
+                                .setAnnotations(std::move(renderThreadData))
+                                .build();
 
             if (!seqnoPtr && tInfo.m_puid) {
                 seqnoPtr = FrameBuffer::getFB()->getProcessSequenceNumberPtr(tInfo.m_puid);
@@ -453,6 +455,7 @@ intptr_t RenderThread::main() {
                     .processName = processName,
                     .gfxApiLogger = &gfxLogger,
                     .healthMonitor = &FrameBuffer::getFB()->getHealthMonitor(),
+                    .metricsLogger = &metricsLogger,
                 };
                 last = tInfo.m_vkInfo->m_vkDec.decode(readBuf.buf(), readBuf.validData(), ioStream,
                                                       seqnoPtr, context);
