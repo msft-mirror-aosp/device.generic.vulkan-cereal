@@ -2745,7 +2745,8 @@ class VkDecoderGlobalState::Impl {
     void on_vkCmdCopyBufferToImage(android::base::BumpPool* pool,
                                    VkCommandBuffer boxed_commandBuffer, VkBuffer srcBuffer,
                                    VkImage dstImage, VkImageLayout dstImageLayout,
-                                   uint32_t regionCount, const VkBufferImageCopy* pRegions) {
+                                   uint32_t regionCount, const VkBufferImageCopy* pRegions,
+                                   const VkDecoderContext& context) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
 
@@ -2810,7 +2811,7 @@ class VkDecoderGlobalState::Impl {
             uint8_t* astcData = (uint8_t*)(memoryInfo->ptr) + bufferInfo->memoryOffset;
             cmp.astcTexture->on_vkCmdCopyBufferToImage(commandBuffer, astcData, bufferInfo->size,
                                                        dstImage, dstImageLayout, regionCount,
-                                                       pRegions);
+                                                       pRegions, context);
         }
     }
 
@@ -3681,8 +3682,11 @@ class VkDecoderGlobalState::Impl {
             uint32_t handleType;
             struct VulkanInfo vulkanInfo = {
                     .memoryIndex = info->memoryIndex,
-                    .physicalDeviceIndex = m_emu->physicalDeviceIndex,
             };
+            memcpy(vulkanInfo.deviceUUID, m_emu->deviceInfo.idProps.deviceUUID,
+                   sizeof(vulkanInfo.deviceUUID));
+            memcpy(vulkanInfo.driverUUID, m_emu->deviceInfo.idProps.driverUUID,
+                   sizeof(vulkanInfo.driverUUID));
 
 #ifdef __unix__
             VkMemoryGetFdInfoKHR getFd = {
@@ -7601,14 +7605,12 @@ void VkDecoderGlobalState::on_vkDestroyPipeline(android::base::BumpPool* pool,
     mImpl->on_vkDestroyPipeline(pool, boxed_device, pipeline, pAllocator);
 }
 
-void VkDecoderGlobalState::on_vkCmdCopyBufferToImage(android::base::BumpPool* pool,
-                                                     VkCommandBuffer commandBuffer,
-                                                     VkBuffer srcBuffer, VkImage dstImage,
-                                                     VkImageLayout dstImageLayout,
-                                                     uint32_t regionCount,
-                                                     const VkBufferImageCopy* pRegions) {
+void VkDecoderGlobalState::on_vkCmdCopyBufferToImage(
+    android::base::BumpPool* pool, VkCommandBuffer commandBuffer, VkBuffer srcBuffer,
+    VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount,
+    const VkBufferImageCopy* pRegions, const VkDecoderContext& context) {
     mImpl->on_vkCmdCopyBufferToImage(pool, commandBuffer, srcBuffer, dstImage, dstImageLayout,
-                                     regionCount, pRegions);
+                                     regionCount, pRegions, context);
 }
 
 void VkDecoderGlobalState::on_vkCmdCopyImage(android::base::BumpPool* pool,
