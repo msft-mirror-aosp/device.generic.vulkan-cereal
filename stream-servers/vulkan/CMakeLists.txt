@@ -5,7 +5,6 @@ add_library(gfxstream-vulkan-server
             BorrowedImageVk.cpp
             CompositorVk.cpp
             DisplayVk.cpp
-            DisplaySurfaceVk.cpp
             DebugUtilsHelper.cpp
             SwapChainStateVk.cpp
             VkAndroidNativeBuffer.cpp
@@ -26,7 +25,7 @@ target_link_libraries(gfxstream-vulkan-server PUBLIC
         gfxstream-compressedTextures
         emulated_textures
         apigen-codec-common
-        gfxstream-base.headers
+        aemu-base.headers
         gfxstream-snapshot.headers
         gfxstream_vulkan_headers)
 
