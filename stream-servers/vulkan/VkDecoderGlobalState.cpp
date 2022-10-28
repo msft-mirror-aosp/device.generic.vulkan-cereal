@@ -25,22 +25,22 @@
 #include "FrameBuffer.h"
 #include "VkAndroidNativeBuffer.h"
 #include "VkCommonOperations.h"
-#include "VkDecoderSnapshot.h"
 #include "VkDecoderContext.h"
+#include "VkDecoderSnapshot.h"
 #include "VkFormatUtils.h"
 #include "VulkanDispatch.h"
 #include "VulkanStream.h"
 #include "aemu/base/ArraySize.h"
-#include "aemu/base/synchronization/ConditionVariable.h"
-#include "aemu/base/containers/EntityManager.h"
-#include "aemu/base/containers/HybridEntityManager.h"
-#include "aemu/base/synchronization/Lock.h"
-#include "aemu/base/containers/Lookup.h"
 #include "aemu/base/ManagedDescriptor.hpp"
 #include "aemu/base/Optional.h"
-#include "aemu/base/files/Stream.h"
-#include "aemu/base/system/System.h"
 #include "aemu/base/Tracing.h"
+#include "aemu/base/containers/EntityManager.h"
+#include "aemu/base/containers/HybridEntityManager.h"
+#include "aemu/base/containers/Lookup.h"
+#include "aemu/base/files/Stream.h"
+#include "aemu/base/synchronization/ConditionVariable.h"
+#include "aemu/base/synchronization/Lock.h"
+#include "aemu/base/system/System.h"
 #include "common/goldfish_vk_deepcopy.h"
 #include "common/goldfish_vk_dispatch.h"
 #include "common/goldfish_vk_marshaling.h"
@@ -49,10 +49,10 @@
 #include "compressedTextureFormats/etc.h"
 #include "host-common/GfxstreamFatalError.h"
 #include "host-common/HostmemIdMapping.h"
-#include "host-common/RenderDoc.h"
 #include "host-common/address_space_device_control_ops.h"
 #include "host-common/feature_control.h"
 #include "host-common/vm_operations.h"
+#include "utils/RenderDoc.h"
 #include "vk_util.h"
 #include "vulkan/emulated_textures/AstcTexture.h"
 #include "vulkan/vk_enum_string_helper.h"
@@ -70,11 +70,12 @@
 using android::base::arraySize;
 using android::base::AutoLock;
 using android::base::ConditionVariable;
+using android::base::DescriptorType;
 using android::base::Lock;
 using android::base::ManagedDescriptor;
 using android::base::MetricEventBadPacketLength;
 using android::base::MetricEventDuplicateSequenceNum;
-using android::base::DescriptorType;
+using android::base::MetricEventVulkanOutOfMemory;
 using android::base::Optional;
 using android::base::StaticLock;
 using android::emulation::HostmemIdMapping;
@@ -2897,13 +2898,21 @@ class VkDecoderGlobalState::Impl {
             }
             uint32_t baseMipLevel = srcBarrier.subresourceRange.baseMipLevel;
             uint32_t levelCount = srcBarrier.subresourceRange.levelCount;
+            if (levelCount == VK_REMAINING_MIP_LEVELS) {
+                levelCount = imageInfo->cmpInfo.mipLevels - baseMipLevel;
+            }
+            uint32_t layerCount = srcBarrier.subresourceRange.layerCount;
+            if (layerCount == VK_REMAINING_ARRAY_LAYERS) {
+                layerCount =
+                    imageInfo->cmpInfo.layerCount - srcBarrier.subresourceRange.baseArrayLayer;
+            }
+
             VkImageMemoryBarrier decompBarrier = srcBarrier;
             decompBarrier.image = imageInfo->cmpInfo.decompImg;
             VkImageMemoryBarrier sizeCompBarrierTemplate = srcBarrier;
             sizeCompBarrierTemplate.subresourceRange.baseMipLevel = 0;
             sizeCompBarrierTemplate.subresourceRange.levelCount = 1;
-            std::vector<VkImageMemoryBarrier> sizeCompBarriers(
-                srcBarrier.subresourceRange.levelCount, sizeCompBarrierTemplate);
+            std::vector<VkImageMemoryBarrier> sizeCompBarriers(levelCount, sizeCompBarrierTemplate);
             for (uint32_t j = 0; j < levelCount; j++) {
                 sizeCompBarriers[j].image = imageInfo->cmpInfo.sizeCompImgs[baseMipLevel + j];
             }
@@ -2911,10 +2920,8 @@ class VkDecoderGlobalState::Impl {
             // TODO: should we use image layout or access bit?
             if (srcBarrier.oldLayout == 0 ||
                 (srcBarrier.newLayout != VK_IMAGE_LAYOUT_GENERAL &&
-                 srcBarrier.newLayout !=
-                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL /* for samplers */ &&
-                 srcBarrier.newLayout !=
-                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL /* for blit */)) {
+                 srcBarrier.newLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL /* for samplers */
+                 && srcBarrier.newLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL /* for blit */)) {
                 // TODO: might only need to push one of them?
                 persistentImageBarriers.push_back(decompBarrier);
                 persistentImageBarriers.insert(persistentImageBarriers.end(),
@@ -2957,11 +2964,10 @@ class VkDecoderGlobalState::Impl {
             imageInfo->cmpInfo.cmdDecompress(
                 vk, commandBuffer, dstStageMask, decompBarrier.newLayout,
                 decompBarrier.dstAccessMask, baseMipLevel, levelCount,
-                srcBarrier.subresourceRange.baseArrayLayer, srcBarrier.subresourceRange.layerCount);
+                srcBarrier.subresourceRange.baseArrayLayer, layerCount);
             needRebind = true;
 
-            for (uint32_t j = 0; j < currImageBarriers.size(); j++) {
-                VkImageMemoryBarrier& barrier = currImageBarriers[j];
+            for (auto& barrier : currImageBarriers) {
                 barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
                 barrier.dstAccessMask = srcBarrier.dstAccessMask;
                 barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2991,7 +2997,7 @@ class VkDecoderGlobalState::Impl {
             // Recover pipeline bindings
             vk->vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                   cmdBufferInfo->computePipeline);
-            if (cmdBufferInfo->descriptorSets.size() > 0) {
+            if (!cmdBufferInfo->descriptorSets.empty()) {
                 vk->vkCmdBindDescriptorSets(
                     commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cmdBufferInfo->descriptorLayout,
                     cmdBufferInfo->firstSet, cmdBufferInfo->descriptorSets.size(),
@@ -4830,6 +4836,18 @@ class VkDecoderGlobalState::Impl {
     void on_DeviceLost() { GFXSTREAM_ABORT(FatalError(VK_ERROR_DEVICE_LOST)); }
 
     void DeviceLostHandler() {}
+
+    void on_CheckOutOfMemory(VkResult result, uint32_t opCode, const VkDecoderContext& context,
+                        std::optional<uint64_t> allocationSize = std::nullopt) {
+        if (result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+            result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+            result == VK_ERROR_OUT_OF_POOL_MEMORY) {
+            context.metricsLogger->logMetricEvent(
+                MetricEventVulkanOutOfMemory{.vkResultCode = result,
+                                             .opCode = std::make_optional(opCode),
+                                             .allocationSize = allocationSize});
+            }
+    }
 
     VkResult waitForFence(VkFence boxed_fence, uint64_t timeout) {
         VkFence fence;
@@ -8102,6 +8120,12 @@ void VkDecoderGlobalState::on_vkDestroySamplerYcbcrConversionKHR(
 void VkDecoderGlobalState::on_DeviceLost() { mImpl->on_DeviceLost(); }
 
 void VkDecoderGlobalState::DeviceLostHandler() { mImpl->DeviceLostHandler(); }
+
+void VkDecoderGlobalState::on_CheckOutOfMemory(VkResult result, uint32_t opCode,
+                                          const VkDecoderContext& context,
+                                          std::optional<uint64_t> allocationSize) {
+    mImpl->on_CheckOutOfMemory(result, opCode, context, allocationSize);
+}
 
 VkResult VkDecoderGlobalState::waitForFence(VkFence boxed_fence, uint64_t timeout) {
     return mImpl->waitForFence(boxed_fence, timeout);
