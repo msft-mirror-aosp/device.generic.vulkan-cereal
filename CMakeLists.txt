@@ -35,7 +35,7 @@ if (WIN32)
     add_definitions("-DUNICODE -D_UNICODE -DNOMINMAX -DEMUGL_BUILD -DVK_USE_PLATFORM_WIN32_KHR -DBUILDING_EMUGL_COMMON_SHARED")
 endif()
 
-option(VIRGL_RENDERER_UNSTABLE_APIS "Use unstable virglrenderer APIs" OFF)
+option(VIRGL_RENDERER_UNSTABLE_APIS "Use unstable virglrenderer APIs" ON)
 if(VIRGL_RENDERER_UNSTABLE_APIS)
     add_definitions(-DVIRGL_RENDERER_UNSTABLE_APIS)
 endif()
@@ -121,6 +121,11 @@ set(GFXSTREAM_REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 include(android.cmake)
 
 set(EXTRA_SUBDIR_TEST_INCLUDE_FILES)
+
+
+if(DEPENDENCY_RESOLUTION STREQUAL "AOSP")
+    add_compile_definitions(USE_ANGLE_SHADER_PARSER)
+endif ()
 
 # Third party dependencies
 add_subdirectory(third-party)
