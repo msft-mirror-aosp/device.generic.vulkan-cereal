@@ -28,7 +28,6 @@
 #include "GLESVersionDetector.h"
 #include "OpenGLESDispatch/DispatchTables.h"
 #include "OpenGLESDispatch/EGLDispatch.h"
-#include "RenderContext.h"
 #include "RenderThreadInfo.h"
 #include "RenderThreadInfoGl.h"
 #include "SyncThread.h"
@@ -262,8 +261,7 @@ static EGLint rcGetEGLVersion(EGLint* major, EGLint* minor)
     if (!fb) {
         return EGL_FALSE;
     }
-    *major = (EGLint)fb->getCaps().eglMajor;
-    *minor = (EGLint)fb->getCaps().eglMinor;
+    fb->getEmulationGl().getEglVersion(major, minor);
 
     return EGL_TRUE;
 }
@@ -281,7 +279,7 @@ static EGLint rcQueryEGLString(EGLenum name, void* buffer, EGLint bufferSize)
     }
 
     std::string eglStr(str);
-    if ((FrameBuffer::getMaxGLESVersion() >= GLES_DISPATCH_MAX_VERSION_3_0) &&
+    if ((fb->getMaxGLESVersion() >= GLES_DISPATCH_MAX_VERSION_3_0) &&
         feature_is_enabled(kFeature_GLESDynamicVersion) &&
         eglStr.find("EGL_KHR_create_context") == std::string::npos) {
         eglStr += "EGL_KHR_create_context ";
@@ -447,7 +445,7 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
     // We add the maximum supported GL protocol number into GL_EXTENSIONS
 
     // filter extensions by name to match guest-side support
-    GLESDispatchMaxVersion maxVersion = FrameBuffer::getMaxGLESVersion();
+    GLESDispatchMaxVersion maxVersion = FrameBuffer::getFB()->getMaxGLESVersion();
     if (name == GL_EXTENSIONS) {
         glStr = filterExtensionsBasedOnMaxVersion(maxVersion, glStr);
     }
@@ -662,7 +660,6 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
 
     if (name == GL_VERSION) {
         if (feature_is_enabled(kFeature_GLESDynamicVersion)) {
-            GLESDispatchMaxVersion maxVersion = FrameBuffer::getMaxGLESVersion();
             switch (maxVersion) {
             // Underlying GLES implmentation's max version string
             // is allowed to be higher than the version of the request
@@ -780,7 +777,7 @@ static uint32_t rcCreateContext(uint32_t config,
         return 0;
     }
 
-    HandleType ret = fb->createRenderContext(config, share, (GLESApi)glVersion);
+    HandleType ret = fb->createEmulatedEglContext(config, share, (GLESApi)glVersion);
     return ret;
 }
 
@@ -791,7 +788,7 @@ static void rcDestroyContext(uint32_t context)
         return;
     }
 
-    fb->DestroyRenderContext(context);
+    fb->DestroyEmulatedEglContext(context);
 }
 
 static uint32_t rcCreateWindowSurface(uint32_t config,

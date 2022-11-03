@@ -21,8 +21,8 @@
 #include "FenceSync.h"
 #include "Hwc2.h"
 #include "OpenGLESDispatch/GLESv2Dispatch.h"
-#include "RenderContext.h"
 #include "aemu/base/Compiler.h"
+#include "gl/EmulatedEglContext.h"
 
 class FrameBuffer;
 class OSWindow;
@@ -78,6 +78,7 @@ public:
     // Just initialize, draw, and swap buffers once.
     void drawOnce();
 
+    bool isSwANGLE();
 private:
     void drawWorkerWithCompose(ColorBufferQueue& app2sfQueue, ColorBufferQueue& sf2appQueue);
     void drawWorker(ColorBufferQueue& app2sfQueue, ColorBufferQueue& sf2appQueue,
