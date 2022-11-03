@@ -16,8 +16,9 @@ cc_library_static {
         "DisplayGl.cpp",
         "DisplaySurfaceGl.cpp",
         "EmulatedEglConfig.cpp",
+        "EmulatedEglContext.cpp",
+        "EmulationGl.cpp",
         "GLESVersionDetector.cpp",
-        "RenderContext.cpp",
         "TextureDraw.cpp",
         "TextureResize.cpp",
         "YUVConverter.cpp",
@@ -25,5 +26,6 @@ cc_library_static {
     static_libs: [
         "gfxstream_gles1_dec",
         "gfxstream_gles2_dec",
+        "gfxstream_glsnapshot",
     ],
 }
