@@ -201,19 +201,9 @@ static std::optional<EGLConfig> getEmulationEglConfig(EGLDisplay display, bool a
 
 }  // namespace
 
-std::unique_ptr<EmulationGl> EmulationGl::create(uint32_t width,
-                                                 uint32_t height,
-                                                 bool egl2egl,
+std::unique_ptr<EmulationGl> EmulationGl::create(uint32_t width, uint32_t height,
                                                  bool allowWindowSurface) {
     std::unique_ptr<EmulationGl> emulationGl(new EmulationGl());
-
-    if (s_egl.eglUseOsEglApi) {
-        EGLBoolean useNullBackend = EGL_FALSE;
-        if (egl2egl && feature_is_enabled(kFeature_VulkanNativeSwapchain)) {
-            useNullBackend = EGL_TRUE;
-        }
-        s_egl.eglUseOsEglApi(egl2egl, useNullBackend);
-    }
 
     emulationGl->mEglDisplay = s_egl.eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (emulationGl->mEglDisplay == EGL_NO_DISPLAY) {
@@ -572,6 +562,61 @@ void EmulationGl::setUseBoundSurfaceContextForDisplay(bool use) {
     if (mCompositorGl) {
         mCompositorGl->setUseBoundSurfaceContext(use);
     }
+}
+
+std::unique_ptr<EmulatedEglContext> EmulationGl::createEmulatedEglContext(
+        uint32_t emulatedEglConfigIndex,
+        const EmulatedEglContext* sharedContext,
+        GLESApi api,
+        HandleType handle) {
+    if (!mEmulatedEglConfigs) {
+        ERR("EmulatedEglConfigs unavailable.");
+        return nullptr;
+    }
+
+    const EmulatedEglConfig* emulatedEglConfig = mEmulatedEglConfigs->get(emulatedEglConfigIndex);
+    if (!emulatedEglConfig) {
+        ERR("Failed to find emulated EGL config %d", emulatedEglConfigIndex);
+        return nullptr;
+    }
+
+    EGLConfig config = emulatedEglConfig->getHostEglConfig();
+    EGLContext share = sharedContext ? sharedContext->getEGLContext() : EGL_NO_CONTEXT;
+
+    return EmulatedEglContext::create(mEglDisplay, config, share, handle, api);
+}
+
+std::unique_ptr<EmulatedEglContext> EmulationGl::loadEmulatedEglContext(
+        android::base::Stream* stream) {
+    return EmulatedEglContext::onLoad(stream, mEglDisplay);
+}
+
+std::unique_ptr<EmulatedEglWindowSurface> EmulationGl::createEmulatedEglWindowSurface(
+        uint32_t emulatedConfigIndex,
+        uint32_t width,
+        uint32_t height,
+        HandleType handle) {
+    if (!mEmulatedEglConfigs) {
+        ERR("EmulatedEglConfigs unavailable.");
+        return nullptr;
+    }
+
+    const EmulatedEglConfig* emulatedEglConfig = mEmulatedEglConfigs->get(emulatedConfigIndex);
+    if (!emulatedEglConfig) {
+        ERR("Failed to find emulated EGL config %d", emulatedConfigIndex);
+        return nullptr;
+    }
+
+    EGLConfig config = emulatedEglConfig->getHostEglConfig();
+
+    return EmulatedEglWindowSurface::create(mEglDisplay, config, width, height, handle);
+}
+
+std::unique_ptr<EmulatedEglWindowSurface> EmulationGl::loadEmulatedEglWindowSurface(
+        android::base::Stream* stream,
+        const ColorBufferMap& colorBuffers,
+        const EmulatedEglContextMap& contexts) {
+    return EmulatedEglWindowSurface::onLoad(stream, mEglDisplay, colorBuffers, contexts);
 }
 
 }  // namespace gfxstream
