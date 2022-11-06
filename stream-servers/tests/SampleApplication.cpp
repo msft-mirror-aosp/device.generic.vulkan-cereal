@@ -35,6 +35,9 @@ using android::base::FunctorThread;
 using android::base::Lock;
 using android::base::MessageChannel;
 using android::base::TestSystem;
+using gfxstream::GLESApi;
+using gfxstream::GLESApi_3_0;
+using gfxstream::GLESApi_CM;
 
 namespace emugl {
 
@@ -288,7 +291,7 @@ SampleApplication::~SampleApplication() {
         }
         mFb->bindContext(0, 0, 0);
         mFb->closeColorBuffer(mColorBuffer);
-        mFb->DestroyEmulatedEglWindowSurface(mSurface);
+        mFb->destroyEmulatedEglWindowSurface(mSurface);
         mFb->finalize();
     }
 }

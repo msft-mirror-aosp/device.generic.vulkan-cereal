@@ -45,6 +45,7 @@
 using android::base::StdioStream;
 using android::snapshot::TextureLoader;
 using android::snapshot::TextureSaver;
+using gfxstream::GLESApi_3_0;
 
 namespace emugl {
 
@@ -453,7 +454,7 @@ TEST_F(FrameBufferTest, BasicBlit) {
     EXPECT_TRUE(mFb->bindContext(0, 0, 0));
     mFb->closeColorBuffer(colorBuffer);
     mFb->closeColorBuffer(colorBuffer);
-    mFb->DestroyEmulatedEglWindowSurface(surface);
+    mFb->destroyEmulatedEglWindowSurface(surface);
 }
 
 // Tests that snapshot works with an empty FrameBuffer.
@@ -694,7 +695,7 @@ fprintf(stderr, "%s: transform loc %d\n", __func__, transformLoc);
     EXPECT_TRUE(mFb->bindContext(0, 0, 0));
     mFb->closeColorBuffer(colorBuffer);
     mFb->closeColorBuffer(colorBuffer);
-    mFb->DestroyEmulatedEglWindowSurface(surface);
+    mFb->destroyEmulatedEglWindowSurface(surface);
 }
 
 // Tests rate of draw calls with only the host driver and no translator.
@@ -731,7 +732,7 @@ TEST_F(FrameBufferTest, HostDrawCallRate) {
     EXPECT_TRUE(mFb->bindContext(0, 0, 0));
     mFb->closeColorBuffer(colorBuffer);
     mFb->closeColorBuffer(colorBuffer);
-    mFb->DestroyEmulatedEglWindowSurface(surface);
+    mFb->destroyEmulatedEglWindowSurface(surface);
 }
 
 // Tests Vulkan interop query.
@@ -888,7 +889,7 @@ TEST_F(FrameBufferTest, ComposeMultiDisplay) {
     mFb->destroyDisplay(ids[0]);
     mFb->destroyDisplay(ids[1]);
     mFb->destroyDisplay(ids[2]);
-    mFb->DestroyEmulatedEglWindowSurface(surface);
+    mFb->destroyEmulatedEglWindowSurface(surface);
 }
 
 #ifdef __linux__
@@ -994,7 +995,7 @@ TEST_F(FrameBufferTest, PixmapImport_Blit) {
     EXPECT_TRUE(mFb->bindContext(0, 0, 0));
     mFb->closeColorBuffer(colorBuffer);
     mFb->closeColorBuffer(colorBuffer);
-    mFb->DestroyEmulatedEglWindowSurface(surface);
+    mFb->destroyEmulatedEglWindowSurface(surface);
 
     freeNativePixmap(pixmap);
 }
