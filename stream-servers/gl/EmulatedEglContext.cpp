@@ -25,24 +25,20 @@
 #include "host-common/logging.h"
 #include "host-common/misc.h"
 
-namespace gfxstream {
-
-std::unique_ptr<EmulatedEglContext> EmulatedEglContext::create(
-        EGLDisplay display,
-        EGLConfig config,
-        EGLContext sharedContext,
-        HandleType hndl,
-        GLESApi version) {
+EmulatedEglContext* EmulatedEglContext::create(EGLDisplay display,
+                                               EGLConfig config,
+                                               EGLContext sharedContext,
+                                               HandleType hndl,
+                                               GLESApi version) {
     return createImpl(display, config, sharedContext, hndl, version, nullptr);
 }
 
-std::unique_ptr<EmulatedEglContext> EmulatedEglContext::createImpl(
-        EGLDisplay display,
-        EGLConfig config,
-        EGLContext sharedContext,
-        HandleType hndl,
-        GLESApi version,
-        android::base::Stream* stream) {
+EmulatedEglContext* EmulatedEglContext::createImpl(EGLDisplay display,
+                                                   EGLConfig config,
+                                                   EGLContext sharedContext,
+                                                   HandleType hndl,
+                                                   GLESApi version,
+                                                   android::base::Stream *stream) {
     GLESApi clientVersion = version;
     int majorVersion = clientVersion;
     int minorVersion = 0;
@@ -76,11 +72,10 @@ std::unique_ptr<EmulatedEglContext> EmulatedEglContext::createImpl(
     }
     if (context == EGL_NO_CONTEXT) {
         ERR("Failed to create context (EGL_NO_CONTEXT result)");
-        return nullptr;
+        return NULL;
     }
 
-    return std::unique_ptr<EmulatedEglContext>(
-        new EmulatedEglContext(display, context, hndl, clientVersion, nullptr));
+    return new EmulatedEglContext(display, context, hndl, clientVersion, NULL);
 }
 
 EmulatedEglContext::EmulatedEglContext(EGLDisplay display,
@@ -109,9 +104,8 @@ void EmulatedEglContext::onSave(android::base::Stream* stream) {
     }
 }
 
-std::unique_ptr<EmulatedEglContext> EmulatedEglContext::onLoad(
-        android::base::Stream* stream,
-        EGLDisplay display) {
+EmulatedEglContext *EmulatedEglContext::onLoad(android::base::Stream* stream,
+                                               EGLDisplay display) {
     HandleType hndl = static_cast<HandleType>(stream->getBe32());
     GLESApi version = static_cast<GLESApi>(stream->getBe32());
 
@@ -121,6 +115,4 @@ std::unique_ptr<EmulatedEglContext> EmulatedEglContext::onLoad(
 
 GLESApi EmulatedEglContext::clientVersion() const {
     return mVersion;
-}
-
 }

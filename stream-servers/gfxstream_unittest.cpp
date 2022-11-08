@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
-#include <vector>
 
 #include "virtio-gpu-gfxstream-renderer.h"
 #include "host-common/testing/MockGraphicsAgentFactory.h"
@@ -31,25 +30,26 @@ private:
 protected:
     uint32_t cookie;
     static const bool useWindow;
-    std::vector<stream_renderer_param> streamRendererParams;
+    struct virgl_renderer_callbacks callbacks;
+    struct gfxstream_callbacks gfxstreamcallbacks;
     static constexpr uint32_t width = 256;
     static constexpr uint32_t height = 256;
     static std::unique_ptr<OSWindow> window;
-    static constexpr int rendererFlags = GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT;
-    static constexpr int surfacelessFlags = GFXSTREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT |
-                                            GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT;
 
     GfxStreamBackendTest()
         : cookie(0),
-          streamRendererParams{
-              {STREAM_RENDERER_PARAM_USER_DATA,
-               static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&cookie))},
-              {STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK,
-               static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&sWriteFence))},
-              {STREAM_RENDERER_PARAM_RENDERER_FLAGS, surfacelessFlags},
-              {STREAM_RENDERER_PARAM_WIN0_WIDTH, width},
-              {STREAM_RENDERER_PARAM_WIN0_HEIGHT, height}
-          } {}
+          callbacks({
+                  0,
+                  sWriteFence,
+                  0,
+                  0,
+                  0,
+          }),
+          gfxstreamcallbacks({
+                  0,
+                  0,
+                  0,
+          }) {}
 
     static void SetUpTestSuite() {
         android::emulation::injectGraphicsAgents(android::emulation::MockGraphicsAgentFactory());
@@ -83,27 +83,28 @@ const bool GfxStreamBackendTest::useWindow =
         android::base::getEnvironmentVariable("ANDROID_EMU_TEST_WITH_WINDOW") == "1";
 
 TEST_F(GfxStreamBackendTest, Init) {
-    stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
+    gfxstream_backend_init(width, height, 0, &cookie,
+                           GFXSTREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT |
+                                   GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT,
+                           &callbacks, &gfxstreamcallbacks);
 }
 
 TEST_F(GfxStreamBackendTest, InitOpenGLWindow) {
     if (!useWindow) {
         return;
     }
-
-    std::vector<stream_renderer_param> glParams = streamRendererParams;
-    for (auto& param: glParams) {
-        if (param.key == STREAM_RENDERER_PARAM_RENDERER_FLAGS) {
-            param.value = rendererFlags;
-        }
-    }
-    stream_renderer_init(glParams.data(), glParams.size());
+    gfxstream_backend_init(width, height, 0, &cookie,
+                           GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT, &callbacks,
+                           &gfxstreamcallbacks);
     gfxstream_backend_setup_window(window->getFramebufferNativeWindow(), 0, 0,
                                        width, height, width, height);
 }
 
 TEST_F(GfxStreamBackendTest, SimpleFlush) {
-    stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
+    gfxstream_backend_init(width, height, 0, &cookie,
+                           GFXSTREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT |
+                                   GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT,
+                           &callbacks, &gfxstreamcallbacks);
 
     const uint32_t res_id = 8;
     struct virgl_renderer_resource_create_args create_resource_args = {
@@ -132,7 +133,10 @@ TEST_F(GfxStreamBackendTest, SimpleFlush) {
 
 // Tests compile and link only.
 TEST_F(GfxStreamBackendTest, DISABLED_ApiCallLinkTest) {
-    stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
+    gfxstream_backend_init(width, height, 0, &cookie,
+            GFXSTREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT |
+            GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT,
+            &callbacks, &gfxstreamcallbacks);
 
     const uint32_t res_id = 8;
     struct virgl_renderer_resource_create_args create_resource_args = {

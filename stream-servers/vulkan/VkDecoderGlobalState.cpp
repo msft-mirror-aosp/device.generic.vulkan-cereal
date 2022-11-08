@@ -1288,6 +1288,8 @@ class VkDecoderGlobalState::Impl {
             queueFamilyIndexCounts[queueFamilyIndex] = queueCount;
         }
 
+        auto it = mPhysdevInfo.find(physicalDevice);
+
         for (auto it : queueFamilyIndexCounts) {
             auto index = it.first;
             auto count = it.second;
@@ -1351,8 +1353,8 @@ class VkDecoderGlobalState::Impl {
     }
 
     void destroyDeviceLocked(VkDevice device, const VkAllocationCallbacks* pAllocator) {
-        auto* deviceInfo = android::base::find(mDeviceInfo, device);
-        if (!deviceInfo) return;
+        auto it = mDeviceInfo.find(device);
+        if (it == mDeviceInfo.end()) return;
 
         auto eraseIt = mQueueInfo.begin();
         for (; eraseIt != mQueueInfo.end();) {
@@ -1365,10 +1367,10 @@ class VkDecoderGlobalState::Impl {
             }
         }
 
-        VulkanDispatch* deviceDispatch = dispatch_VkDevice(deviceInfo->boxed);
+        VulkanDispatch* deviceDispatch = dispatch_VkDevice(it->second.boxed);
 
         // Destroy pooled external fences
-        auto deviceFences = deviceInfo->externalFencePool->popAll();
+        auto deviceFences = it->second.externalFencePool->popAll();
         for (auto fence : deviceFences) {
             deviceDispatch->vkDestroyFence(device, fence, pAllocator);
             mFenceInfo.erase(fence);
@@ -1382,7 +1384,7 @@ class VkDecoderGlobalState::Impl {
         // Run the underlying API call.
         m_vk->vkDestroyDevice(device, pAllocator);
 
-        delete_VkDevice(deviceInfo->boxed);
+        delete_VkDevice(it->second.boxed);
     }
 
     void on_vkDestroyDevice(android::base::BumpPool* pool, VkDevice boxed_device,
@@ -1430,10 +1432,12 @@ class VkDecoderGlobalState::Impl {
 
     void setBufferMemoryBindInfoLocked(VkBuffer buffer, VkDeviceMemory memory,
                                        VkDeviceSize memoryOffset) {
-        auto* bufferInfo = android::base::find(mBufferInfo, buffer);
-        if (!bufferInfo) return;
-        bufferInfo->memory = memory;
-        bufferInfo->memoryOffset = memoryOffset;
+        auto it = mBufferInfo.find(buffer);
+        if (it == mBufferInfo.end()) {
+            return;
+        }
+        it->second.memory = memory;
+        it->second.memoryOffset = memoryOffset;
     }
 
     VkResult on_vkBindBufferMemory(android::base::BumpPool* pool, VkDevice boxed_device,
@@ -1590,14 +1594,15 @@ class VkDecoderGlobalState::Impl {
 
     void destroyImageLocked(VkDevice device, VulkanDispatch* deviceDispatch, VkImage image,
                             const VkAllocationCallbacks* pAllocator) {
-        auto* imageInfo = android::base::find(mImageInfo, image);
-        if (!imageInfo) return;
+        auto imageInfoIt = mImageInfo.find(image);
+        if (imageInfoIt == mImageInfo.end()) return;
+        auto& imageInfo = imageInfoIt->second;
 
-        if (!imageInfo->anbInfo) {
-            if (imageInfo->cmpInfo.isCompressed) {
-                CompressedImageInfo& cmpInfo = imageInfo->cmpInfo;
+        if (!imageInfo.anbInfo) {
+            if (imageInfo.cmpInfo.isCompressed) {
+                CompressedImageInfo& cmpInfo = imageInfo.cmpInfo;
                 if (image != cmpInfo.decompImg) {
-                    deviceDispatch->vkDestroyImage(device, cmpInfo.decompImg, nullptr);
+                    deviceDispatch->vkDestroyImage(device, imageInfo.cmpInfo.decompImg, nullptr);
                 }
                 for (const auto& image : cmpInfo.sizeCompImgs) {
                     deviceDispatch->vkDestroyImage(device, image, nullptr);
@@ -1641,26 +1646,32 @@ class VkDecoderGlobalState::Impl {
             return result;
         }
         std::lock_guard<std::recursive_mutex> lock(mLock);
-        auto* deviceInfo = android::base::find(mDeviceInfo, device);
-        if (!deviceInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
-        auto* mapInfo = android::base::find(mMapInfo, memory);
-        if (!mapInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        auto deviceInfoIt = mDeviceInfo.find(device);
+        if (deviceInfoIt == mDeviceInfo.end()) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        auto mapInfoIt = mMapInfo.find(memory);
+        if (mapInfoIt == mMapInfo.end()) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
 #ifdef VK_MVK_moltenvk
-        if (mapInfo->mtlTexture) {
-            result = m_vk->vkSetMTLTextureMVK(image, mapInfo->mtlTexture);
+        if (mapInfoIt->second.mtlTexture) {
+            result = m_vk->vkSetMTLTextureMVK(image, mapInfoIt->second.mtlTexture);
             if (result != VK_SUCCESS) {
                 fprintf(stderr, "vkSetMTLTexture failed\n");
                 return VK_ERROR_OUT_OF_HOST_MEMORY;
             }
         }
 #endif
-        if (!deviceInfo->emulateTextureEtc2 && !deviceInfo->emulateTextureAstc) {
+        if (!deviceInfoIt->second.emulateTextureEtc2 && !deviceInfoIt->second.emulateTextureAstc) {
             return VK_SUCCESS;
         }
-        auto* imageInfo = android::base::find(mImageInfo, image);
-        if (!imageInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
-        CompressedImageInfo& cmp = imageInfo->cmpInfo;
-        if (!deviceInfo->needEmulatedDecompression(cmp)) {
+        auto imageInfoIt = mImageInfo.find(image);
+        if (imageInfoIt == mImageInfo.end()) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        CompressedImageInfo& cmp = imageInfoIt->second.cmpInfo;
+        if (!deviceInfoIt->second.needEmulatedDecompression(cmp)) {
             return VK_SUCCESS;
         }
         for (size_t i = 0; i < cmp.sizeCompImgs.size(); i++) {
@@ -1682,33 +1693,39 @@ class VkDecoderGlobalState::Impl {
         }
 
         std::lock_guard<std::recursive_mutex> lock(mLock);
-        auto* deviceInfo = android::base::find(mDeviceInfo, device);
-        auto* imageInfo = android::base::find(mImageInfo, pCreateInfo->image);
-        if (!deviceInfo || !imageInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        auto deviceInfoIt = mDeviceInfo.find(device);
+        if (deviceInfoIt == mDeviceInfo.end()) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        auto imageInfoIt = mImageInfo.find(pCreateInfo->image);
+        if (imageInfoIt == mImageInfo.end()) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
         VkImageViewCreateInfo createInfo;
         bool needEmulatedAlpha = false;
-        if (deviceInfo->emulateTextureEtc2 || deviceInfo->emulateTextureAstc) {
+        if (deviceInfoIt->second.emulateTextureEtc2 || deviceInfoIt->second.emulateTextureAstc) {
             CompressedImageInfo cmpInfo = CompressedImageInfo::create(pCreateInfo->format);
-            if (deviceInfo->needEmulatedDecompression(cmpInfo)) {
-                if (imageInfo->cmpInfo.decompImg) {
+            if (deviceInfoIt->second.needEmulatedDecompression(cmpInfo)) {
+                if (imageInfoIt->second.cmpInfo.decompImg) {
                     createInfo = *pCreateInfo;
                     createInfo.format = cmpInfo.decompFormat;
                     needEmulatedAlpha = cmpInfo.needEmulatedAlpha();
-                    createInfo.image = imageInfo->cmpInfo.decompImg;
+                    createInfo.image = imageInfoIt->second.cmpInfo.decompImg;
                     pCreateInfo = &createInfo;
                 }
-            } else if (deviceInfo->needEmulatedDecompression(imageInfo->cmpInfo)) {
+            } else if (deviceInfoIt->second.needEmulatedDecompression(
+                           imageInfoIt->second.cmpInfo)) {
                 // Size compatible image view
                 createInfo = *pCreateInfo;
                 createInfo.format = cmpInfo.sizeCompFormat;
                 needEmulatedAlpha = false;
-                createInfo.image =
-                    imageInfo->cmpInfo.sizeCompImgs[pCreateInfo->subresourceRange.baseMipLevel];
+                createInfo.image = imageInfoIt->second.cmpInfo
+                                       .sizeCompImgs[pCreateInfo->subresourceRange.baseMipLevel];
                 createInfo.subresourceRange.baseMipLevel = 0;
                 pCreateInfo = &createInfo;
             }
         }
-        if (imageInfo->anbInfo && imageInfo->anbInfo->externallyBacked) {
+        if (imageInfoIt->second.anbInfo && imageInfoIt->second.anbInfo->externallyBacked) {
             createInfo = *pCreateInfo;
             pCreateInfo = &createInfo;
         }
@@ -1772,13 +1789,14 @@ class VkDecoderGlobalState::Impl {
                               const VkAllocationCallbacks* pAllocator) {
         deviceDispatch->vkDestroySampler(device, sampler, pAllocator);
 
-        auto* samplerInfo = android::base::find(mSamplerInfo, sampler);
-        if (!samplerInfo) return;
+        auto samplerInfoIt = mSamplerInfo.find(sampler);
+        if (samplerInfoIt == mSamplerInfo.end()) return;
+        auto& samplerInfo = samplerInfoIt->second;
 
-        if (samplerInfo->emulatedborderSampler != VK_NULL_HANDLE) {
-            deviceDispatch->vkDestroySampler(device, samplerInfo->emulatedborderSampler, nullptr);
+        if (samplerInfo.emulatedborderSampler != VK_NULL_HANDLE) {
+            deviceDispatch->vkDestroySampler(device, samplerInfo.emulatedborderSampler, nullptr);
         }
-        mSamplerInfo.erase(sampler);
+        mSamplerInfo.erase(samplerInfoIt);
     }
 
     void on_vkDestroySampler(android::base::BumpPool* pool, VkDevice boxed_device,
@@ -1862,9 +1880,11 @@ class VkDecoderGlobalState::Impl {
             vk_struct_chain_remove(exportFenceInfoPtr, &createInfo);
             {
                 std::lock_guard<std::recursive_mutex> lock(mLock);
-                auto* deviceInfo = android::base::find(mDeviceInfo, device);
-                if (!deviceInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
-                externalFencePool = deviceInfo->externalFencePool.get();
+                auto deviceInfo = mDeviceInfo.find(device);
+                if (deviceInfo == mDeviceInfo.end()) {
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                externalFencePool = deviceInfo->second.externalFencePool.get();
             }
             *pFence = externalFencePool->pop(pCreateInfo);
             if (*pFence != VK_NULL_HANDLE) {
@@ -1927,14 +1947,16 @@ class VkDecoderGlobalState::Impl {
         // TODO: should store creation info / pNext chain per fence and re-apply?
         VkFenceCreateInfo createInfo{
             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = 0, .flags = 0};
-        auto* deviceInfo = android::base::find(mDeviceInfo, device);
-        if (!deviceInfo) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        auto deviceInfo = mDeviceInfo.find(device);
+        if (deviceInfo == mDeviceInfo.end()) {
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
         for (auto fence : externalFences) {
-            VkFence replacement = deviceInfo->externalFencePool->pop(&createInfo);
+            VkFence replacement = deviceInfo->second.externalFencePool->pop(&createInfo);
             if (replacement == VK_NULL_HANDLE) {
                 VK_CHECK(vk->vkCreateFence(device, &createInfo, 0, &replacement));
             }
-            deviceInfo->externalFencePool->add(fence);
+            deviceInfo->second.externalFencePool->add(fence);
 
             {
                 std::lock_guard<std::recursive_mutex> lock(mLock);
@@ -2059,9 +2081,9 @@ class VkDecoderGlobalState::Impl {
             // External fences are just slated for recycling. This addresses known
             // behavior where the guest might destroy the fence prematurely. b/228221208
             if (mFenceInfo[fence].external) {
-                auto* deviceInfo = android::base::find(mDeviceInfo, device);
-                if (deviceInfo) {
-                    deviceInfo->externalFencePool->add(fence);
+                auto deviceInfo = mDeviceInfo.find(device);
+                if (deviceInfo != mDeviceInfo.end()) {
+                    deviceInfo->second.externalFencePool->add(fence);
                     mFenceInfo[fence].boxed = VK_NULL_HANDLE;
                     return;
                 }
@@ -2334,10 +2356,15 @@ class VkDecoderGlobalState::Impl {
             }
             for (uint32_t j = 0; j < descriptorWrite.descriptorCount; j++) {
                 const VkDescriptorImageInfo& imageInfo = descriptorWrite.pImageInfo[j];
-                const auto* imgViewInfo = android::base::find(mImageViewInfo, imageInfo.imageView);
-                const auto* samplerInfo = android::base::find(mSamplerInfo, imageInfo.sampler);
-                if (!imgViewInfo || !samplerInfo) continue;
-                if (imgViewInfo->needEmulatedAlpha && samplerInfo->needEmulatedAlpha) {
+                const auto& viewIt = mImageViewInfo.find(imageInfo.imageView);
+                if (viewIt == mImageViewInfo.end()) {
+                    continue;
+                }
+                const auto& samplerIt = mSamplerInfo.find(imageInfo.sampler);
+                if (samplerIt == mSamplerInfo.end()) {
+                    continue;
+                }
+                if (viewIt->second.needEmulatedAlpha && samplerIt->second.needEmulatedAlpha) {
                     needEmulateWriteDescriptor = true;
                     descriptorWritesNeedDeepCopy[i] = true;
                     break;
@@ -2370,15 +2397,22 @@ class VkDecoderGlobalState::Impl {
             dstDescriptorWrite.pImageInfo = imageInfos;
             for (uint32_t j = 0; j < dstDescriptorWrite.descriptorCount; j++) {
                 VkDescriptorImageInfo& imageInfo = imageInfos[j];
-                const auto* imgViewInfo = android::base::find(mImageViewInfo, imageInfo.imageView);
-                auto* samplerInfo = android::base::find(mSamplerInfo, imageInfo.sampler);
-                if (!imgViewInfo || !samplerInfo) continue;
-                if (imgViewInfo->needEmulatedAlpha && samplerInfo->needEmulatedAlpha) {
-                    if (samplerInfo->emulatedborderSampler == VK_NULL_HANDLE) {
+                const auto& viewIt = mImageViewInfo.find(imageInfo.imageView);
+                if (viewIt == mImageViewInfo.end()) {
+                    continue;
+                }
+                const auto& samplerIt = mSamplerInfo.find(imageInfo.sampler);
+                if (samplerIt == mSamplerInfo.end()) {
+                    continue;
+                }
+                if (viewIt->second.needEmulatedAlpha && samplerIt->second.needEmulatedAlpha) {
+                    SamplerInfo& samplerInfo = samplerIt->second;
+                    if (samplerInfo.emulatedborderSampler == VK_NULL_HANDLE) {
                         // create the emulated sampler
                         VkSamplerCreateInfo createInfo;
-                        deepcopy_VkSamplerCreateInfo(pool, VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-                                                     &samplerInfo->createInfo, &createInfo);
+                        deepcopy_VkSamplerCreateInfo(
+                                pool, VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                                &samplerInfo.createInfo, &createInfo);
                         switch (createInfo.borderColor) {
                             case VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK:
                                 createInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
@@ -2414,9 +2448,9 @@ class VkDecoderGlobalState::Impl {
                                 break;
                         }
                         vk->vkCreateSampler(device, &createInfo, nullptr,
-                                            &samplerInfo->emulatedborderSampler);
+                                            &samplerInfo.emulatedborderSampler);
                     }
-                    imageInfo.sampler = samplerInfo->emulatedborderSampler;
+                    imageInfo.sampler = samplerInfo.emulatedborderSampler;
                 }
             }
         }
@@ -2623,17 +2657,25 @@ class VkDecoderGlobalState::Impl {
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
 
         std::lock_guard<std::recursive_mutex> lock(mLock);
-        auto* imageInfo = android::base::find(mImageInfo, srcImage);
-        auto* bufferInfo = android::base::find(mBufferInfo, dstBuffer);
-        if (!imageInfo || !bufferInfo) return;
-        auto* deviceInfo = android::base::find(mDeviceInfo, bufferInfo->device);
-        if (!deviceInfo) return;
-        CompressedImageInfo& cmp = imageInfo->cmpInfo;
-        if (!deviceInfo->needEmulatedDecompression(cmp)) {
+        auto it = mImageInfo.find(srcImage);
+        if (it == mImageInfo.end()) {
+            return;
+        }
+        auto bufferInfoIt = mBufferInfo.find(dstBuffer);
+        if (bufferInfoIt == mBufferInfo.end()) {
+            return;
+        }
+        VkDevice device = bufferInfoIt->second.device;
+        auto deviceInfoIt = mDeviceInfo.find(device);
+        if (deviceInfoIt == mDeviceInfo.end()) {
+            return;
+        }
+        if (!deviceInfoIt->second.needEmulatedDecompression(it->second.cmpInfo)) {
             vk->vkCmdCopyImageToBuffer(commandBuffer, srcImage, srcImageLayout, dstBuffer,
                                        regionCount, pRegions);
             return;
         }
+        CompressedImageInfo& cmp = it->second.cmpInfo;
         for (uint32_t r = 0; r < regionCount; r++) {
             VkBufferImageCopy region;
             region = pRegions[r];
@@ -3777,10 +3819,10 @@ class VkDecoderGlobalState::Impl {
 
         vk->vkDestroyCommandPool(device, commandPool, pAllocator);
         std::lock_guard<std::recursive_mutex> lock(mLock);
-        const auto* cmdPoolInfo = android::base::find(mCmdPoolInfo, commandPool);
-        if (cmdPoolInfo) {
-            removeCommandBufferInfo(cmdPoolInfo->cmdBuffers);
-            mCmdPoolInfo.erase(commandPool);
+        const auto ite = mCmdPoolInfo.find(commandPool);
+        if (ite != mCmdPoolInfo.end()) {
+            removeCommandBufferInfo(ite->second.cmdBuffers);
+            mCmdPoolInfo.erase(ite);
         }
     }
 
@@ -3845,11 +3887,11 @@ class VkDecoderGlobalState::Impl {
         // waitForFence() on this fence.
         {
             std::lock_guard<std::recursive_mutex> lock(mLock);
-            auto* fenceInfo = android::base::find(mFenceInfo, fence);
-            if (fenceInfo) {
-                fenceInfo->state = FenceInfo::State::kWaitable;
-                fenceInfo->lock.lock();
-                fenceInfo->cv.signalAndUnlock(&fenceInfo->lock);
+            auto fenceInfo = mFenceInfo.find(fence);
+            if (fenceInfo != mFenceInfo.end()) {
+                fenceInfo->second.state = FenceInfo::State::kWaitable;
+                fenceInfo->second.lock.lock();
+                fenceInfo->second.cv.signalAndUnlock(&fenceInfo->second.lock);
             }
         }
 
@@ -4223,10 +4265,10 @@ class VkDecoderGlobalState::Impl {
         vk->vkCmdBindPipeline(commandBuffer, pipelineBindPoint, pipeline);
         if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
             std::lock_guard<std::recursive_mutex> lock(mLock);
-            auto* cmdBufferInfo = android::base::find(mCmdBufferInfo, commandBuffer);
-            if (cmdBufferInfo) {
+            auto cmdBufferInfoIt = mCmdBufferInfo.find(commandBuffer);
+            if (cmdBufferInfoIt != mCmdBufferInfo.end()) {
                 if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
-                    cmdBufferInfo->computePipeline = pipeline;
+                    cmdBufferInfoIt->second.computePipeline = pipeline;
                 }
             }
         }
@@ -4245,16 +4287,17 @@ class VkDecoderGlobalState::Impl {
                                     pDynamicOffsets);
         if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
             std::lock_guard<std::recursive_mutex> lock(mLock);
-            auto* cmdBufferInfo = android::base::find(mCmdBufferInfo, commandBuffer);
-            if (cmdBufferInfo) {
-                cmdBufferInfo->descriptorLayout = layout;
+            auto cmdBufferInfoIt = mCmdBufferInfo.find(commandBuffer);
+            if (cmdBufferInfoIt != mCmdBufferInfo.end()) {
+                auto& cmdBufferInfo = cmdBufferInfoIt->second;
+                cmdBufferInfo.descriptorLayout = layout;
 
                 if (descriptorSetCount) {
-                    cmdBufferInfo->firstSet = firstSet;
-                    cmdBufferInfo->descriptorSets.assign(pDescriptorSets,
-                                                         pDescriptorSets + descriptorSetCount);
-                    cmdBufferInfo->dynamicOffsets.assign(pDynamicOffsets,
-                                                         pDynamicOffsets + dynamicOffsetCount);
+                    cmdBufferInfo.firstSet = firstSet;
+                    cmdBufferInfo.descriptorSets.assign(pDescriptorSets,
+                                                        pDescriptorSets + descriptorSetCount);
+                    cmdBufferInfo.dynamicOffsets.assign(pDynamicOffsets,
+                                                        pDynamicOffsets + dynamicOffsetCount);
                 }
             }
         }
@@ -4270,11 +4313,14 @@ class VkDecoderGlobalState::Impl {
         bool needReformat = false;
         std::lock_guard<std::recursive_mutex> lock(mLock);
 
-        auto* deviceInfo = android::base::find(mDeviceInfo, device);
-        if (!deviceInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
-        if (deviceInfo->emulateTextureEtc2 || deviceInfo->emulateTextureAstc) {
+        auto deviceInfoIt = mDeviceInfo.find(device);
+        if (deviceInfoIt == mDeviceInfo.end()) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        if (deviceInfoIt->second.emulateTextureEtc2 || deviceInfoIt->second.emulateTextureAstc) {
             for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
-                if (deviceInfo->needEmulatedDecompression(pCreateInfo->pAttachments[i].format)) {
+                if (deviceInfoIt->second.needEmulatedDecompression(
+                        pCreateInfo->pAttachments[i].format)) {
                     needReformat = true;
                     break;
                 }
@@ -5399,14 +5445,16 @@ class VkDecoderGlobalState::Impl {
 
     void updateImageMemorySizeLocked(VkDevice device, VkImage image,
                                      VkMemoryRequirements* pMemoryRequirements) {
-        auto* deviceInfo = android::base::find(mDeviceInfo, device);
-        if (!deviceInfo->emulateTextureEtc2 && !deviceInfo->emulateTextureAstc) {
+        auto deviceInfoIt = mDeviceInfo.find(device);
+        if (!deviceInfoIt->second.emulateTextureEtc2 && !deviceInfoIt->second.emulateTextureAstc) {
             return;
         }
-        auto* imageInfo = android::base::find(mImageInfo, image);
-        if (!imageInfo) return;
-        CompressedImageInfo& cmpInfo = imageInfo->cmpInfo;
-        if (!deviceInfo->needEmulatedDecompression(cmpInfo)) {
+        auto it = mImageInfo.find(image);
+        if (it == mImageInfo.end()) {
+            return;
+        }
+        CompressedImageInfo& cmpInfo = it->second.cmpInfo;
+        if (!deviceInfoIt->second.needEmulatedDecompression(cmpInfo)) {
             return;
         }
         pMemoryRequirements->alignment =
@@ -5582,13 +5630,15 @@ class VkDecoderGlobalState::Impl {
     }
 
     void executePreprocessRecursive(int level, VkCommandBuffer cmdBuffer) {
-        auto* cmdBufferInfo = android::base::find(mCmdBufferInfo, cmdBuffer);
-        if (!cmdBufferInfo) return;
-        for (const auto& func : cmdBufferInfo->preprocessFuncs) {
+        auto cmdBufferIt = mCmdBufferInfo.find(cmdBuffer);
+        if (cmdBufferIt == mCmdBufferInfo.end()) {
+            return;
+        }
+        for (const auto& func : cmdBufferIt->second.preprocessFuncs) {
             func();
         }
         // TODO: fix
-        // for (const auto& subCmd : cmdBufferInfo->subCmds) {
+        // for (const auto& subCmd : cmdBufferIt->second.subCmds) {
         // executePreprocessRecursive(level + 1, subCmd);
         // }
     }

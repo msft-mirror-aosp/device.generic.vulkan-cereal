@@ -7,7 +7,6 @@ add_subdirectory(OpenGLESDispatch)
 
 # GLES translator
 add_subdirectory(glestranslator)
-add_subdirectory(glsnapshot)
 
 add_library(gfxstream-gl-server
             CompositorGl.cpp

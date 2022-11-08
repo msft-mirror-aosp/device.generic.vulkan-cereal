@@ -25,8 +25,6 @@
 #include "aemu/base/containers/Lookup.h"
 #include "host-common/logging.h"
 
-namespace gfxstream {
-
 EmulatedEglWindowSurface::EmulatedEglWindowSurface(EGLDisplay display,
                                                    EGLConfig config,
                                                    HandleType hndl) :
@@ -40,21 +38,25 @@ EmulatedEglWindowSurface::~EmulatedEglWindowSurface() {
     }
 }
 
-std::unique_ptr<EmulatedEglWindowSurface> EmulatedEglWindowSurface::create(
-        EGLDisplay display,
-        EGLConfig config,
-        int p_width,
-        int p_height,
-        HandleType hndl) {
-    std::unique_ptr<EmulatedEglWindowSurface> surface(
-        new EmulatedEglWindowSurface(display, config, hndl));
-
-    // Create a pbuffer to be used as the egl surface for that window.
-    if (!surface->resize(p_width, p_height)) {
-        return nullptr;
+EmulatedEglWindowSurface *EmulatedEglWindowSurface::create(EGLDisplay display,
+                                                           EGLConfig config,
+                                                           int p_width,
+                                                           int p_height,
+                                                           HandleType hndl) {
+    // allocate space for the EmulatedEglWindowSurface object
+    EmulatedEglWindowSurface *win = new EmulatedEglWindowSurface(display, config, hndl);
+    if (!win) {
+        return NULL;
     }
 
-    return surface;
+    // Create a pbuffer to be used as the egl surface
+    // for that window.
+    if (!win->resize(p_width, p_height)) {
+        delete win;
+        return NULL;
+    }
+
+    return win;
 }
 
 void EmulatedEglWindowSurface::setColorBuffer(ColorBufferPtr p_colorBuffer) {
@@ -214,11 +216,10 @@ void EmulatedEglWindowSurface::onSave(android::base::Stream* stream) const {
     }
 }
 
-std::unique_ptr<EmulatedEglWindowSurface> EmulatedEglWindowSurface::onLoad(
-        android::base::Stream* stream,
-        EGLDisplay display,
-        const ColorBufferMap& colorBuffers,
-        const EmulatedEglContextMap& contexts) {
+EmulatedEglWindowSurface * EmulatedEglWindowSurface::onLoad(android::base::Stream* stream,
+                                                            EGLDisplay display,
+                                                            const ColorBufferMap& colorBuffers,
+                                                            const EmulatedEglContextMap& contexts) {
     HandleType hndl = stream->getBe32();
     HandleType colorBufferHndl = stream->getBe32();
     HandleType readCtx = stream->getBe32();
@@ -230,18 +231,15 @@ std::unique_ptr<EmulatedEglWindowSurface> EmulatedEglWindowSurface::onLoad(
     if (s_egl.eglLoadConfig) {
         config = s_egl.eglLoadConfig(display, stream);
     }
-
-    auto surface = create(display, config, width, height, hndl);
-    assert(surface);
+    EmulatedEglWindowSurface* ret = create(display, config, width, height, hndl);
+    assert(ret);
     // fb is already locked by its caller
     if (colorBufferHndl) {
         const auto* colorBufferRef = android::base::find(colorBuffers, colorBufferHndl);
         assert(colorBufferRef);
-        surface->mAttachedColorBuffer = colorBufferRef->cb;
+        ret->mAttachedColorBuffer = colorBufferRef->cb;
     }
-    surface->mReadContext = android::base::findOrDefault(contexts, readCtx);
-    surface->mDrawContext = android::base::findOrDefault(contexts, drawCtx);
-    return surface;
+    ret->mReadContext = android::base::findOrDefault(contexts, readCtx);
+    ret->mDrawContext = android::base::findOrDefault(contexts, drawCtx);
+    return ret;
 }
-
-}  // namespace gfxstream

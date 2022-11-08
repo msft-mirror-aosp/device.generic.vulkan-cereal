@@ -19,13 +19,6 @@
 
 #include <memory>
 
-using gfxstream::GLESApi;
-using gfxstream::GLESApi_2;
-using gfxstream::GLESApi_3_0;
-using gfxstream::GLESApi_3_1;
-using gfxstream::GLESApi_3_2;
-using gfxstream::GLESApi_CM;
-
 namespace emugl {
 
 struct ClearColorParam {

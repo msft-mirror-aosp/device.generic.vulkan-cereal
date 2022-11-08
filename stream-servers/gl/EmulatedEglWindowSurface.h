@@ -27,8 +27,6 @@
 #include "Handle.h"
 #include "gl/EmulatedEglContext.h"
 
-namespace gfxstream {
-
 // A class used to model a guest-side window surface. The implementation
 // uses a host Pbuffer to act as the EGL rendering surface instead.
 class EmulatedEglWindowSurface {
@@ -39,11 +37,11 @@ class EmulatedEglWindowSurface {
     // |width| and |height| are the initial size of the Pbuffer.
     // Return a new EmulatedEglWindowSurface instance on success, or NULL on
     // failure.
-    static std::unique_ptr<EmulatedEglWindowSurface> create(EGLDisplay display,
-                                                            EGLConfig config,
-                                                            int width,
-                                                            int height,
-                                                            HandleType hndl);
+    static EmulatedEglWindowSurface* create(EGLDisplay display,
+                                            EGLConfig config,
+                                            int width,
+                                            int height,
+                                            HandleType hndl);
 
     // Destructor.
     ~EmulatedEglWindowSurface();
@@ -95,12 +93,10 @@ class EmulatedEglWindowSurface {
     GLuint getHeight() const;
 
     void onSave(android::base::Stream* stream) const;
-    static std::unique_ptr<EmulatedEglWindowSurface> onLoad(
-      android::base::Stream* stream,
-      EGLDisplay display,
-      const ColorBufferMap& colorBuffers,
-      const EmulatedEglContextMap& contexts);
-
+    static EmulatedEglWindowSurface *onLoad(android::base::Stream* stream,
+                                            EGLDisplay display,
+                                            const ColorBufferMap& colorBuffers,
+                                            const EmulatedEglContextMap& contexts);
     HandleType getHndl() const;
 
   private:
@@ -124,5 +120,3 @@ class EmulatedEglWindowSurface {
 typedef std::shared_ptr<EmulatedEglWindowSurface> EmulatedEglWindowSurfacePtr;
 typedef std::unordered_map<HandleType, std::pair<EmulatedEglWindowSurfacePtr, HandleType>> EmulatedEglWindowSurfaceMap;
 typedef std::unordered_set<HandleType> EmulatedEglWindowSurfaceSet;
-
-}
