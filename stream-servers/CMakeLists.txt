@@ -13,15 +13,12 @@ add_subdirectory(renderControl_dec)
 
 # Stream server core
 set(stream-server-core-sources
-    Buffer.cpp
     GfxStreamAgents.cpp
     VirtioGpuTimelines.cpp
     ChannelStream.cpp
-    ColorBuffer.cpp
     Debug.cpp
     DisplaySurface.cpp
     DisplaySurfaceUser.cpp
-    FenceSync.cpp
     Hwc2.cpp
     PostWorker.cpp
     ReadbackWorker.cpp
