@@ -44,6 +44,8 @@ using android::base::AutoLock;
 using android::base::Lock;
 using emugl::emugl_sync_device_exists;
 using emugl::emugl_sync_register_trigger_wait;
+using gfxstream::GLESApi;
+using gfxstream::GLESApi_CM;
 
 #define DEBUG_GRALLOC_SYNC 0
 #define DEBUG_EGL_SYNC 0
@@ -788,7 +790,7 @@ static void rcDestroyContext(uint32_t context)
         return;
     }
 
-    fb->DestroyEmulatedEglContext(context);
+    fb->destroyEmulatedEglContext(context);
 }
 
 static uint32_t rcCreateWindowSurface(uint32_t config,
@@ -809,7 +811,7 @@ static void rcDestroyWindowSurface(uint32_t windowSurface)
         return;
     }
 
-    fb->DestroyEmulatedEglWindowSurface(windowSurface);
+    fb->destroyEmulatedEglWindowSurface(windowSurface);
 }
 
 static uint32_t rcCreateColorBuffer(uint32_t width,
@@ -1076,7 +1078,7 @@ static uint32_t rcCreateClientImage(uint32_t context, EGLenum target, GLuint buf
         return 0;
     }
 
-    return fb->createClientImage(context, target, buffer);
+    return fb->createEmulatedEglImage(context, target, buffer);
 }
 
 static int rcDestroyClientImage(uint32_t image)
@@ -1086,7 +1088,7 @@ static int rcDestroyClientImage(uint32_t image)
         return 0;
     }
 
-    return fb->destroyClientImage(image);
+    return fb->destroyEmulatedEglImage(image);
 }
 
 static void rcSelectChecksumHelper(uint32_t protocol, uint32_t reserved) {

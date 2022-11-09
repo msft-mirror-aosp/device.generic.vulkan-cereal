@@ -7,6 +7,7 @@ add_subdirectory(OpenGLESDispatch)
 
 # GLES translator
 add_subdirectory(glestranslator)
+add_subdirectory(glsnapshot)
 
 add_library(gfxstream-gl-server
             CompositorGl.cpp
@@ -14,6 +15,7 @@ add_library(gfxstream-gl-server
             DisplaySurfaceGl.cpp
             EmulatedEglConfig.cpp
             EmulatedEglContext.cpp
+            EmulatedEglImage.cpp
             EmulatedEglWindowSurface.cpp
             EmulationGl.cpp
             GLESVersionDetector.cpp
