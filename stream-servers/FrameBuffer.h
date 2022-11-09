@@ -29,8 +29,6 @@
 #include <GLES2/gl2ext.h>
 #include <stdint.h>
 
-#include "Buffer.h"
-#include "ColorBuffer.h"
 #include "Compositor.h"
 #include "Display.h"
 #include "DisplaySurface.h"
@@ -47,6 +45,8 @@
 #include "aemu/base/files/Stream.h"
 #include "aemu/base/threads/Thread.h"
 #include "aemu/base/threads/WorkerThread.h"
+#include "gl/BufferGl.h"
+#include "gl/ColorBufferGl.h"
 #include "gl/CompositorGl.h"
 #include "gl/DisplaySurfaceGl.h"
 #include "gl/EmulatedEglConfig.h"
@@ -215,6 +215,11 @@ class FrameBuffer {
 
     // Returns the set of ColorBuffers destroyed (for further cleanup)
     std::vector<HandleType> destroyEmulatedEglWindowSurfaceLocked(HandleType p_surface);
+
+    void createEmulatedEglFenceSync(EGLenum type,
+                                    int destroyWhenSignaled,
+                                    uint64_t* outSync = nullptr,
+                                    uint64_t* outSyncThread = nullptr);
 
     // Create a new ColorBuffer instance from this display instance.
     // |p_width| and |p_height| are its dimensions in pixels.
