@@ -16,7 +16,7 @@
 
 #include "RenderThreadInfo.h"
 
-#include "base/Lock.h"
+#include "aemu/base/synchronization/Lock.h"
 
 #include <unordered_map>
 #include <unordered_set>

@@ -17,9 +17,9 @@
 #include "SyncThread.h"
 
 #include "OpenGLESDispatch/OpenGLDispatchLoader.h"
-#include "base/Metrics.h"
-#include "base/System.h"
-#include "base/Thread.h"
+#include "aemu/base/Metrics.h"
+#include "aemu/base/system/System.h"
+#include "aemu/base/threads/Thread.h"
 #include "host-common/GfxstreamFatalError.h"
 #include "host-common/crash_reporter.h"
 #include "host-common/logging.h"
@@ -33,6 +33,7 @@
 using android::base::EventHangMetadata;
 using emugl::ABORT_REASON_OTHER;
 using emugl::FatalError;
+using gfxstream::EmulatedEglFenceSync;
 
 #define DEBUG 0
 
@@ -117,7 +118,7 @@ SyncThread::~SyncThread() {
     cleanup();
 }
 
-void SyncThread::triggerWait(FenceSync* fenceSync,
+void SyncThread::triggerWait(EmulatedEglFenceSync* fenceSync,
                              uint64_t timeline) {
     std::stringstream ss;
     ss << "triggerWait fenceSyncInfo=0x" << std::hex << reinterpret_cast<uintptr_t>(fenceSync)
@@ -146,7 +147,7 @@ void SyncThread::triggerWaitVk(VkFence vkFence, uint64_t timeline) {
         ss.str());
 }
 
-void SyncThread::triggerBlockedWaitNoTimeline(FenceSync* fenceSync) {
+void SyncThread::triggerBlockedWaitNoTimeline(EmulatedEglFenceSync* fenceSync) {
     std::stringstream ss;
     ss << "triggerBlockedWaitNoTimeline fenceSyncInfo=0x" << std::hex
        << reinterpret_cast<uintptr_t>(fenceSync);
@@ -158,7 +159,7 @@ void SyncThread::triggerBlockedWaitNoTimeline(FenceSync* fenceSync) {
         ss.str());
 }
 
-void SyncThread::triggerWaitWithCompletionCallback(FenceSync* fenceSync, FenceCompletionCallback cb) {
+void SyncThread::triggerWaitWithCompletionCallback(EmulatedEglFenceSync* fenceSync, FenceCompletionCallback cb) {
     std::stringstream ss;
     ss << "triggerWaitWithCompletionCallback fenceSyncInfo=0x" << std::hex
        << reinterpret_cast<uintptr_t>(fenceSync);
@@ -272,9 +273,10 @@ void SyncThread::doSyncThreadCmd(Command&& command, WorkerId workerId) {
     std::unique_ptr<std::unordered_map<std::string, std::string>> syncThreadData =
         std::make_unique<std::unordered_map<std::string, std::string>>();
     syncThreadData->insert({{"syncthread_cmd_desc", command.mDescription}});
-    HealthWatchdog watchdog(mHealthMonitor, WATCHDOG_DATA("SyncThread task execution",
-                                                          EventHangMetadata::HangType::kSyncThread,
-                                                          std::move(syncThreadData)));
+    auto watchdog = WATCHDOG_BUILDER(mHealthMonitor, "SyncThread task execution")
+                        .setHangType(EventHangMetadata::HangType::kSyncThread)
+                        .setAnnotations(std::move(syncThreadData))
+                        .build();
     command.mTask(workerId);
 }
 
@@ -329,19 +331,20 @@ void SyncThread::initSyncEGLContext() {
             .mDescription = "init sync EGL context",
         };
     });
+    mWorkerThreadPool.waitAllItems();
 }
 
-void SyncThread::doSyncWait(FenceSync* fenceSync, std::function<void()> onComplete) {
+void SyncThread::doSyncWait(EmulatedEglFenceSync* fenceSync, std::function<void()> onComplete) {
     DPRINT("enter");
 
-    if (!FenceSync::getFromHandle((uint64_t)(uintptr_t)fenceSync)) {
+    if (!EmulatedEglFenceSync::getFromHandle((uint64_t)(uintptr_t)fenceSync)) {
         if (onComplete) {
             onComplete();
         }
         return;
     }
-    // We shouldn't use FenceSync to wait, when SyncThread is initialized
-    // without GL enabled, because FenceSync uses EGL/GLES.
+    // We shouldn't use EmulatedEglFenceSync to wait, when SyncThread is initialized
+    // without GL enabled, because EmulatedEglFenceSync uses EGL/GLES.
     SYNC_THREAD_CHECK(!mNoGL);
 
     EGLint wait_result = 0x0;
@@ -389,7 +392,7 @@ void SyncThread::doSyncWait(FenceSync* fenceSync, std::function<void()> onComple
     if (onComplete) {
         onComplete();
     }
-    FenceSync::incrementTimelineAndDeleteOldFences();
+    EmulatedEglFenceSync::incrementTimelineAndDeleteOldFences();
 
     DPRINT("done timeline increment");
 

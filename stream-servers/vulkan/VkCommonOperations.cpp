@@ -28,12 +28,12 @@
 #include "FrameBuffer.h"
 #include "VkFormatUtils.h"
 #include "VulkanDispatch.h"
-#include "base/Lock.h"
-#include "base/Lookup.h"
-#include "base/Optional.h"
-#include "base/StaticMap.h"
-#include "base/System.h"
-#include "base/Tracing.h"
+#include "aemu/base/synchronization/Lock.h"
+#include "aemu/base/containers/Lookup.h"
+#include "aemu/base/Optional.h"
+#include "aemu/base/containers/StaticMap.h"
+#include "aemu/base/system/System.h"
+#include "aemu/base/Tracing.h"
 #include "common/goldfish_vk_dispatch.h"
 #include "host-common/GfxstreamFatalError.h"
 #include "host-common/vm_operations.h"
@@ -531,8 +531,10 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
         extensionsSupported(exts, externalMemoryInstanceExtNames);
     bool externalSemaphoreCapabilitiesSupported =
         extensionsSupported(exts, externalSemaphoreInstanceExtNames);
+#ifdef VK_MVK_moltenvk
     bool moltenVKSupported =
         (vk->vkGetMTLTextureMVK != nullptr) && (vk->vkSetMTLTextureMVK != nullptr);
+#endif
 
     VkInstanceCreateInfo instCi = {
         VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, 0, 0, nullptr, 0, nullptr, 0, nullptr,
@@ -546,12 +548,14 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
         }
     }
 
+#ifdef VK_MVK_moltenvk
     if (moltenVKSupported) {
         // We don't need both moltenVK and external memory. Disable
         // external memory if moltenVK is supported.
         externalMemoryCapabilitiesSupported = false;
         enabledExtensions.clear();
     }
+#endif
 
     for (auto extension : SwapChainStateVk::getRequiredInstanceExtensions()) {
         enabledExtensions.emplace(extension);
@@ -639,8 +643,11 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
     sVkEmulation->vulkanInstanceVersion = appInfo.apiVersion;
 
     sVkEmulation->instanceSupportsExternalMemoryCapabilities = externalMemoryCapabilitiesSupported;
-    sVkEmulation->instanceSupportsExternalSemaphoreCapabilities = externalSemaphoreCapabilitiesSupported;
+    sVkEmulation->instanceSupportsExternalSemaphoreCapabilities =
+        externalSemaphoreCapabilitiesSupported;
+#ifdef VK_MVK_moltenvk
     sVkEmulation->instanceSupportsMoltenVK = moltenVKSupported;
+#endif
 
     if (sVkEmulation->instanceSupportsExternalMemoryCapabilities) {
         sVkEmulation->getImageFormatProperties2Func = vk_util::getVkInstanceProcAddrWithFallback<
@@ -654,6 +661,7 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
         vk_util::getVkInstanceProcAddrWithFallback<vk_util::vk_fn_info::GetPhysicalDeviceFeatures2>(
             {ivk->vkGetInstanceProcAddr, vk->vkGetInstanceProcAddr}, sVkEmulation->instance);
 
+#ifdef VK_MVK_moltenvk
     if (sVkEmulation->instanceSupportsMoltenVK) {
         sVkEmulation->setMTLTextureFunc = reinterpret_cast<PFN_vkSetMTLTextureMVK>(
             vk->vkGetInstanceProcAddr(sVkEmulation->instance, "vkSetMTLTextureMVK"));
@@ -670,6 +678,7 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
         }
         // LOG(VERBOSE) << "Instance supports VK_MVK_moltenvk.";
     }
+#endif
 
     uint32_t physdevCount = 0;
     ivk->vkEnumeratePhysicalDevices(sVkEmulation->instance, &physdevCount, nullptr);
@@ -1209,12 +1218,38 @@ void teardownGlobalVkEmulation() {
 
     freeExternalMemoryLocked(sVkEmulation->dvk, &sVkEmulation->staging.memory);
 
+    sVkEmulation->dvk->vkDestroyBuffer(sVkEmulation->device, sVkEmulation->staging.buffer, nullptr);
+
+    sVkEmulation->dvk->vkDestroyFence(sVkEmulation->device, sVkEmulation->commandBufferFence,
+                                      nullptr);
+
+    sVkEmulation->dvk->vkFreeCommandBuffers(sVkEmulation->device, sVkEmulation->commandPool, 1,
+                                            &sVkEmulation->commandBuffer);
+
+    sVkEmulation->dvk->vkDestroyCommandPool(sVkEmulation->device, sVkEmulation->commandPool,
+                                            nullptr);
+
     sVkEmulation->ivk->vkDestroyDevice(sVkEmulation->device, nullptr);
     sVkEmulation->gvk->vkDestroyInstance(sVkEmulation->instance, nullptr);
 
     sVkEmulation->live = false;
     delete sVkEmulation;
     sVkEmulation = nullptr;
+}
+
+std::unique_ptr<gfxstream::DisplaySurface> createDisplaySurface(FBNativeWindowType window,
+                                                                uint32_t width, uint32_t height) {
+    if (!sVkEmulation || !sVkEmulation->live) {
+        return nullptr;
+    }
+
+    auto surfaceVk = DisplaySurfaceVk::create(*sVkEmulation->ivk, sVkEmulation->instance, window);
+    if (!surfaceVk) {
+        VK_COMMON_ERROR("Failed to create DisplaySurfaceVk.");
+        return nullptr;
+    }
+
+    return std::make_unique<gfxstream::DisplaySurface>(width, height, std::move(surfaceVk));
 }
 
 // Precondition: sVkEmulation has valid device support info
@@ -1811,16 +1846,16 @@ bool setupVkColorBuffer(uint32_t colorBufferHandle, bool vulkanOnly, uint32_t me
         return false;
     }
 
+#if defined(VK_MVK_moltenvk) && defined(__APPLE__)
     if (sVkEmulation->instanceSupportsMoltenVK) {
         sVkEmulation->getMTLTextureFunc(res.image, &res.mtlTexture);
         if (!res.mtlTexture) {
             fprintf(stderr, "%s: Failed to get MTLTexture.\n", __func__);
         }
 
-#ifdef __APPLE__
         CFRetain(res.mtlTexture);
-#endif
     }
+#endif
 
     bool glExported = sVkEmulation->deviceInfo.supportsExternalMemory &&
                       sVkEmulation->deviceInfo.glInteropSupported && glCompatible && !vulkanOnly;
@@ -1913,8 +1948,6 @@ bool readColorBufferToGl(uint32_t colorBufferHandle) {
         return false;
     }
 
-    auto vk = sVkEmulation->dvk;
-
     AutoLock lock(sVkEmulationLock);
 
     auto colorBufferInfo = android::base::find(sVkEmulation->colorBuffers, colorBufferHandle);
@@ -1940,7 +1973,7 @@ bool readColorBufferToGl(uint32_t colorBufferHandle) {
 
     std::vector<uint8_t> bytes(bytesNeeded);
 
-    result = readColorBufferToBytes(
+    result = readColorBufferToBytesLocked(
         colorBufferHandle, 0, 0, colorBufferInfo->imageCreateInfoShallow.extent.width,
         colorBufferInfo->imageCreateInfoShallow.extent.height, bytes.data());
     if (!result) {
@@ -1959,8 +1992,6 @@ bool readColorBufferToBytes(uint32_t colorBufferHandle, uint32_t x, uint32_t y, 
         VK_COMMON_ERROR("VkEmulation not available.");
         return false;
     }
-
-    auto vk = sVkEmulation->dvk;
 
     AutoLock lock(sVkEmulationLock);
     return readColorBufferToBytesLocked(colorBufferHandle, x, y, w, h, outPixels);
@@ -2147,7 +2178,6 @@ bool updateColorBufferFromBytes(uint32_t colorBufferHandle, uint32_t x, uint32_t
         return false;
     }
 
-    auto vk = sVkEmulation->dvk;
     AutoLock lock(sVkEmulationLock);
     return updateColorBufferFromBytesLocked(colorBufferHandle, x, y, w, h, pixels);
 }

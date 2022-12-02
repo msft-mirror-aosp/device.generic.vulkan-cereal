@@ -17,22 +17,30 @@
 #include <type_traits>
 #include <unordered_map>
 
+#include "FrameBuffer.h"
+#include "GfxStreamAgents.h"
 #include "VirtioGpuTimelines.h"
-#include "base/AlignedBuf.h"
-#include "base/Lock.h"
-#include "base/SharedMemory.h"
-#include "base/ManagedDescriptor.hpp"
-#include "base/Tracing.h"
+#include "aemu/base/AlignedBuf.h"
+#include "aemu/base/Metrics.h"
+#include "aemu/base/synchronization/Lock.h"
+#include "aemu/base/memory/SharedMemory.h"
+#include "aemu/base/ManagedDescriptor.hpp"
+#include "aemu/base/Tracing.h"
 #include "host-common/AddressSpaceService.h"
 #include "host-common/GfxstreamFatalError.h"
 #include "host-common/HostmemIdMapping.h"
 #include "host-common/address_space_device.h"
 #include "host-common/android_pipe_common.h"
+#include "host-common/android_pipe_device.h"
 #include "host-common/feature_control.h"
+#include "host-common/globals.h"
 #include "host-common/linux_types.h"
 #include "host-common/opengles.h"
+#include "host-common/opengles-pipe.h"
+#include "host-common/refcount-pipe.h"
 #include "host-common/vm_operations.h"
 #include "virtgpu_gfxstream_protocol.h"
+#include "vk_util.h"
 
 extern "C" {
 #include "virtio-gpu-gfxstream-renderer.h"
@@ -69,6 +77,23 @@ extern "C" {
 #define VG_EXPORT
 
 #endif // !VIRTIO_GOLDFISH_EXPORT_API
+
+#define GFXSTREAM_DEBUG_LEVEL 1
+
+#if GFXSTREAM_DEBUG_LEVEL >= 1
+#define GFXS_LOG(fmt, ...)                                                     \
+    do {                                                                       \
+        fprintf(stdout, "%s:%d " fmt "\n", __func__, __LINE__, ##__VA_ARGS__); \
+        fflush(stdout);                                                        \
+    } while (0)
+
+#else
+#define GFXS_LOG(fmt,...)
+#endif
+
+#define POST_CALLBACK_DISPLAY_TYPE_X 0
+#define POST_CALLBACK_DISPLAY_TYPE_WAYLAND_SHARED_MEM 1
+#define POST_CALLBACK_DISPLAY_TYPE_WINDOWS_HWND 2
 
 // Virtio Goldfish Pipe: Overview-----------------------------------------------
 //
@@ -148,10 +173,12 @@ extern "C" {
 // linear buffer if necessary, and then perform a corresponding pip operation
 // based on the box parameter's x and width values.
 
+using android::AndroidPipe;
 using android::base::AutoLock;
 using android::base::DescriptorType;
 using android::base::Lock;
 using android::base::ManagedDescriptor;
+using android::base::MetricsLogger;
 using android::base::SharedMemory;
 
 using android::emulation::HostmemIdMapping;
@@ -374,28 +401,39 @@ static inline size_t virgl_format_to_total_xfer_len(
     uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     if (virgl_format_is_yuv(format)) {
         uint32_t bpp = format == VIRGL_FORMAT_P010 ? 2 : 1;
+
         uint32_t yWidth = totalWidth;
         uint32_t yHeight = totalHeight;
-        uint32_t yStride = yWidth * bpp;
-        uint32_t ySize = yStride * yHeight;
+        uint32_t yStridePixels;
+        if (format == VIRGL_FORMAT_NV12) {
+            yStridePixels = yWidth;
+        } else if (format == VIRGL_FORMAT_P010) {
+            yStridePixels = yWidth;
+        } else if (format == VIRGL_FORMAT_YV12) {
+            yStridePixels = align_up_power_of_2(yWidth, 32);
+        } else {
+            VGP_FATAL() << "Unknown yuv virgl format: 0x" << std::hex << format;
+        }
+        uint32_t yStrideBytes = yStridePixels * bpp;
+        uint32_t ySize = yStrideBytes * yHeight;
 
-        uint32_t uvWidth;
+        uint32_t uvStridePixels;
         uint32_t uvPlaneCount;
         if (format == VIRGL_FORMAT_NV12) {
-            uvWidth = totalWidth;
+            uvStridePixels = yStridePixels;
             uvPlaneCount = 1;
         } else if (format == VIRGL_FORMAT_P010) {
-            uvWidth = totalWidth;
+            uvStridePixels = yStridePixels;
             uvPlaneCount = 1;
         } else if (format == VIRGL_FORMAT_YV12) {
-            uvWidth = totalWidth / 2;
+            uvStridePixels = yStridePixels / 2;
             uvPlaneCount = 2;
         } else {
             VGP_FATAL() << "Unknown yuv virgl format: 0x" << std::hex << format;
         }
+        uint32_t uvStrideBytes = uvStridePixels * bpp;
         uint32_t uvHeight = totalHeight / 2;
-        uint32_t uvStride = uvWidth * bpp;
-        uint32_t uvSize = uvStride * uvHeight * uvPlaneCount;
+        uint32_t uvSize = uvStrideBytes * uvHeight * uvPlaneCount;
 
         uint32_t dataSize = ySize + uvSize;
         return dataSize;
@@ -1633,9 +1671,10 @@ public:
         const auto& entry = it->second;
         if (entry.descriptorInfo && entry.descriptorInfo->vulkanInfoOpt) {
             vulkan_info->memory_index = (*entry.descriptorInfo->vulkanInfoOpt).memoryIndex;
-            vulkan_info->physical_device_index =
-                (*entry.descriptorInfo->vulkanInfoOpt).physicalDeviceIndex;
-
+            memcpy(vulkan_info->device_uuid, (*entry.descriptorInfo->vulkanInfoOpt).deviceUUID,
+                   sizeof(vulkan_info->device_uuid));
+            memcpy(vulkan_info->driver_uuid, (*entry.descriptorInfo->vulkanInfoOpt).driverUUID,
+                   sizeof(vulkan_info->driver_uuid));
             return 0;
         }
 
@@ -1914,6 +1953,646 @@ VG_EXPORT int stream_renderer_resource_map_info(uint32_t res_handle, uint32_t *m
 VG_EXPORT int stream_renderer_vulkan_info(uint32_t res_handle,
                                           struct stream_renderer_vulkan_info *vulkan_info) {
     return sRenderer()->vulkanInfo(res_handle, vulkan_info);
+}
+
+struct renderer_display_info;
+typedef void (*get_pixels_t)(void*, uint32_t, uint32_t);
+static get_pixels_t sGetPixelsFunc = 0;
+typedef void (*post_callback_t)(void*, uint32_t, int, int, int, int, int, unsigned char*);
+
+// For reading back rendered contents to display
+VG_EXPORT void get_pixels(void* pixels, uint32_t bytes);
+
+static const GoldfishPipeServiceOps goldfish_pipe_service_ops = {
+    // guest_open()
+    [](GoldfishHwPipe* hwPipe) -> GoldfishHostPipe* {
+        return static_cast<GoldfishHostPipe*>(
+            android_pipe_guest_open(hwPipe));
+    },
+    // guest_open_with_flags()
+    [](GoldfishHwPipe* hwPipe, uint32_t flags) -> GoldfishHostPipe* {
+        return static_cast<GoldfishHostPipe*>(
+            android_pipe_guest_open_with_flags(hwPipe, flags));
+    },
+    // guest_close()
+    [](GoldfishHostPipe* hostPipe, GoldfishPipeCloseReason reason) {
+        static_assert((int)GOLDFISH_PIPE_CLOSE_GRACEFUL ==
+                          (int)PIPE_CLOSE_GRACEFUL,
+                      "Invalid PIPE_CLOSE_GRACEFUL value");
+        static_assert(
+            (int)GOLDFISH_PIPE_CLOSE_REBOOT == (int)PIPE_CLOSE_REBOOT,
+            "Invalid PIPE_CLOSE_REBOOT value");
+        static_assert((int)GOLDFISH_PIPE_CLOSE_LOAD_SNAPSHOT ==
+                          (int)PIPE_CLOSE_LOAD_SNAPSHOT,
+                      "Invalid PIPE_CLOSE_LOAD_SNAPSHOT value");
+        static_assert(
+            (int)GOLDFISH_PIPE_CLOSE_ERROR == (int)PIPE_CLOSE_ERROR,
+            "Invalid PIPE_CLOSE_ERROR value");
+
+        android_pipe_guest_close(hostPipe,
+                                 static_cast<PipeCloseReason>(reason));
+    },
+    // guest_pre_load()
+    [](QEMUFile* file) { (void)file; },
+    // guest_post_load()
+    [](QEMUFile* file) { (void)file; },
+    // guest_pre_save()
+    [](QEMUFile* file) { (void)file; },
+    // guest_post_save()
+    [](QEMUFile* file) { (void)file; },
+    // guest_load()
+    [](QEMUFile* file,
+       GoldfishHwPipe* hwPipe,
+       char* force_close) -> GoldfishHostPipe* {
+        (void)file;
+        (void)hwPipe;
+        (void)force_close;
+        return nullptr;
+    },
+    // guest_save()
+    [](GoldfishHostPipe* hostPipe, QEMUFile* file) {
+        (void)hostPipe;
+        (void)file;
+    },
+    // guest_poll()
+    [](GoldfishHostPipe* hostPipe) {
+        static_assert((int)GOLDFISH_PIPE_POLL_IN == (int)PIPE_POLL_IN,
+                      "invalid POLL_IN values");
+        static_assert((int)GOLDFISH_PIPE_POLL_OUT == (int)PIPE_POLL_OUT,
+                      "invalid POLL_OUT values");
+        static_assert((int)GOLDFISH_PIPE_POLL_HUP == (int)PIPE_POLL_HUP,
+                      "invalid POLL_HUP values");
+
+        return static_cast<GoldfishPipePollFlags>(
+            android_pipe_guest_poll(hostPipe));
+    },
+    // guest_recv()
+    [](GoldfishHostPipe* hostPipe,
+       GoldfishPipeBuffer* buffers,
+       int numBuffers) -> int {
+        // NOTE: Assumes that AndroidPipeBuffer and GoldfishPipeBuffer
+        //       have exactly the same layout.
+        static_assert(
+            sizeof(AndroidPipeBuffer) == sizeof(GoldfishPipeBuffer),
+            "Invalid PipeBuffer sizes");
+    // We can't use a static_assert with offsetof() because in msvc, it uses
+    // reinterpret_cast.
+    // TODO: Add runtime assertion instead?
+    // https://developercommunity.visualstudio.com/content/problem/22196/static-assert-cannot-compile-constexprs-method-tha.html
+#ifndef _MSC_VER
+        static_assert(offsetof(AndroidPipeBuffer, data) ==
+                          offsetof(GoldfishPipeBuffer, data),
+                      "Invalid PipeBuffer::data offsets");
+        static_assert(offsetof(AndroidPipeBuffer, size) ==
+                          offsetof(GoldfishPipeBuffer, size),
+                      "Invalid PipeBuffer::size offsets");
+#endif
+        return android_pipe_guest_recv(
+            hostPipe, reinterpret_cast<AndroidPipeBuffer*>(buffers),
+            numBuffers);
+    },
+    // guest_send()
+    [](GoldfishHostPipe** hostPipe,
+       const GoldfishPipeBuffer* buffers,
+       int numBuffers) -> int {
+        return android_pipe_guest_send(
+            reinterpret_cast<void**>(hostPipe),
+            reinterpret_cast<const AndroidPipeBuffer*>(buffers),
+            numBuffers);
+    },
+    // guest_wake_on()
+    [](GoldfishHostPipe* hostPipe, GoldfishPipeWakeFlags wakeFlags) {
+        android_pipe_guest_wake_on(hostPipe, static_cast<int>(wakeFlags));
+    },
+    // dma_add_buffer()
+    [](void* pipe, uint64_t paddr, uint64_t sz) {
+        // not considered for virtio
+    },
+    // dma_remove_buffer()
+    [](uint64_t paddr) {
+        // not considered for virtio
+    },
+    // dma_invalidate_host_mappings()
+    []() {
+        // not considered for virtio
+    },
+    // dma_reset_host_mappings()
+    []() {
+        // not considered for virtio
+    },
+    // dma_save_mappings()
+    [](QEMUFile* file) {
+        (void)file;
+    },
+    // dma_load_mappings()
+    [](QEMUFile* file) {
+        (void)file;
+    },
+};
+
+extern const QAndroidVmOperations* const gQAndroidVmOperations;
+
+static void default_post_callback(
+    void* context, uint32_t displayId, int width, int height, int ydir, int format, int frame_type, unsigned char* pixels) {
+    (void)context;
+    (void)width;
+    (void)height;
+    (void)ydir;
+    (void)format;
+    (void)frame_type;
+    (void)pixels;
+    // no-op
+}
+
+VG_EXPORT int stream_renderer_init(
+    struct stream_renderer_param* stream_renderer_params,
+    uint64_t num_params) {
+    // Required parameters.
+    std::unordered_set<uint64_t> required_params{STREAM_RENDERER_PARAM_USER_DATA,
+                                                 STREAM_RENDERER_PARAM_RENDERER_FLAGS,
+                                                 STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK};
+
+    // String names of the parameters.
+    std::unordered_map<uint64_t, std::string> param_strings{
+        {STREAM_RENDERER_PARAM_USER_DATA, "USER_DATA"},
+        {STREAM_RENDERER_PARAM_RENDERER_FLAGS, "RENDERER_FLAGS"},
+        {STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK, "WRITE_FENCE_CALLBACK"},
+        {STREAM_RENDERER_PARAM_WRITE_CONTEXT_FENCE_CALLBACK, "WRITE_CONTEXT_FENCE_CALLBACK"},
+        {STREAM_RENDERER_PARAM_WIN0_WIDTH, "WIN0_WIDTH"},
+        {STREAM_RENDERER_PARAM_WIN0_HEIGHT, "WIN0_HEIGHT"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT,
+         "METRICS_CALLBACK_ADD_INSTANT_EVENT"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR,
+         "METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC,
+         "METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT,
+         "METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION, "METRICS_CALLBACK_SET_ANNOTATION"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT, "METRICS_CALLBACK_ABORT"}};
+
+    // Print full values for these parameters:
+    // Values here must not be pointers (e.g. callback functions), to avoid potentially identifying
+    // someone via ASLR. Pointers in ASLR are randomized on boot, which means pointers may be
+    // different between users but similar across a single user's sessions.
+    // As a convenience, any value <= 4096 is also printed, to catch small or null pointer errors.
+    std::unordered_set<uint64_t> printed_param_values{
+        STREAM_RENDERER_PARAM_RENDERER_FLAGS,
+        STREAM_RENDERER_PARAM_WIN0_WIDTH,
+        STREAM_RENDERER_PARAM_WIN0_HEIGHT
+    };
+
+    // We may have unknown parameters, so this function is lenient.
+    auto get_param_string = [&](uint64_t key) -> std::string {
+        auto param_string = param_strings.find(key);
+        if (param_string != param_strings.end()) {
+            return param_string->second;
+        } else {
+            return "Unknown param with key=" + std::to_string(key);
+        }
+    };
+
+    // Initialization data.
+    uint32_t display_width = 0;
+    uint32_t display_height = 0;
+    void* renderer_cookie = nullptr;
+    int renderer_flags = 0;
+    virgl_renderer_callbacks virglrenderer_callbacks = {};
+
+    // Iterate all parameters that we support.
+    GFXS_LOG("Reading stream renderer parameters:");
+    for (uint64_t i = 0; i < num_params; ++i) {
+        stream_renderer_param& param = stream_renderer_params[i];
+
+        // Print out parameter we are processing. See comment above `printed_param_values` before
+        // adding new prints.
+        if (printed_param_values.find(param.key) != printed_param_values.end() ||
+            param.value <= 4096) {
+            GFXS_LOG("%s - %llu", get_param_string(param.key).c_str(),
+                     static_cast<unsigned long long>(param.value));
+        } else {
+            // If not full value, print that it was passed.
+            GFXS_LOG("%s", get_param_string(param.key).c_str());
+        }
+
+        // Removing every param we process will leave required_params empty if all provided.
+        required_params.erase(param.key);
+
+        switch (param.key) {
+            case STREAM_RENDERER_PARAM_USER_DATA: {
+                renderer_cookie = reinterpret_cast<void*>(static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_RENDERER_FLAGS: {
+                renderer_flags = static_cast<int>(param.value);
+                break;
+            }
+            case STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK: {
+                virglrenderer_callbacks.write_fence =
+                    reinterpret_cast<stream_renderer_param_write_fence_callback>(
+                        static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_WRITE_CONTEXT_FENCE_CALLBACK: {
+#ifdef VIRGL_RENDERER_UNSTABLE_APIS
+                virglrenderer_callbacks.write_context_fence =
+                    reinterpret_cast<stream_renderer_param_write_context_fence_callback>(
+                        static_cast<uintptr_t>(param.value));
+#else
+                ERR("Cannot use WRITE_CONTEXT_FENCE_CALLBACK with unstable APIs OFF.");
+#endif
+                break;
+            }
+            case STREAM_RENDERER_PARAM_WIN0_WIDTH: {
+                display_width = static_cast<uint32_t>(param.value);
+                break;
+            }
+            case STREAM_RENDERER_PARAM_WIN0_HEIGHT: {
+                display_height = static_cast<uint32_t>(param.value);
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT: {
+                MetricsLogger::add_instant_event_callback =
+                    reinterpret_cast<stream_renderer_param_metrics_callback_add_instant_event>(
+                        static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR: {
+                MetricsLogger::add_instant_event_with_descriptor_callback = reinterpret_cast<
+                    stream_renderer_param_metrics_callback_add_instant_event_with_descriptor>(
+                    static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC: {
+                MetricsLogger::add_instant_event_with_metric_callback = reinterpret_cast<
+                    stream_renderer_param_metrics_callback_add_instant_event_with_metric>(
+                    static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT: {
+                MetricsLogger::add_vulkan_out_of_memory_event = reinterpret_cast<
+                    stream_renderer_param_metrics_callback_add_vulkan_out_of_memory_event>(
+                    static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION: {
+                MetricsLogger::set_crash_annotation_callback =
+                    reinterpret_cast<stream_renderer_param_metrics_callback_set_annotation>(
+                        static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT: {
+                emugl::setDieFunction(
+                    reinterpret_cast<stream_renderer_param_metrics_callback_abort>(
+                        static_cast<uintptr_t>(param.value)));
+                break;
+            }
+            default: {
+                // We skip any parameters we don't recognize.
+                ERR("Skipping unknown parameter key: %llu. May need to upgrade gfxstream.",
+                    static_cast<unsigned long long>(param.key));
+                break;
+            }
+        }
+    }
+    GFXS_LOG("Finished reading parameters");
+
+    // Some required params not found.
+    if (required_params.size() > 0) {
+        ERR("Missing required parameters:");
+        for (uint64_t param : required_params) {
+            ERR("%s", get_param_string(param).c_str());
+        }
+        ERR("Failing initialization intentionally");
+        return STREAM_RENDERER_ERROR_MISSING_PARAM;
+    }
+
+    // Set non product-specific callbacks
+    vk_util::setVkCheckCallbacks(
+        std::make_unique<vk_util::VkCheckCallbacks>(vk_util::VkCheckCallbacks{
+            .onVkErrorOutOfMemory =
+                [](VkResult result, const char* function, int line) {
+                    auto fb = FrameBuffer::getFB();
+                    if (!fb) {
+                        ERR("FrameBuffer not yet initialized. Dropping out of memory event");
+                        return;
+                    }
+                    fb->logVulkanOutOfMemory(result, function, line);
+                },
+            .onVkErrorOutOfMemoryOnAllocation =
+                [](VkResult result, const char* function, int line,
+                   std::optional<uint64_t> allocationSize) {
+                    auto fb = FrameBuffer::getFB();
+                    if (!fb) {
+                        ERR("FrameBuffer not yet initialized. Dropping out of memory event");
+                        return;
+                    }
+                    fb->logVulkanOutOfMemory(result, function, line, allocationSize);
+                }}));
+
+    gfxstream_backend_init_product_override();
+    // First we make some agents available.
+
+    GFXS_LOG("start. display dimensions: width %u height %u, renderer flags: 0x%x", display_width,
+             display_height, renderer_flags);
+
+    // Flags processing
+
+    // TODO: hook up "gfxstream egl" to the renderer flags
+    // GFXSTREAM_RENDERER_FLAGS_USE_EGL_BIT in crosvm
+    // as it's specified from launch_cvd.
+    // At the moment, use ANDROID_GFXSTREAM_EGL=1
+    // For test on GCE
+    if (android::base::getEnvironmentVariable("ANDROID_GFXSTREAM_EGL") == "1") {
+        android::base::setEnvironmentVariable("ANDROID_EGL_ON_EGL", "1");
+        android::base::setEnvironmentVariable("ANDROID_EMUGL_LOG_PRINT", "1");
+        android::base::setEnvironmentVariable("ANDROID_EMUGL_VERBOSE", "1");
+    }
+    // end for test on GCE
+
+    android::base::setEnvironmentVariable("ANDROID_EMU_HEADLESS", "1");
+    bool enableVk =
+        !(renderer_flags & GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT);
+
+    bool egl2eglByEnv = android::base::getEnvironmentVariable("ANDROID_EGL_ON_EGL") == "1";
+    bool egl2eglByFlag = renderer_flags & GFXSTREAM_RENDERER_FLAGS_USE_EGL_BIT;
+    bool enable_egl2egl = egl2eglByFlag || egl2eglByEnv;
+    if (enable_egl2egl) {
+        android::base::setEnvironmentVariable("ANDROID_GFXSTREAM_EGL", "1");
+        android::base::setEnvironmentVariable("ANDROID_EGL_ON_EGL", "1");
+    }
+
+    bool surfaceless =
+        renderer_flags & GFXSTREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT;
+    bool enableGlEs31Flag = renderer_flags & GFXSTREAM_RENDERER_FLAGS_ENABLE_GLES31_BIT;
+    bool useExternalBlob = renderer_flags & GFXSTREAM_RENDERER_FLAGS_USE_EXTERNAL_BLOB;
+    bool guestUsesAngle = renderer_flags & GFXSTREAM_RENDERER_FLAGS_GUEST_USES_ANGLE;
+    bool useVulkanNativeSwapchain =
+        renderer_flags & GFXSTREAM_RENDERER_FLAGS_VULKAN_NATIVE_SWAPCHAIN_BIT;
+
+    GFXS_LOG("Vulkan enabled? %d", enableVk);
+    GFXS_LOG("egl2egl enabled? %d", enable_egl2egl);
+    GFXS_LOG("surfaceless? %d", surfaceless);
+    GFXS_LOG("OpenGL ES 3.1 enabled? %d", enableGlEs31Flag);
+    GFXS_LOG("use external blob? %d", useExternalBlob);
+    GFXS_LOG("guest using ANGLE? %d", guestUsesAngle);
+    GFXS_LOG("use Vulkan native swapchain on the host? %d",
+             useVulkanNativeSwapchain);
+
+    // Need to manually set the GLES backend paths in gfxstream environment
+    // because the library search paths are not automatically set to include
+    // the directory in whioch the GLES backend resides.
+#if defined(__linux__)
+#define GFXSTREAM_LIB_SUFFIX ".so"
+#elif defined(__APPLE__)
+#define GFXSTREAM_LIB_SUFFIX ".dylib"
+#else // Windows
+#define GFXSTREAM_LIB_SUFFIX ".dll"
+#endif
+
+    feature_set_enabled_override(
+        kFeature_GLPipeChecksum, false);
+    feature_set_enabled_override(
+        kFeature_GLESDynamicVersion, true);
+    feature_set_enabled_override(
+        kFeature_PlayStoreImage, !enableGlEs31Flag);
+    feature_set_enabled_override(
+        kFeature_GLDMA, false);
+    feature_set_enabled_override(
+        kFeature_GLAsyncSwap, false);
+    feature_set_enabled_override(
+        kFeature_RefCountPipe, false);
+    feature_set_enabled_override(
+        kFeature_NoDelayCloseColorBuffer, true);
+    feature_set_enabled_override(
+        kFeature_NativeTextureDecompression, false);
+    feature_set_enabled_override(
+        kFeature_GLDirectMem, false);
+    feature_set_enabled_override(
+        kFeature_Vulkan, enableVk);
+    feature_set_enabled_override(
+        kFeature_VulkanSnapshots, false);
+    feature_set_enabled_override(
+        kFeature_VulkanNullOptionalStrings, true);
+    feature_set_enabled_override(
+        kFeature_VulkanShaderFloat16Int8, true);
+    feature_set_enabled_override(
+        kFeature_HostComposition, true);
+    feature_set_enabled_override(
+        kFeature_VulkanIgnoredHandles, true);
+    feature_set_enabled_override(
+        kFeature_VirtioGpuNext, true);
+    feature_set_enabled_override(
+        kFeature_VirtioGpuNativeSync, true);
+    feature_set_enabled_override(
+        kFeature_GuestUsesAngle, guestUsesAngle);
+    feature_set_enabled_override(
+        kFeature_VulkanQueueSubmitWithCommands, true);
+    feature_set_enabled_override(kFeature_VulkanNativeSwapchain,
+                                 useVulkanNativeSwapchain);
+    feature_set_enabled_override(
+        kFeature_VulkanBatchedDescriptorSetUpdate, true);
+    // TODO: Strictly speaking, renderer_flags check is insufficient because
+    // fence contexts require us to be running a new-enough guest kernel.
+    feature_set_enabled_override(
+        kFeature_VirtioGpuFenceContexts,
+        (renderer_flags & GFXSTREAM_RENDERER_FLAGS_ASYNC_FENCE_CB));
+    feature_set_enabled_override(kFeature_VulkanAstcLdrEmulation, true);
+    feature_set_enabled_override(kFeature_VulkanEtc2Emulation, true);
+    feature_set_enabled_override(kFeature_VulkanYcbcrEmulation, false);
+    feature_set_enabled_override(kFeature_ExternalBlob, useExternalBlob);
+
+    android::featurecontrol::productFeatureOverride();
+
+    if (useVulkanNativeSwapchain && !enableVk) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) <<
+            "can't enable vulkan native swapchain, Vulkan is disabled";
+    }
+
+    emugl::vkDispatch(false /* don't use test ICD */);
+
+    auto androidHw = aemu_get_android_hw();
+
+    androidHw->hw_gltransport_asg_writeBufferSize = 1048576;
+    androidHw->hw_gltransport_asg_writeStepSize = 262144;
+    androidHw->hw_gltransport_asg_dataRingSize = 524288;
+    androidHw->hw_gltransport_drawFlushInterval = 10000;
+
+    EmuglConfig config;
+
+    // Make all the console agents available.
+    android::emulation::injectGraphicsAgents(android::emulation::GfxStreamGraphicsAgentFactory());
+
+    emuglConfig_init(&config, true /* gpu enabled */, "auto",
+                     enable_egl2egl ? "swiftshader_indirect" : "host",
+                     64,          /* bitness */
+                     surfaceless, /* no window */
+                     false,       /* blocklisted */
+                     false,       /* has guest renderer */
+                     WINSYS_GLESBACKEND_PREFERENCE_AUTO,
+                     true /* force host gpu vulkan */);
+
+    emuglConfig_setupEnv(&config);
+
+    android_prepareOpenglesEmulation();
+
+    {
+        static emugl::RenderLibPtr renderLibPtr = initLibrary();
+        void* egldispatch = renderLibPtr->getEGLDispatch();
+        void* glesv2Dispatch = renderLibPtr->getGLESv2Dispatch();
+        android_setOpenglesEmulation(
+            renderLibPtr.get(), egldispatch, glesv2Dispatch);
+    }
+
+    int maj;
+    int min;
+    android_startOpenglesRenderer(
+        display_width, display_height, 1, 28,
+        getGraphicsAgents()->vm,
+        getGraphicsAgents()->emu,
+        getGraphicsAgents()->multi_display,
+        &maj, &min);
+
+    char* vendor = nullptr;
+    char* renderer = nullptr;
+    char* version = nullptr;
+
+    android_getOpenglesHardwareStrings(
+        &vendor, &renderer, &version);
+
+    GFXS_LOG("GL strings; [%s] [%s] [%s].\n",
+             vendor, renderer, version);
+
+    auto openglesRenderer = android_getOpenglesRenderer();
+
+    if (!openglesRenderer) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "No renderer started, fatal";
+    }
+
+    address_space_set_vm_operations(getGraphicsAgents()->vm);
+    android_init_opengles_pipe();
+    android_opengles_pipe_set_recv_mode(2 /* virtio-gpu */);
+    android_init_refcount_pipe();
+
+    sGetPixelsFunc = android_getReadPixelsFunc();
+
+    pipe_virgl_renderer_init(renderer_cookie, renderer_flags, &virglrenderer_callbacks);
+
+    GFXS_LOG("Started renderer");
+
+    return STREAM_RENDERER_SUCCESS;
+}
+
+VG_EXPORT void gfxstream_backend_init(
+    uint32_t display_width,
+    uint32_t display_height,
+    uint32_t display_type,
+    void* renderer_cookie,
+    int renderer_flags,
+    struct virgl_renderer_callbacks* virglrenderer_callbacks,
+    struct gfxstream_callbacks* gfxstreamcallbacks) {
+    std::vector<stream_renderer_param> streamRendererParams{
+        {STREAM_RENDERER_PARAM_USER_DATA,
+         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(renderer_cookie))},
+        {STREAM_RENDERER_PARAM_RENDERER_FLAGS, static_cast<uint64_t>(renderer_flags)},
+        {STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK,
+         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(virglrenderer_callbacks->write_fence))},
+#ifdef VIRGL_RENDERER_UNSTABLE_APIS
+        {STREAM_RENDERER_PARAM_WRITE_CONTEXT_FENCE_CALLBACK,
+         static_cast<uint64_t>(
+             reinterpret_cast<uintptr_t>(virglrenderer_callbacks->write_context_fence))},
+#endif
+        {STREAM_RENDERER_PARAM_WIN0_WIDTH, display_width},
+        {STREAM_RENDERER_PARAM_WIN0_HEIGHT, display_height}};
+
+    // Convert metrics callbacks.
+    if (gfxstreamcallbacks) {
+        if (gfxstreamcallbacks->add_instant_event) {
+            streamRendererParams.push_back(
+                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT,
+                 static_cast<uint64_t>(
+                     reinterpret_cast<uintptr_t>(gfxstreamcallbacks->add_instant_event))});
+        }
+        if (gfxstreamcallbacks->add_instant_event_with_descriptor) {
+            streamRendererParams.push_back(
+                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR,
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                     gfxstreamcallbacks->add_instant_event_with_descriptor))});
+        }
+        if (gfxstreamcallbacks->add_instant_event_with_metric) {
+            streamRendererParams.push_back(
+                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC,
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                     gfxstreamcallbacks->add_instant_event_with_metric))});
+        }
+        if (gfxstreamcallbacks->add_vulkan_out_of_memory_event) {
+            streamRendererParams.push_back(
+                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT,
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                     gfxstreamcallbacks->add_vulkan_out_of_memory_event))});
+        }
+        if (gfxstreamcallbacks->set_annotation) {
+            streamRendererParams.push_back({STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION,
+                                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                                                gfxstreamcallbacks->set_annotation))});
+        }
+        if (gfxstreamcallbacks->abort) {
+            streamRendererParams.push_back(
+                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT,
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(gfxstreamcallbacks->abort))});
+        }
+    }
+
+    stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
+}
+
+VG_EXPORT void gfxstream_backend_setup_window(
+    void* native_window_handle,
+    int32_t window_x,
+    int32_t window_y,
+    int32_t window_width,
+    int32_t window_height,
+    int32_t fb_width,
+    int32_t fb_height) {
+    android_showOpenglesWindow(native_window_handle, window_x, window_y,
+                               window_width, window_height, fb_width, fb_height,
+                               1.0f, 0, false, false);
+}
+
+VG_EXPORT void gfxstream_backend_teardown() {
+    android_finishOpenglesRenderer();
+    android_hideOpenglesWindow();
+    android_stopOpenglesRenderer(true);
+}
+
+VG_EXPORT void gfxstream_backend_set_screen_mask(int width, int height, const unsigned char* rgbaData) {
+    android_setOpenglesScreenMask(width, height, rgbaData);
+}
+
+VG_EXPORT void get_pixels(void* pixels, uint32_t bytes) {
+    //TODO: support display > 0
+    sGetPixelsFunc(pixels, bytes, 0);
+}
+
+VG_EXPORT void gfxstream_backend_getrender(char* buf, size_t bufSize, size_t* size) {
+    const char* render = "";
+    FrameBuffer* pFB = FrameBuffer::getFB();
+    if (pFB) {
+        const char* vendor = nullptr;
+        const char* version = nullptr;
+        pFB->getGLStrings(&vendor, &render, &version);
+    }
+    if (!buf || bufSize==0) {
+        if (size) *size = strlen(render);
+        return;
+    }
+    *buf = '\0';
+    strncat(buf, render, bufSize - 1);
+    if (size) *size = strlen(buf);
+}
+
+const GoldfishPipeServiceOps* goldfish_pipe_get_service_ops() {
+    return &goldfish_pipe_service_ops;
 }
 
 #define VIRGLRENDERER_API_PIPE_STRUCT_DEF(api) pipe_##api,

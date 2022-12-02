@@ -17,11 +17,12 @@
 #include <unordered_set>
 
 #include "FrameBuffer.h"
+#include "OpenGLESDispatch/EGLDispatch.h"
 #include "OpenGLESDispatch/GLESv1Dispatch.h"
 #include "OpenGLESDispatch/GLESv2Dispatch.h"
-#include "base/Lock.h"
-#include "base/Lookup.h"
-#include "base/StreamSerializing.h"
+#include "aemu/base/synchronization/Lock.h"
+#include "aemu/base/containers/Lookup.h"
+#include "aemu/base/files/StreamSerializing.h"
 #include "host-common/GfxstreamFatalError.h"
 
 using android::base::AutoLock;

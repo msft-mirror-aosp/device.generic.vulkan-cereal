@@ -7,7 +7,9 @@ target_link_libraries(
     gles1_dec
     PUBLIC
     apigen-codec-common
-    GLSnapshot)
+    GLSnapshot
+    PRIVATE
+    gfxstream_egl_headers)
 target_include_directories(
     gles1_dec
     PRIVATE

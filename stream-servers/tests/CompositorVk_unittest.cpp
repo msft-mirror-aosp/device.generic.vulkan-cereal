@@ -10,7 +10,7 @@
 #include <optional>
 
 #include "BorrowedImageVk.h"
-#include "base/Lock.h"
+#include "aemu/base/synchronization/Lock.h"
 #include "tests/ImageUtils.h"
 #include "tests/VkTestUtils.h"
 #include "vulkan/VulkanDispatch.h"
@@ -21,7 +21,7 @@ namespace {
 static constexpr const bool kDefaultSaveImageIfComparisonFailed = false;
 
 std::string GetTestDataPath(const std::string& basename) {
-    const std::filesystem::path currentPath = std::filesystem::current_path();
+    const std::filesystem::path currentPath = android::base::getProgramDirectory();
     return (currentPath / "tests" / "testdata" / basename).string();
 }
 

@@ -5,6 +5,10 @@
  * implement an actual virtio goldfish pipe, but this hijacking of virgl  is
  * done in order to avoid any guest kernel changes. */
 
+#include <assert.h>
+#include <stddef.h>
+
+#include "virgl_hw.h"
 #include "virglrenderer.h"
 
 
@@ -155,14 +159,158 @@ VG_EXPORT int stream_renderer_platform_destroy_shared_egl_context(void*);
 VG_EXPORT int stream_renderer_resource_map_info(uint32_t res_handle, uint32_t *map_info);
 
 struct stream_renderer_vulkan_info {
-    // This may be removed eventually [TODO(idanr): investigate)]
     uint32_t memory_index;
-    // This may be changed to device UUID instead [TODO(idanr): investigate)]
-    uint32_t physical_device_index;
+    uint8_t device_uuid[16];
+    uint8_t driver_uuid[16];
 };
 
 VG_EXPORT int stream_renderer_vulkan_info(uint32_t res_handle,
                                           struct stream_renderer_vulkan_info *vulkan_info);
+
+// Parameters - data passed to initialize the renderer, with the goal of avoiding FFI breakages.
+// To change the data a parameter is passing safely, you should create a new parameter and
+// deprecate the old one. The old parameter may be removed after sufficient time.
+
+// Reserved.
+#define STREAM_RENDERER_PARAM_NULL 0
+
+// User data, for custom use by renderer. An example is VirglCookie which includes a fence
+// handler and render server descriptor.
+#define STREAM_RENDERER_PARAM_USER_DATA 1
+
+// Bitwise flags for the renderer.
+#define STREAM_RENDERER_PARAM_RENDERER_FLAGS 2
+
+// Reserved to replace write_fence / write_context_fence.
+#define STREAM_RENDERER_PARAM_FENCE_CALLBACK 3
+
+// Callback for writing a fence.
+#define STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK 4
+typedef void (*stream_renderer_param_write_fence_callback)(void* user_data, uint32_t fence);
+
+// Callback for writing a fence with context.
+#define STREAM_RENDERER_PARAM_WRITE_CONTEXT_FENCE_CALLBACK 5
+typedef void (*stream_renderer_param_write_context_fence_callback)(void* user_data, uint64_t fence,
+                                                                   uint32_t ctx_id,
+                                                                   uint8_t ring_idx);
+
+// Window 0's width.
+#define STREAM_RENDERER_PARAM_WIN0_WIDTH 6
+
+// Window 0's height.
+#define STREAM_RENDERER_PARAM_WIN0_HEIGHT 7
+
+// External callbacks for tracking metrics.
+// Separating each function to a parameter allows new functions to be added later.
+#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT 1024
+typedef void (*stream_renderer_param_metrics_callback_add_instant_event)(int64_t event_code);
+
+#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR 1025
+typedef void (*stream_renderer_param_metrics_callback_add_instant_event_with_descriptor)(
+    int64_t event_code, int64_t descriptor);
+
+#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC 1026
+typedef void (*stream_renderer_param_metrics_callback_add_instant_event_with_metric)(
+    int64_t event_code, int64_t metric_value);
+
+#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT 1027
+typedef void (*stream_renderer_param_metrics_callback_add_vulkan_out_of_memory_event)(
+    int64_t result_code, uint32_t op_code, const char* function, uint32_t line,
+    uint64_t allocation_size, bool is_host_side_result, bool is_allocation);
+
+#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION 1028
+typedef void (*stream_renderer_param_metrics_callback_set_annotation)(const char* key,
+                                                                      const char* value);
+
+#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT 1029
+typedef void (*stream_renderer_param_metrics_callback_abort)();
+
+// An entry in the stream renderer parameters list.
+struct stream_renderer_param {
+    // The key should be one of STREAM_RENDERER_PARAM_*
+    uint64_t key;
+    // The value can be either a uint64_t or cast to a pointer to a struct, depending on if the
+    // parameter needs to pass data bigger than a single uint64_t.
+    uint64_t value;
+};
+
+static_assert(sizeof(stream_renderer_param) == 16, "stream_renderer_param must be 16 bytes");
+static_assert(offsetof(stream_renderer_param, key) == 0,
+              "stream_renderer_param.key must be at offset 0");
+static_assert(offsetof(stream_renderer_param, value) == 8,
+              "stream_renderer_param.value must be at offset 8");
+
+// Entry point for the stream renderer.
+// Pass a list of parameters to configure the renderer. The available ones are listed above. If a
+// parameter is not supported, the renderer will ignore it and warn in stderr.
+// Return value of STREAM_RENDERER_SUCCESS indicates success, otherwise an error code is returned.
+// Error codes:
+// STREAM_RENDERER_ERROR_MISSING_PARAM - Missing a required parameter.
+VG_EXPORT int stream_renderer_init(
+    struct stream_renderer_param* stream_renderer_params,
+    uint64_t num_params);
+
+// Generic success return code.
+#define STREAM_RENDERER_SUCCESS 0
+
+// Missing a required parameter.
+#define STREAM_RENDERER_ERROR_MISSING_PARAM 1
+
+struct gfxstream_callbacks {
+    /* Metrics callbacks */
+    void (*add_instant_event)(int64_t event_code);
+    void (*add_instant_event_with_descriptor)(int64_t event_code, int64_t descriptor);
+    void (*add_instant_event_with_metric)(int64_t event_code, int64_t metric_value);
+    void (*add_vulkan_out_of_memory_event)(int64_t result_code, uint32_t op_code,
+                                           const char* function, uint32_t line,
+                                           uint64_t allocation_size, bool is_host_side_result,
+                                           bool is_allocation);
+    void (*set_annotation)(const char* key, const char* value);
+    void (*abort)();
+};
+
+// Deprecated, use stream_renderer_init instead.
+VG_EXPORT void gfxstream_backend_init(
+    uint32_t display_width,
+    uint32_t display_height,
+    uint32_t display_type,
+    void* renderer_cookie,
+    int renderer_flags,
+    struct virgl_renderer_callbacks* virglrenderer_callbacks,
+    struct gfxstream_callbacks* gfxstreamcallbacks);
+
+VG_EXPORT void gfxstream_backend_setup_window(
+    void* native_window_handle,
+    int32_t window_x,
+    int32_t window_y,
+    int32_t window_width,
+    int32_t window_height,
+    int32_t fb_width,
+    int32_t fb_height);
+
+VG_EXPORT void gfxstream_backend_teardown(void);
+
+// Get the gfxstream backend render information.
+// example:
+//      /* Get the render string size */
+//      size_t size = 0
+//      gfxstream_backend_getrender(nullptr, 0, &size);
+//
+//      /* add extra space for '\0' */
+//      char * buf = malloc(size + 1);
+//
+//      /* Get the result render string */
+//      gfxstream_backend_getrender(buf, size+1, nullptr);
+//
+// if bufSize is less or equal the render string length, only bufSize-1 char copied.
+VG_EXPORT void gfxstream_backend_getrender(
+    char* buf,
+    size_t bufSize,
+    size_t* size);
+
+// A customization point that allows the downstream to call their own functions when
+// gfxstream_backend_init is called.
+void gfxstream_backend_init_product_override();
 
 #else
 
@@ -184,6 +332,7 @@ enum RendererFlags {
     GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT = 1 << 5,  // for disabling vk
     GFXSTREAM_RENDERER_FLAGS_ENABLE_GLES31_BIT =
         1 << 9,  // disables the PlayStoreImage flag
+    GFXSTREAM_RENDERER_FLAGS_USE_EXTERNAL_BLOB = 1 << 10,
     GFXSTREAM_RENDERER_FLAGS_GUEST_USES_ANGLE = 1 << 21,
     GFXSTREAM_RENDERER_FLAGS_VULKAN_NATIVE_SWAPCHAIN_BIT = 1 << 22,
     GFXSTREAM_RENDERER_FLAGS_ASYNC_FENCE_CB = 1 << 23,

@@ -26,14 +26,15 @@
 #include "RenderThreadInfo.h"
 #include "RendererImpl.h"
 #include "RingStream.h"
+#include "VkDecoderContext.h"
 #include "apigen-codec-common/ChecksumCalculatorThreadInfo.h"
-#include "base/HealthMonitor.h"
-#include "base/Lock.h"
-#include "base/MessageChannel.h"
-#include "base/Metrics.h"
-#include "base/StreamSerializing.h"
-#include "base/System.h"
-#include "base/Tracing.h"
+#include "aemu/base/HealthMonitor.h"
+#include "aemu/base/synchronization/Lock.h"
+#include "aemu/base/synchronization/MessageChannel.h"
+#include "aemu/base/Metrics.h"
+#include "aemu/base/files/StreamSerializing.h"
+#include "aemu/base/system/System.h"
+#include "aemu/base/Tracing.h"
 #include "host-common/feature_control.h"
 #include "host-common/logging.h"
 #include "vulkan/VkCommonOperations.h"
@@ -347,8 +348,9 @@ intptr_t RenderThread::main() {
     }
 
     GfxApiLogger gfxLogger;
+    auto& metricsLogger = FrameBuffer::getFB()->getMetricsLogger();
 
-    uint32_t* seqnoPtr = nullptr;
+    const ProcessResources* processResources = nullptr;
 
     while (true) {
         // Let's make sure we read enough data for at least some processing.
@@ -429,13 +431,19 @@ intptr_t RenderThread::main() {
                     {{"renderthread_guest_process", tInfo.m_processName.value()}});
                 processName = tInfo.m_processName.value().c_str();
             }
-            HealthWatchdog watchdog(FrameBuffer::getFB()->getHealthMonitor(),
-                                    WATCHDOG_DATA("RenderThread decode operation",
-                                                  EventHangMetadata::HangType::kRenderThread,
-                                                  std::move(renderThreadData)));
+            if (readBuf.validData() >= 4) {
+                renderThreadData->insert(
+                    {{"first_opcode", std::to_string(*(uint32_t*)readBuf.buf())},
+                    {"buffer_length", std::to_string(readBuf.validData())}});
+            }
+            auto watchdog = WATCHDOG_BUILDER(FrameBuffer::getFB()->getHealthMonitor(),
+                                             "RenderThread decode operation")
+                                .setHangType(EventHangMetadata::HangType::kRenderThread)
+                                .setAnnotations(std::move(renderThreadData))
+                                .build();
 
-            if (!seqnoPtr && tInfo.m_puid) {
-                seqnoPtr = FrameBuffer::getFB()->getProcessSequenceNumberPtr(tInfo.m_puid);
+            if (!processResources && tInfo.m_puid) {
+                processResources = FrameBuffer::getFB()->getProcessResources(tInfo.m_puid);
             }
 
             progress = false;
@@ -448,11 +456,23 @@ intptr_t RenderThread::main() {
             // Note: It's risky to limit Vulkan decoding to one thread,
             // so we do it outside the limiter
             if (tInfo.m_vkInfo) {
+                VkDecoderContext context = {
+                    .processName = processName,
+                    .gfxApiLogger = &gfxLogger,
+                    .healthMonitor = &FrameBuffer::getFB()->getHealthMonitor(),
+                    .metricsLogger = &metricsLogger,
+                };
+                uint32_t* seqno = nullptr;
+                if (processResources) {
+                    seqno = processResources->getSequenceNumberPtr();
+                }
                 last = tInfo.m_vkInfo->m_vkDec.decode(readBuf.buf(), readBuf.validData(), ioStream,
-                                                      seqnoPtr, gfxLogger,
-                                                      FrameBuffer::getFB()->getHealthMonitor(),
-                                                      processName);
+                                                      seqno, context);
                 if (last > 0) {
+                    if (!processResources) {
+                        ERR("Processed some Vulkan packets without process resources created. "
+                            "That's problematic.");
+                    }
                     readBuf.consume(last);
                     progress = true;
                 }

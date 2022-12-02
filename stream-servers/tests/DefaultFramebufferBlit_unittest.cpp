@@ -19,6 +19,13 @@
 
 #include <memory>
 
+using gfxstream::GLESApi;
+using gfxstream::GLESApi_2;
+using gfxstream::GLESApi_3_0;
+using gfxstream::GLESApi_3_1;
+using gfxstream::GLESApi_3_2;
+using gfxstream::GLESApi_CM;
+
 namespace emugl {
 
 struct ClearColorParam {
@@ -50,12 +57,12 @@ public:
         if (!param.fastBlit) {
             // Disable fast blit and then recreate the color buffer to apply the
             // change.
-            mFb->disableFastBlit();
+            mFb->disableFastBlitForTesting();
 
             mFb->closeColorBuffer(mColorBuffer);
             mColorBuffer = mFb->createColorBuffer(
                     mWidth, mHeight, GL_RGBA, FRAMEWORK_FORMAT_GL_COMPATIBLE);
-            mFb->setWindowSurfaceColorBuffer(mSurface, mColorBuffer);
+            mFb->setEmulatedEglWindowSurfaceColorBuffer(mSurface, mColorBuffer);
         }
     }
 

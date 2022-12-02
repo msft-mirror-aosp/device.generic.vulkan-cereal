@@ -17,10 +17,10 @@
 
 #include "RenderWindow.h"
 
-#include "base/Compiler.h"
-#include "base/Lock.h"
-#include "base/MessageChannel.h"
-#include "base/FunctorThread.h"
+#include "aemu/base/Compiler.h"
+#include "aemu/base/synchronization/Lock.h"
+#include "aemu/base/synchronization/MessageChannel.h"
+#include "aemu/base/threads/FunctorThread.h"
 #include "snapshot/common.h"
 
 #include "RenderThread.h"
@@ -95,6 +95,8 @@ public:
                          uint32_t dpi,
                          bool add) final;
     void setMultiDisplayColorBuffer(uint32_t id, uint32_t cb) override;
+    void onGuestGraphicsProcessCreate(uint64_t puid) final;
+    // TODO(kaiyili): rename this interface to onGuestGraphicsProcessDestroy.
     void cleanupProcGLObjects(uint64_t puid) final;
     void waitForProcessCleanup() final;
     struct AndroidVirtioGpuOps* getVirtioGpuOps() final;
@@ -107,10 +109,11 @@ public:
     bool load(android::base::Stream* stream,
               const android::snapshot::ITextureLoaderPtr& textureLoader) final;
     void fillGLESUsages(android_studio::EmulatorGLESUsages*) final;
-    void getScreenshot(unsigned int nChannels, unsigned int* width,
-            unsigned int* height, std::vector<unsigned char>& pixels,
+    int getScreenshot(unsigned int nChannels, unsigned int* width,
+            unsigned int* height, uint8_t *pixels, size_t *cPixels,
             int displayId, int desiredWidth, int desiredHeight,
             int desiredRotation) final;
+
     void snapshotOperationCallback(
             int snapshotterOp,
             int snapshotterStage) final;

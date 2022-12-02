@@ -17,12 +17,13 @@
 
 #include <algorithm>
 #include <utility>
+#include <variant>
 
-#include "FenceSync.h"
 #include "FrameBuffer.h"
 #include "RenderChannelImpl.h"
 #include "RenderThread.h"
-#include "base/System.h"
+#include "aemu/base/system/System.h"
+#include "aemu/base/threads/WorkerThread.h"
 #include "host-common/logging.h"
 #include "snapshot/common.h"
 
@@ -56,36 +57,52 @@ static const bool kUseSubwindowThread = false;
 class RendererImpl::ProcessCleanupThread {
 public:
     ProcessCleanupThread()
-        : mCleanupThread([this]() {
-              while (const auto id = mCleanupProcessIds.receive()) {
-                  FrameBuffer::getFB()->cleanupProcGLObjects(*id);
-              }
+        : mCleanupWorker([](Cmd cmd) {
+            using android::base::WorkerProcessingResult;
+            struct {
+                WorkerProcessingResult operator()(CleanProcessResources resources) {
+                    FrameBuffer::getFB()->cleanupProcGLObjects(resources.puid);
+                    // resources.resource are destroyed automatically when going out of the scope.
+                    return WorkerProcessingResult::Continue;
+                }
+                WorkerProcessingResult operator()(Exit) {
+                    return WorkerProcessingResult::Stop;
+                }
+            } visitor;
+            return std::visit(visitor, std::move(cmd));
           }) {
-        mCleanupThread.start();
+        mCleanupWorker.start();
     }
 
     ~ProcessCleanupThread() {
-        mCleanupProcessIds.stop();
-        mCleanupThread.wait();
+        mCleanupWorker.enqueue(Exit{});
     }
 
-    void cleanup(uint64_t processId) {
-        mCleanupProcessIds.send(processId);
+    void cleanup(uint64_t processId, std::unique_ptr<ProcessResources> resource) {
+        mCleanupWorker.enqueue(CleanProcessResources{
+            .puid = processId,
+            .resource = std::move(resource),
+        });
     }
 
     void stop() {
-        mCleanupProcessIds.stop();
+        mCleanupWorker.enqueue(Exit{});
     }
 
     void waitForCleanup() {
-        mCleanupProcessIds.waitForEmpty();
+        mCleanupWorker.waitQueuedItems();
     }
 
 private:
+    struct CleanProcessResources {
+        uint64_t puid;
+        std::unique_ptr<ProcessResources> resource;
+    };
+    struct Exit {};
+    using Cmd = std::variant<CleanProcessResources, Exit>;
     DISALLOW_COPY_AND_ASSIGN(ProcessCleanupThread);
 
-    android::base::MessageChannel<uint64_t, 64> mCleanupProcessIds;
-    android::base::FunctorThread mCleanupThread;
+    android::base::WorkerThread<Cmd> mCleanupWorker;
 };
 
 RendererImpl::RendererImpl() {
@@ -319,8 +336,6 @@ void RendererImpl::save(android::base::Stream* stream,
     auto fb = FrameBuffer::getFB();
     assert(fb);
     fb->onSave(stream, textureSaver);
-
-    FenceSync::onSave(stream);
 }
 
 bool RendererImpl::load(android::base::Stream* stream,
@@ -348,9 +363,6 @@ bool RendererImpl::load(android::base::Stream* stream,
 
     bool res = true;
 
-    res = fb->onLoad(stream, textureLoader);
-    FenceSync::onLoad(stream);
-
     return res;
 }
 
@@ -359,12 +371,24 @@ void RendererImpl::fillGLESUsages(android_studio::EmulatorGLESUsages* usages) {
     if (fb) fb->fillGLESUsages(usages);
 }
 
-void RendererImpl::getScreenshot(unsigned int nChannels, unsigned int* width,
-        unsigned int* height, std::vector<unsigned char>& pixels, int displayId,
-        int desiredWidth, int desiredHeight, int desiredRotation) {
+int RendererImpl::getScreenshot(
+        unsigned int nChannels,
+        unsigned int* width,
+        unsigned int* height,
+        uint8_t* pixels,
+        size_t* cPixels,
+        int displayId = 0,
+        int desiredWidth = 0,
+        int desiredHeight = 0,
+        int desiredRotation = 0) {
     auto fb = FrameBuffer::getFB();
-    if (fb) fb->getScreenshot(nChannels, width, height, pixels, displayId,
-                              desiredWidth, desiredHeight, desiredRotation);
+    if (fb) {
+        return fb->getScreenshot(nChannels, width, height, pixels, cPixels,
+                                 displayId, desiredWidth, desiredHeight,
+                                 desiredRotation);
+    }
+    *cPixels = 0;
+    return -1;
 }
 
 void RendererImpl::setMultiDisplay(uint32_t id,
@@ -487,8 +511,14 @@ void RendererImpl::setScreenMask(int width, int height, const unsigned char* rgb
     mRenderWindow->setScreenMask(width, height, rgbaData);
 }
 
+void RendererImpl::onGuestGraphicsProcessCreate(uint64_t puid) {
+    FrameBuffer::getFB()->createGraphicsProcessResources(puid);
+}
+
 void RendererImpl::cleanupProcGLObjects(uint64_t puid) {
-    mCleanupThread->cleanup(puid);
+    std::unique_ptr<ProcessResources> resource =
+        FrameBuffer::getFB()->removeGraphicsProcessResources(puid);
+    mCleanupThread->cleanup(puid, std::move(resource));
 }
 
 static struct AndroidVirtioGpuOps sVirtioGpuOps = {

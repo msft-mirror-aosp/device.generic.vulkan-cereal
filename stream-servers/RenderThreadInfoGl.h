@@ -17,16 +17,13 @@
 #include <optional>
 #include <string>
 
-#include "base/Stream.h"
+#include "Handle.h"
+#include "StalePtrRegistry.h"
+#include "aemu/base/files/Stream.h"
+#include "gl/EmulatedEglContext.h"
+#include "gl/EmulatedEglWindowSurface.h"
 #include "gl/gles1_dec/GLESv1Decoder.h"
 #include "gl/gles2_dec/GLESv2Decoder.h"
-#include "RenderContext.h"
-#include "WindowSurface.h"
-#include "StalePtrRegistry.h"
-
-typedef uint32_t HandleType;
-typedef std::unordered_set<HandleType> ThreadContextSet;
-typedef std::unordered_set<HandleType> WindowSurfaceSet;
 
 struct RenderThreadInfoGl {
     // Create new instance. Only call this once per thread.
@@ -65,9 +62,9 @@ struct RenderThreadInfoGl {
     HandleType currDrawSurfHandleFromLoad;
     HandleType currReadSurfHandleFromLoad;
 
-    RenderContextPtr currContext;
-    WindowSurfacePtr currDrawSurf;
-    WindowSurfacePtr currReadSurf;
+    gfxstream::EmulatedEglContextPtr currContext;
+    gfxstream::EmulatedEglWindowSurfacePtr currDrawSurf;
+    gfxstream::EmulatedEglWindowSurfacePtr currReadSurf;
 
     // Decoder states.
     GLESv1Decoder                   m_glDec;

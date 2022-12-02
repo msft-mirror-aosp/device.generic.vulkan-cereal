@@ -14,15 +14,15 @@
 
 #pragma once
 
-#include "OpenGLESDispatch/GLESv2Dispatch.h"
-#include "RenderContext.h"
-#include "base/Compiler.h"
-#include "FenceSync.h"
-#include "Hwc2.h"
-
 #include <cinttypes>
 #include <functional>
 #include <memory>
+
+#include "Hwc2.h"
+#include "OpenGLESDispatch/GLESv2Dispatch.h"
+#include "aemu/base/Compiler.h"
+#include "gl/EmulatedEglContext.h"
+#include "gl/EmulatedEglFenceSync.h"
 
 class FrameBuffer;
 class OSWindow;
@@ -47,7 +47,8 @@ class ColorBufferQueue;
 class SampleApplication {
 public:
     SampleApplication(int windowWidth = 256, int windowHeight = 256,
-                      int refreshRate = 60, GLESApi glVersion = GLESApi_3_0,
+                      int refreshRate = 60,
+                      gfxstream::GLESApi glVersion = gfxstream::GLESApi_3_0,
                       bool compose = false);
     ~SampleApplication();
 
@@ -78,11 +79,12 @@ public:
     // Just initialize, draw, and swap buffers once.
     void drawOnce();
 
+    bool isSwANGLE();
 private:
     void drawWorkerWithCompose(ColorBufferQueue& app2sfQueue, ColorBufferQueue& sf2appQueue);
     void drawWorker(ColorBufferQueue& app2sfQueue, ColorBufferQueue& sf2appQueue,
                 ColorBufferQueue& sf2hwcQueue, ColorBufferQueue& hwc2sfQueue);
-    FenceSync* getFenceSync();
+    gfxstream::EmulatedEglFenceSync* getFenceSync();
 
 protected:
     virtual void initialize() = 0;
