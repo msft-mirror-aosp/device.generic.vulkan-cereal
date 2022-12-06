@@ -553,10 +553,14 @@ class VkDecoderGlobalState {
                                  VkFramebuffer framebuffer,
                                  const VkAllocationCallbacks* pAllocator);
 
-    void on_vkCmdCopyQueryPoolResults(android::base::BumpPool* pool, VkCommandBuffer commandBuffer,
-                                      VkQueryPool queryPool, uint32_t firstQuery,
-                                      uint32_t queryCount, VkBuffer dstBuffer,
-                                      VkDeviceSize dstOffset, VkDeviceSize stride,
+    void on_vkCmdCopyQueryPoolResults(android::base::BumpPool* pool,
+                                      VkCommandBuffer commandBuffer,
+                                      VkQueryPool queryPool,
+                                      uint32_t firstQuery,
+                                      uint32_t queryCount,
+                                      VkBuffer dstBuffer,
+                                      VkDeviceSize dstOffset,
+                                      VkDeviceSize stride,
                                       VkQueryResultFlags flags);
 
     // VK_GOOGLE_gfxstream
@@ -620,7 +624,7 @@ class VkDecoderGlobalState {
     void DeviceLostHandler();
 
     void on_CheckOutOfMemory(VkResult result, uint32_t opCode, const VkDecoderContext& context,
-                             std::optional<uint64_t> allocationSize = std::nullopt);
+                        std::optional<uint64_t> allocationSize = std::nullopt);
 
     // Fence waits
     VkResult waitForFence(VkFence boxed_fence, uint64_t timeout);
