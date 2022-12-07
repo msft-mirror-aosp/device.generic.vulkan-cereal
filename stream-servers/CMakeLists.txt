@@ -203,11 +203,21 @@ if (ENABLE_VKCEREAL_TESTS)
         gfxstream_backend_static
         gtest_main)
     if (LINUX)
+        target_compile_definitions(
+            OpenglRender_unittests
+            PRIVATE GFXSTREAM_HAS_X11=1)
         target_link_libraries(
             OpenglRender_unittests
             PRIVATE x11_testing_support)
     endif()
-    gtest_discover_tests(OpenglRender_unittests)
+    if (WIN32)
+        gtest_discover_tests(
+            OpenglRender_unittests
+            PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_append:${CMAKE_BINARY_DIR}/lib64/gles_swiftshader"
+        )
+    else()
+        gtest_discover_tests(OpenglRender_unittests)
+    endif()
 
     # Snapshot tests################################################################
     add_executable(
@@ -235,7 +245,14 @@ if (ENABLE_VKCEREAL_TESTS)
         aemu-base-testing-support
         gfxstream_backend_static
         gtest_main)
-    gtest_discover_tests(OpenglRender_snapshot_unittests)
+    if (WIN32)
+        gtest_discover_tests(
+            OpenglRender_snapshot_unittests
+            PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_append:${CMAKE_BINARY_DIR}/lib64/gles_swiftshader"
+        )
+    else()
+        gtest_discover_tests(OpenglRender_snapshot_unittests)
+    endif()
 
     # Vulkan tests##################################################################
     add_executable(
