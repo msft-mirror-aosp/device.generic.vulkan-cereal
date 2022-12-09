@@ -202,6 +202,41 @@ typedef void (*stream_renderer_param_write_context_fence_callback)(void* user_da
 // Window 0's height.
 #define STREAM_RENDERER_PARAM_WIN0_HEIGHT 7
 
+// Enables the host to control which memory types the guest will be allowed to map. For types not
+// in the mask, the bits HOST_VISIBLE and HOST_COHERENT will be removed.
+#define STREAM_RENDERER_PARAM_HOST_VISIBLE_MEMORY_MASK 8
+
+// Information about one device's memory mask.
+struct stream_renderer_param_host_visible_memory_mask_entry {
+    // Which device the mask applies to.
+    struct stream_renderer_device_id device_id;
+    // Memory types allowed to be host visible are 1, otherwise 0.
+    uint32_t memory_type_mask;
+};
+
+static_assert(sizeof(stream_renderer_param_host_visible_memory_mask_entry) == 36,
+              "stream_renderer_param_host_visible_memory_mask_entry must be 36 bytes");
+static_assert(offsetof(stream_renderer_param_host_visible_memory_mask_entry, device_id) == 0,
+              "stream_renderer_param_host_visible_memory_mask_entry.device_id must be at offset 0");
+static_assert(
+    offsetof(stream_renderer_param_host_visible_memory_mask_entry, memory_type_mask) == 32,
+    "stream_renderer_param_host_visible_memory_mask_entry.memory_type_mask must be at offset 32");
+
+// Information about the devices in the system with host visible memory type constraints.
+struct stream_renderer_param_host_visible_memory_mask {
+    // Points to a stream_renderer_param_host_visible_memory_mask_entry array.
+    uint64_t entries;
+    // Length of the entries array.
+    uint64_t num_entries;
+};
+
+static_assert(sizeof(stream_renderer_param_host_visible_memory_mask) == 16,
+              "stream_renderer_param_host_visible_memory_mask must be 16 bytes");
+static_assert(offsetof(stream_renderer_param_host_visible_memory_mask, entries) == 0,
+              "stream_renderer_param_host_visible_memory_mask.entries must be at offset 0");
+static_assert(offsetof(stream_renderer_param_host_visible_memory_mask, num_entries) == 8,
+              "stream_renderer_param_host_visible_memory_mask.num_entries must be at offset 8");
+
 // External callbacks for tracking metrics.
 // Separating each function to a parameter allows new functions to be added later.
 #define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT 1024
@@ -245,17 +280,9 @@ static_assert(offsetof(stream_renderer_param, value) == 8,
 // Entry point for the stream renderer.
 // Pass a list of parameters to configure the renderer. The available ones are listed above. If a
 // parameter is not supported, the renderer will ignore it and warn in stderr.
-// Return value of STREAM_RENDERER_SUCCESS indicates success, otherwise an error code is returned.
-// Error codes:
-// STREAM_RENDERER_ERROR_MISSING_PARAM - Missing a required parameter.
+// Return value 0 indicates success, and a negative number indicates failure.
 VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer_params,
                                    uint64_t num_params);
-
-// Generic success return code.
-#define STREAM_RENDERER_SUCCESS 0
-
-// Missing a required parameter.
-#define STREAM_RENDERER_ERROR_MISSING_PARAM 1
 
 struct gfxstream_callbacks {
     /* Metrics callbacks */
@@ -323,6 +350,7 @@ enum RendererFlags {
     GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT = 1 << 5,          // for disabling vk
     GFXSTREAM_RENDERER_FLAGS_ENABLE_GLES31_BIT = 1 << 9,  // disables the PlayStoreImage flag
     GFXSTREAM_RENDERER_FLAGS_USE_EXTERNAL_BLOB = 1 << 10,
+    GFXSTREAM_RENDERER_FLAGS_USE_SYSTEM_BLOB = 1 << 11,
     GFXSTREAM_RENDERER_FLAGS_GUEST_USES_ANGLE = 1 << 21,
     GFXSTREAM_RENDERER_FLAGS_VULKAN_NATIVE_SWAPCHAIN_BIT = 1 << 22,
     GFXSTREAM_RENDERER_FLAGS_ASYNC_FENCE_CB = 1 << 23,
