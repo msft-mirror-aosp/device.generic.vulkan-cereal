@@ -520,9 +520,9 @@ class VkDecoderGlobalState::Impl {
         //   Theoretically the pApplicationName field would be exactly what we want, unfortunately
         //   it looks like Unity apps always set this to "Unity" instead of the actual application.
         //   Eventually we will want to use https://r.android.com/2163499 for this purpose.
+        const bool isUnity = appName == "Unity" && engineName == "Unity";
         if (m_emu->astcLdrEmulationMode == AstcEmulationMode::CpuOnly ||
-            (m_emu->astcLdrEmulationMode != AstcEmulationMode::Auto && appName == "Unity" &&
-             engineName == "Unity")) {
+            (m_emu->astcLdrEmulationMode == AstcEmulationMode::Auto && isUnity)) {
             info.useAstcCpuDecompression = true;
         }
 
@@ -4902,6 +4902,7 @@ class VkDecoderGlobalState::Impl {
      VK_EXTERNAL_MEMORY_HANDLE_TYPE_ZIRCON_VMO_BIT_FUCHSIA)
 
     // Transforms
+    // If adding a new transform here, please check if it needs to be used in VkDecoderTestDispatch
 
     void transformImpl_VkExternalMemoryProperties_tohost(const VkExternalMemoryProperties* props,
                                                          uint32_t count) {
@@ -6221,6 +6222,12 @@ VkDecoderGlobalState* VkDecoderGlobalState::get() {
     if (sGlobalDecoderState) return sGlobalDecoderState;
     sGlobalDecoderState = new VkDecoderGlobalState;
     return sGlobalDecoderState;
+}
+
+// static
+void VkDecoderGlobalState::reset() {
+    delete sGlobalDecoderState;
+    sGlobalDecoderState = nullptr;
 }
 
 // Snapshots
