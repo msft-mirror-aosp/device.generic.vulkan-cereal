@@ -296,14 +296,20 @@ std::shared_future<void> PostWorker::composeImpl(const FlatComposeRequest& compo
     return m_compositor->compose(compositorRequest);
 }
 
-void PostWorker::screenshot(ColorBuffer* cb, int width, int height, GLenum format, GLenum type,
-                            int rotation, void* pixels, emugl::Rect rect) {
+void PostWorker::screenshot(
+    ColorBuffer* cb,
+    int width,
+    int height,
+    GLenum format,
+    GLenum type,
+    int rotation,
+    void* pixels) {
     if (m_displayVk) {
         GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) <<
                             "Screenshot not supported with native Vulkan swapchain enabled.";
     }
     cb->readPixelsScaled(
-        width, height, format, type, rotation, pixels, rect);
+        width, height, format, type, rotation, pixels);
 }
 
 void PostWorker::block(std::promise<void> scheduledSignal, std::future<void> continueSignal) {

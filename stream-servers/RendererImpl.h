@@ -109,9 +109,10 @@ public:
     bool load(android::base::Stream* stream,
               const android::snapshot::ITextureLoaderPtr& textureLoader) final;
     void fillGLESUsages(android_studio::EmulatorGLESUsages*) final;
-    int getScreenshot(unsigned int nChannels, unsigned int* width, unsigned int* height,
-                      uint8_t* pixels, size_t* cPixels, int displayId, int desiredWidth,
-                      int desiredHeight, int desiredRotation, Rect rect) final;
+    int getScreenshot(unsigned int nChannels, unsigned int* width,
+            unsigned int* height, uint8_t *pixels, size_t *cPixels,
+            int displayId, int desiredWidth, int desiredHeight,
+            int desiredRotation) final;
 
     void snapshotOperationCallback(
             int snapshotterOp,
