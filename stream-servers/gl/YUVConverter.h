@@ -63,13 +63,15 @@ public:
     // the host color buffer
     // (rcUpdateColorBuffer)
     void drawConvert(int x, int y, int width, int height, const char* pixels);
+    void drawConvertFromFormat(FrameworkFormat format, int x, int y, int width, int height,
+                               const char* pixels);
 
     uint32_t getDataSize();
     // read YUV data into pixels, exactly pixels_size bytes;
     // if size mismatches, will read nothing.
     void readPixels(uint8_t* pixels, uint32_t pixels_size);
 
-    void swapTextures(FrameworkFormat type, GLuint* textures);
+    void swapTextures(uint32_t type, uint32_t* textures);
 
     // public so other classes can call
     static void createYUVGLTex(GLenum textureUnit,
@@ -101,6 +103,7 @@ private:
     GLuint mTextureY = 0;
     GLuint mTextureU = 0;
     GLuint mTextureV = 0;
+    bool mTexturesSwapped = false;
     GLint mUniformLocYWidthCutoff = -1;
     GLint mUniformLocUVWidthCutoff = -1;
     GLint mUniformLocSamplerY = -1;
