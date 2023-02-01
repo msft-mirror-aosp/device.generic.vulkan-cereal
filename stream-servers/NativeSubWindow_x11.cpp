@@ -39,6 +39,7 @@ EGLNativeWindowType createSubWindow(FBNativeWindowType p_window,
                                     int y,
                                     int width,
                                     int height,
+                                    float dpr,
                                     SubWindowRepaintCallback repaint_callback,
                                     void* repaint_callback_param,
                                     int hideWindow) {
@@ -66,7 +67,7 @@ EGLNativeWindowType createSubWindow(FBNativeWindowType p_window,
             &wa);
     if (!hideWindow) {
         x11->XMapWindow(s_display,win);
-        x11->XSetWindowBackground(s_display, win, BlackPixel(s_display, 0));
+        x11->XSetWindowBackground(s_display, win, 0);
         XEvent e;
         x11->XIfEvent(s_display, &e, WaitForMapNotify, (char *)win);
     }

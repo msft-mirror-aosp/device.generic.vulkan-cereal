@@ -16,8 +16,8 @@
 #include "BorrowedImageVk.h"
 #include "Compositor.h"
 #include "Hwc2.h"
-#include "base/Lock.h"
-#include "base/LruCache.h"
+#include "aemu/base/synchronization/Lock.h"
+#include "aemu/base/LruCache.h"
 #include "vulkan/cereal/common/goldfish_vk_dispatch.h"
 #include "vulkan/vk_util.h"
 
@@ -27,6 +27,7 @@
 // If we see rendering error or significant time spent on updating
 // descriptors in setComposition, we should tune this number.
 static constexpr const uint32_t kMaxLayersPerFrame = 16;
+static const uint64_t kVkWaitForFencesTimeoutNsecs = 5ULL * 1000ULL * 1000ULL * 1000ULL;
 
 // Base used to grant visibility to members to the vk_util::* helper classes.
 struct CompositorVkBase : public vk_util::MultiCrtp<CompositorVkBase,         //
@@ -105,8 +106,8 @@ struct CompositorVkBase : public vk_util::MultiCrtp<CompositorVkBase,         //
           m_vkDevice(device),
           m_vkPhysicalDevice(physicalDevice),
           m_vkQueue(queue),
-          m_vkQueueLock(queueLock),
           m_queueFamilyIndex(queueFamilyIndex),
+          m_vkQueueLock(queueLock),
           m_vkDescriptorSetLayout(VK_NULL_HANDLE),
           m_vkPipelineLayout(VK_NULL_HANDLE),
           m_vkRenderPass(VK_NULL_HANDLE),

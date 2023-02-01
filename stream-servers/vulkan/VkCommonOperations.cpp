@@ -28,14 +28,15 @@
 #include "FrameBuffer.h"
 #include "VkFormatUtils.h"
 #include "VulkanDispatch.h"
-#include "base/Lock.h"
-#include "base/Lookup.h"
-#include "base/Optional.h"
-#include "base/StaticMap.h"
-#include "base/System.h"
-#include "base/Tracing.h"
+#include "aemu/base/synchronization/Lock.h"
+#include "aemu/base/containers/Lookup.h"
+#include "aemu/base/Optional.h"
+#include "aemu/base/containers/StaticMap.h"
+#include "aemu/base/system/System.h"
+#include "aemu/base/Tracing.h"
 #include "common/goldfish_vk_dispatch.h"
 #include "host-common/GfxstreamFatalError.h"
+#include "host-common/emugl_vm_operations.h"
 #include "host-common/vm_operations.h"
 
 #ifdef _WIN32
@@ -140,7 +141,7 @@ bool getStagingMemoryTypeIndex(VulkanDispatch* vk, VkDevice device,
     bool foundSuitableStagingMemoryType = false;
     uint32_t stagingMemoryTypeIndex = 0;
 
-    for (uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; ++i) {
+    for (uint32_t i = 0; i < memProps->memoryTypeCount; ++i) {
         const auto& typeInfo = memProps->memoryTypes[i];
         bool hostVisible = typeInfo.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         bool hostCached = typeInfo.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
@@ -149,6 +150,21 @@ bool getStagingMemoryTypeIndex(VulkanDispatch* vk, VkDevice device,
             foundSuitableStagingMemoryType = true;
             stagingMemoryTypeIndex = i;
             break;
+        }
+    }
+
+    // If the previous loop failed, try to accept a type that is not HOST_CACHED.
+    if (!foundSuitableStagingMemoryType) {
+        for (uint32_t i = 0; i < memProps->memoryTypeCount; ++i) {
+            const auto& typeInfo = memProps->memoryTypes[i];
+            bool hostVisible = typeInfo.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+            bool allowedInBuffer = (1 << i) & memReqs.memoryTypeBits;
+            if (hostVisible && allowedInBuffer) {
+                VK_COMMON_ERROR("Warning: using non-cached HOST_VISIBLE type for staging memory");
+                foundSuitableStagingMemoryType = true;
+                stagingMemoryTypeIndex = i;
+                break;
+            }
         }
     }
 
@@ -398,35 +414,49 @@ static std::string decodeDriverVersion(uint32_t vendorId, uint32_t driverVersion
 }
 
 static std::vector<VkEmulation::ImageSupportInfo> getBasicImageSupportList() {
-    std::vector<VkFormat> formats = {
+    struct ImageFeatureCombo {
+        VkFormat format;
+        VkImageCreateFlags createFlags = 0;
+    };
+    // Set the mutable flag for RGB UNORM formats so that the created image can also be sampled in
+    // the sRGB Colorspace. See
+    // https://chromium-review.googlesource.com/c/chromiumos/platform/minigbm/+/3827672/comments/77db9cb3_60663a6a
+    // for details.
+    std::vector<ImageFeatureCombo> combos = {
         // Cover all the gralloc formats
-        VK_FORMAT_R8G8B8A8_UNORM,
-        VK_FORMAT_R8G8B8_UNORM,
+        {VK_FORMAT_R8G8B8A8_UNORM,
+         VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT},
+        {VK_FORMAT_R8G8B8_UNORM,
+         VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT},
 
-        VK_FORMAT_R5G6B5_UNORM_PACK16,
+        {VK_FORMAT_R5G6B5_UNORM_PACK16},
 
-        VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_FORMAT_R16G16B16_SFLOAT,
+        {VK_FORMAT_R16G16B16A16_SFLOAT},
+        {VK_FORMAT_R16G16B16_SFLOAT},
 
-        VK_FORMAT_B8G8R8A8_UNORM,
+        {VK_FORMAT_B8G8R8A8_UNORM,
+         VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT},
 
-        VK_FORMAT_R8_UNORM,
+        {VK_FORMAT_R8_UNORM,
+         VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT},
+        {VK_FORMAT_R16_UNORM,
+         VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT},
 
-        VK_FORMAT_A2R10G10B10_UINT_PACK32,
-        VK_FORMAT_A2R10G10B10_UNORM_PACK32,
-        VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+        {VK_FORMAT_A2R10G10B10_UINT_PACK32},
+        {VK_FORMAT_A2R10G10B10_UNORM_PACK32},
+        {VK_FORMAT_A2B10G10R10_UNORM_PACK32},
 
         // Compressed texture formats
-        VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
-        VK_FORMAT_ASTC_4x4_UNORM_BLOCK,
+        {VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK},
+        {VK_FORMAT_ASTC_4x4_UNORM_BLOCK},
 
         // TODO: YUV formats used in Android
         // Fails on Mac
-        VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
-        VK_FORMAT_G8_B8R8_2PLANE_422_UNORM,
-        VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM,
-        VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM,
-        VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+        {VK_FORMAT_G8_B8R8_2PLANE_420_UNORM},
+        {VK_FORMAT_G8_B8R8_2PLANE_422_UNORM},
+        {VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM},
+        {VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM},
+        {VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16},
 
     };
 
@@ -445,27 +475,20 @@ static std::vector<VkEmulation::ImageSupportInfo> getBasicImageSupportList() {
         VK_IMAGE_USAGE_TRANSFER_DST_BIT,
     };
 
-    std::vector<VkImageCreateFlags> createFlags = {
-        0,
-    };
-
     std::vector<VkEmulation::ImageSupportInfo> res;
 
-    // Currently: 12 formats, 2 tilings, 5 usage flags -> 120 cases
-    // to check
-    for (auto f : formats) {
+    // Currently: 17 format + create flags combo, 2 tilings, 5 usage flags -> 170 cases to check.
+    for (auto combo : combos) {
         for (auto t : types) {
             for (auto ti : tilings) {
                 for (auto u : usageFlags) {
-                    for (auto c : createFlags) {
-                        VkEmulation::ImageSupportInfo info;
-                        info.format = f;
-                        info.type = t;
-                        info.tiling = ti;
-                        info.usageFlags = u;
-                        info.createFlags = c;
-                        res.push_back(info);
-                    }
+                    VkEmulation::ImageSupportInfo info;
+                    info.format = combo.format;
+                    info.type = t;
+                    info.tiling = ti;
+                    info.usageFlags = u;
+                    info.createFlags = combo.createFlags;
+                    res.push_back(info);
                 }
             }
         }
@@ -512,6 +535,10 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
 #endif
     };
 
+    std::vector<const char*> externalSemaphoreInstanceExtNames = {
+        VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
+    };
+
     uint32_t extCount = 0;
     gvk->vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr);
     std::vector<VkExtensionProperties>& exts = sVkEmulation->instanceExtensions;
@@ -520,8 +547,12 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
 
     bool externalMemoryCapabilitiesSupported =
         extensionsSupported(exts, externalMemoryInstanceExtNames);
+    bool externalSemaphoreCapabilitiesSupported =
+        extensionsSupported(exts, externalSemaphoreInstanceExtNames);
+#ifdef VK_MVK_moltenvk
     bool moltenVKSupported =
         (vk->vkGetMTLTextureMVK != nullptr) && (vk->vkSetMTLTextureMVK != nullptr);
+#endif
 
     VkInstanceCreateInfo instCi = {
         VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, 0, 0, nullptr, 0, nullptr, 0, nullptr,
@@ -535,12 +566,14 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
         }
     }
 
+#ifdef VK_MVK_moltenvk
     if (moltenVKSupported) {
         // We don't need both moltenVK and external memory. Disable
         // external memory if moltenVK is supported.
         externalMemoryCapabilitiesSupported = false;
         enabledExtensions.clear();
     }
+#endif
 
     for (auto extension : SwapChainStateVk::getRequiredInstanceExtensions()) {
         enabledExtensions.emplace(extension);
@@ -628,7 +661,11 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
     sVkEmulation->vulkanInstanceVersion = appInfo.apiVersion;
 
     sVkEmulation->instanceSupportsExternalMemoryCapabilities = externalMemoryCapabilitiesSupported;
+    sVkEmulation->instanceSupportsExternalSemaphoreCapabilities =
+        externalSemaphoreCapabilitiesSupported;
+#ifdef VK_MVK_moltenvk
     sVkEmulation->instanceSupportsMoltenVK = moltenVKSupported;
+#endif
 
     if (sVkEmulation->instanceSupportsExternalMemoryCapabilities) {
         sVkEmulation->getImageFormatProperties2Func = vk_util::getVkInstanceProcAddrWithFallback<
@@ -642,6 +679,7 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
         vk_util::getVkInstanceProcAddrWithFallback<vk_util::vk_fn_info::GetPhysicalDeviceFeatures2>(
             {ivk->vkGetInstanceProcAddr, vk->vkGetInstanceProcAddr}, sVkEmulation->instance);
 
+#ifdef VK_MVK_moltenvk
     if (sVkEmulation->instanceSupportsMoltenVK) {
         sVkEmulation->setMTLTextureFunc = reinterpret_cast<PFN_vkSetMTLTextureMVK>(
             vk->vkGetInstanceProcAddr(sVkEmulation->instance, "vkSetMTLTextureMVK"));
@@ -658,6 +696,7 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
         }
         // LOG(VERBOSE) << "Instance supports VK_MVK_moltenvk.";
     }
+#endif
 
     uint32_t physdevCount = 0;
     ivk->vkEnumeratePhysicalDevices(sVkEmulation->instance, &physdevCount, nullptr);
@@ -866,6 +905,7 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
     }
 
     sVkEmulation->physdev = physdevs[maxScoringIndex];
+    sVkEmulation->physicalDeviceIndex = maxScoringIndex;
     sVkEmulation->deviceInfo = deviceInfos[maxScoringIndex];
     // Postcondition: sVkEmulation has valid device support info
 
@@ -1147,16 +1187,18 @@ void initVkEmulationFeatures(std::unique_ptr<VkEmulationFeatures> features) {
     INFO("    useVulkanComposition: %s", features->useVulkanComposition ? "true" : "false");
     INFO("    useVulkanNativeSwapchain: %s", features->useVulkanNativeSwapchain ? "true" : "false");
     INFO("    enable guestRenderDoc: %s", features->guestRenderDoc ? "true" : "false");
-    INFO("    enable ASTC LDR emulation: %s", features->enableAstcLdrEmulation ? "true" : "false");
+    INFO("    ASTC LDR emulation mode: %d", features->astcLdrEmulationMode);
     INFO("    enable ETC2 emulation: %s", features->enableEtc2Emulation ? "true" : "false");
     INFO("    enable Ycbcr emulation: %s", features->enableYcbcrEmulation ? "true" : "false");
+    INFO("    guestUsesAngle: %s", features->guestUsesAngle ? "true" : "false");
     sVkEmulation->deviceInfo.glInteropSupported = features->glInteropSupported;
     sVkEmulation->useDeferredCommands = features->deferredCommands;
     sVkEmulation->useCreateResourcesWithRequirements = features->createResourceWithRequirements;
     sVkEmulation->guestRenderDoc = std::move(features->guestRenderDoc);
-    sVkEmulation->enableAstcLdrEmulation = features->enableAstcLdrEmulation;
+    sVkEmulation->astcLdrEmulationMode = features->astcLdrEmulationMode;
     sVkEmulation->enableEtc2Emulation = features->enableEtc2Emulation;
     sVkEmulation->enableYcbcrEmulation = features->enableYcbcrEmulation;
+    sVkEmulation->guestUsesAngle = features->guestUsesAngle;
 
     if (features->useVulkanComposition) {
         if (sVkEmulation->compositorVk) {
@@ -1194,12 +1236,38 @@ void teardownGlobalVkEmulation() {
 
     freeExternalMemoryLocked(sVkEmulation->dvk, &sVkEmulation->staging.memory);
 
+    sVkEmulation->dvk->vkDestroyBuffer(sVkEmulation->device, sVkEmulation->staging.buffer, nullptr);
+
+    sVkEmulation->dvk->vkDestroyFence(sVkEmulation->device, sVkEmulation->commandBufferFence,
+                                      nullptr);
+
+    sVkEmulation->dvk->vkFreeCommandBuffers(sVkEmulation->device, sVkEmulation->commandPool, 1,
+                                            &sVkEmulation->commandBuffer);
+
+    sVkEmulation->dvk->vkDestroyCommandPool(sVkEmulation->device, sVkEmulation->commandPool,
+                                            nullptr);
+
     sVkEmulation->ivk->vkDestroyDevice(sVkEmulation->device, nullptr);
     sVkEmulation->gvk->vkDestroyInstance(sVkEmulation->instance, nullptr);
 
     sVkEmulation->live = false;
     delete sVkEmulation;
     sVkEmulation = nullptr;
+}
+
+std::unique_ptr<gfxstream::DisplaySurface> createDisplaySurface(FBNativeWindowType window,
+                                                                uint32_t width, uint32_t height) {
+    if (!sVkEmulation || !sVkEmulation->live) {
+        return nullptr;
+    }
+
+    auto surfaceVk = DisplaySurfaceVk::create(*sVkEmulation->ivk, sVkEmulation->instance, window);
+    if (!surfaceVk) {
+        VK_COMMON_ERROR("Failed to create DisplaySurfaceVk.");
+        return nullptr;
+    }
+
+    return std::make_unique<gfxstream::DisplaySurface>(width, height, std::move(surfaceVk));
 }
 
 // Precondition: sVkEmulation has valid device support info
@@ -1379,7 +1447,7 @@ bool importExternalMemory(VulkanDispatch* vk, VkDevice targetDevice,
     VkMemoryAllocateInfo allocInfo = {
         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         &importInfo,
-        info->size,
+        info->actualSize,
         info->typeIndex,
     };
 
@@ -1465,6 +1533,10 @@ static VkFormat glFormat2VkFormat(GLint internalformat) {
         case GL_BGRA_EXT:
         case GL_BGRA8_EXT:
             return VK_FORMAT_B8G8R8A8_UNORM;
+        case GL_R16_EXT:
+            return VK_FORMAT_R16_UNORM;
+        case GL_RG8_EXT:
+            return VK_FORMAT_R8G8_UNORM;
         default:
             VK_COMMON_ERROR("Unhandled format %d, falling back to VK_FORMAT_R8G8B8A8_UNORM",
                             internalformat);
@@ -1519,18 +1591,19 @@ static uint32_t lastGoodTypeIndexWithMemoryProperties(uint32_t indices,
 // filled.
 static std::unique_ptr<VkImageCreateInfo> generateColorBufferVkImageCreateInfo_locked(
     VkFormat format, uint32_t width, uint32_t height, VkImageTiling tiling) {
-    const VkFormatProperties* maybeFormatProperties = nullptr;
+    const VkEmulation::ImageSupportInfo* maybeImageSupportInfo = nullptr;
     for (const auto& supportInfo : sVkEmulation->imageSupportInfo) {
         if (supportInfo.format == format && supportInfo.supported) {
-            maybeFormatProperties = &supportInfo.formatProps2.formatProperties;
+            maybeImageSupportInfo = &supportInfo;
             break;
         }
     }
-    if (!maybeFormatProperties) {
+    if (!maybeImageSupportInfo) {
         ERR("Format %s is not supported.", string_VkFormat(format));
         return nullptr;
     }
-    const VkFormatProperties& formatProperties = *maybeFormatProperties;
+    const VkEmulation::ImageSupportInfo& imageSupportInfo = *maybeImageSupportInfo;
+    const VkFormatProperties& formatProperties = imageSupportInfo.formatProps2.formatProperties;
 
     constexpr std::pair<VkFormatFeatureFlags, VkImageUsageFlags> formatUsagePairs[] = {
         {VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT,
@@ -1553,7 +1626,7 @@ static std::unique_ptr<VkImageCreateInfo> generateColorBufferVkImageCreateInfo_l
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         // The caller is responsible to fill pNext.
         .pNext = nullptr,
-        .flags = 0,
+        .flags = imageSupportInfo.createFlags,
         .imageType = VK_IMAGE_TYPE_2D,
         .format = format,
         .extent =
@@ -1791,19 +1864,19 @@ bool setupVkColorBuffer(uint32_t colorBufferHandle, bool vulkanOnly, uint32_t me
         return false;
     }
 
+#if defined(VK_MVK_moltenvk) && defined(__APPLE__)
     if (sVkEmulation->instanceSupportsMoltenVK) {
         sVkEmulation->getMTLTextureFunc(res.image, &res.mtlTexture);
         if (!res.mtlTexture) {
             fprintf(stderr, "%s: Failed to get MTLTexture.\n", __func__);
         }
 
-#ifdef __APPLE__
         CFRetain(res.mtlTexture);
-#endif
     }
+#endif
 
     bool glExported = sVkEmulation->deviceInfo.supportsExternalMemory &&
-                      sVkEmulation->deviceInfo.glInteropSupported && glCompatible;
+                      sVkEmulation->deviceInfo.glInteropSupported && glCompatible && !vulkanOnly;
     if (glExported) {
         ManagedDescriptor exportedHandle(dupExternalMemory(res.memory.exportedHandle));
         glExported = FrameBuffer::getFB()->importMemoryToColorBuffer(
@@ -1811,6 +1884,9 @@ bool setupVkColorBuffer(uint32_t colorBufferHandle, bool vulkanOnly, uint32_t me
             colorBufferHandle, res.image, *imageCi);
     }
     res.glExported = glExported;
+    if (vulkanOnly) {
+        res.vulkanMode = VkEmulation::VulkanMode::VulkanOnly;
+    }
 
     if (exported) *exported = res.glExported;
     if (allocSize) *allocSize = res.memory.size;
@@ -1890,8 +1966,6 @@ bool readColorBufferToGl(uint32_t colorBufferHandle) {
         return false;
     }
 
-    auto vk = sVkEmulation->dvk;
-
     AutoLock lock(sVkEmulationLock);
 
     auto colorBufferInfo = android::base::find(sVkEmulation->colorBuffers, colorBufferHandle);
@@ -1917,7 +1991,7 @@ bool readColorBufferToGl(uint32_t colorBufferHandle) {
 
     std::vector<uint8_t> bytes(bytesNeeded);
 
-    result = readColorBufferToBytes(
+    result = readColorBufferToBytesLocked(
         colorBufferHandle, 0, 0, colorBufferInfo->imageCreateInfoShallow.extent.width,
         colorBufferInfo->imageCreateInfoShallow.extent.height, bytes.data());
     if (!result) {
@@ -1936,8 +2010,6 @@ bool readColorBufferToBytes(uint32_t colorBufferHandle, uint32_t x, uint32_t y, 
         VK_COMMON_ERROR("VkEmulation not available.");
         return false;
     }
-
-    auto vk = sVkEmulation->dvk;
 
     AutoLock lock(sVkEmulationLock);
     return readColorBufferToBytesLocked(colorBufferHandle, x, y, w, h, outPixels);
@@ -2124,7 +2196,6 @@ bool updateColorBufferFromBytes(uint32_t colorBufferHandle, uint32_t x, uint32_t
         return false;
     }
 
-    auto vk = sVkEmulation->dvk;
     AutoLock lock(sVkEmulationLock);
     return updateColorBufferFromBytesLocked(colorBufferHandle, x, y, w, h, pixels);
 }

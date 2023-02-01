@@ -15,10 +15,11 @@
 
 #include "VulkanHandleMapping.h"
 #include "VulkanHandles.h"
-#include "base/EntityManager.h"
-#include "base/GfxApiLogger.h"
-#include "base/Stream.h"
+#include "aemu/base/containers/EntityManager.h"
+#include "aemu/base/HealthMonitor.h"
+#include "aemu/base/files/Stream.h"
 #include "common/goldfish_vk_marshaling.h"
+#include "utils/GfxApiLogger.h"
 
 // A class that captures all important data structures for
 // reconstructing a Vulkan system state via trimmed API record and replay.
@@ -27,7 +28,8 @@ class VkReconstruction {
     VkReconstruction();
 
     void save(android::base::Stream* stream);
-    void load(android::base::Stream* stream, emugl::GfxApiLogger& gfxLogger);
+    void load(android::base::Stream* stream, emugl::GfxApiLogger& gfxLogger,
+              emugl::HealthMonitor<>* healthMonitor);
 
     struct ApiInfo {
         // Fast

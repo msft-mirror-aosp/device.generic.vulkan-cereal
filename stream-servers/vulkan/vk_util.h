@@ -40,12 +40,13 @@
 #include <type_traits>
 #include <vector>
 
+#include "VkDecoderContext.h"
 #include "VulkanDispatch.h"
-#include "base/Lock.h"
-#include "common/vk_struct_id.h"
+#include "aemu/base/synchronization/Lock.h"
 #include "host-common/GfxstreamFatalError.h"
 #include "host-common/logging.h"
 #include "vk_fn_info.h"
+#include "vulkan/cereal/common/vk_struct_id.h"
 
 struct vk_struct_common {
     VkStructureType sType;
@@ -229,14 +230,14 @@ T vk_make_orphan_copy(const T& vk_struct) {
 
 template <class T>
 vk_struct_chain_iterator vk_make_chain_iterator(T* vk_struct) {
-    vk_get_vk_struct_id<T>::id;
+    (void)vk_get_vk_struct_id<T>::id;
     vk_struct_chain_iterator result = {reinterpret_cast<vk_struct_common*>(vk_struct)};
     return result;
 }
 
 template <class T>
 void vk_append_struct(vk_struct_chain_iterator* i, T* vk_struct) {
-    vk_get_vk_struct_id<T>::id;
+    (void)vk_get_vk_struct_id<T>::id;
 
     vk_struct_common* p = i->value;
     if (p->pNext) {
@@ -247,6 +248,17 @@ void vk_append_struct(vk_struct_chain_iterator* i, T* vk_struct) {
     vk_struct->pNext = NULL;
 
     *i = vk_make_chain_iterator(vk_struct);
+}
+
+// The caller should guarantee that all the pNext structs in the chain starting at nextChain is not
+// a const object to avoid unexpected undefined behavior.
+template <class T, class U, typename = std::enable_if_t<!std::is_const_v<T> && !std::is_const_v<U>>>
+void vk_insert_struct(T& pos, U& nextChain) {
+    vk_struct_common* nextChainTail = reinterpret_cast<vk_struct_common*>(&nextChain);
+    for (; nextChainTail->pNext; nextChainTail = nextChainTail->pNext) {}
+
+    nextChainTail->pNext = reinterpret_cast<vk_struct_common*>(const_cast<void*>(pos.pNext));
+    pos.pNext = &nextChain;
 }
 
 template <class S, class T>
@@ -262,17 +274,38 @@ void vk_struct_chain_remove(S* unwanted, T* vk_struct) {
     }
 }
 
-#define VK_CHECK(x)                                                     \
-    do {                                                                \
-        VkResult err = x;                                               \
-        if (err != VK_SUCCESS) {                                        \
-            if (err == VK_ERROR_DEVICE_LOST) {                          \
-                ::vk_util::getVkCheckCallbacks().callIfExists(          \
-                    &::vk_util::VkCheckCallbacks::onVkErrorDeviceLost); \
-            }                                                           \
-            GFXSTREAM_ABORT(::emugl::FatalError(err));                  \
-        }                                                               \
+#define VK_CHECK(x)                                                                               \
+    do {                                                                                          \
+        VkResult err = x;                                                                         \
+        if (err != VK_SUCCESS) {                                                                  \
+            if (err == VK_ERROR_DEVICE_LOST) {                                                    \
+                ::vk_util::getVkCheckCallbacks().callIfExists(                                    \
+                    &::vk_util::VkCheckCallbacks::onVkErrorDeviceLost);                           \
+            }                                                                                     \
+            if (err == VK_ERROR_OUT_OF_HOST_MEMORY || err == VK_ERROR_OUT_OF_DEVICE_MEMORY ||     \
+                err == VK_ERROR_OUT_OF_POOL_MEMORY) {                                             \
+                ::vk_util::getVkCheckCallbacks().callIfExists(                                    \
+                    &::vk_util::VkCheckCallbacks::onVkErrorOutOfMemory, err, __func__, __LINE__); \
+            }                                                                                     \
+            GFXSTREAM_ABORT(::emugl::FatalError(err));                                            \
+        }                                                                                         \
     } while (0)
+
+#define VK_CHECK_MEMALLOC(x, allocateInfo)                                                           \
+    do {                                                                                           \
+        VkResult err = x;                                                                          \
+        if (err != VK_SUCCESS) {                                                                   \
+            if (err == VK_ERROR_OUT_OF_HOST_MEMORY || err == VK_ERROR_OUT_OF_DEVICE_MEMORY) {      \
+                ::vk_util::getVkCheckCallbacks().callIfExists(                                     \
+                    &::vk_util::VkCheckCallbacks::onVkErrorOutOfMemoryOnAllocation, err, __func__, \
+                    __LINE__, allocateInfo.allocationSize);                                        \
+            }                                                                                      \
+            GFXSTREAM_ABORT(::emugl::FatalError(err));                                             \
+        }                                                                                          \
+    } while (0)
+
+typedef void* MTLTextureRef;
+typedef void* MTLBufferRef;
 
 namespace vk_util {
 
@@ -295,6 +328,8 @@ inline VkResult waitForVkQueueIdleWithRetry(const VulkanDispatch& vk, VkQueue qu
 
 typedef struct {
     std::function<void()> onVkErrorDeviceLost;
+    std::function<void(VkResult, const char*, int)> onVkErrorOutOfMemory;
+    std::function<void(VkResult, const char*, int, uint64_t)> onVkErrorOutOfMemoryOnAllocation;
 } VkCheckCallbacks;
 
 template <class T>
@@ -305,9 +340,11 @@ class CallbacksWrapper {
     template <class U, class... Args>
     void callIfExists(U function, Args&&... args) const {
         if (mCallbacks && (*mCallbacks.*function)) {
-            (*mCallbacks.*function)(std::forward(args)...);
+            (*mCallbacks.*function)(std::forward<Args>(args)...);
         }
     }
+
+    T* get() const { return mCallbacks.get(); }
 
    private:
     std::unique_ptr<T> mCallbacks;

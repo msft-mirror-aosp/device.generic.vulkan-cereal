@@ -14,10 +14,10 @@
 
 #include "VulkanDispatch.h"
 
-#include "base/Lock.h"
-#include "base/PathUtils.h"
-#include "base/SharedLibrary.h"
-#include "base/System.h"
+#include "aemu/base/synchronization/Lock.h"
+#include "aemu/base/files/PathUtils.h"
+#include "aemu/base/SharedLibrary.h"
+#include "aemu/base/system/System.h"
 #include "host-common/misc.h"
 
 using android::base::AutoLock;
@@ -37,8 +37,12 @@ static void setIcdPath(const std::string& path) {
 
 static std::string icdJsonNameToProgramAndLauncherPaths(const std::string& icdFilename) {
     std::string suffix = pj({"lib64", "vulkan", icdFilename});
-
-    return pj({android::base::getProgramDirectory(), suffix}) + ":" +
+#if defined(_WIN32)
+    const char* sep = ";";
+#else
+    const char* sep = ":";
+#endif
+    return pj({android::base::getProgramDirectory(), suffix}) + sep +
            pj({android::base::getLauncherDirectory(), suffix});
 }
 
@@ -56,8 +60,7 @@ static const char* getTestIcdFilename() {
 
 static void initIcdPaths(bool forTesting) {
     auto androidIcd = android::base::getEnvironmentVariable("ANDROID_EMU_VK_ICD");
-    android::base::setEnvironmentVariable("ANDROID_EMU_SANDBOX", "1");
-    if (android::base::getEnvironmentVariable("ANDROID_EMU_SANDBOX") == "1") {
+    if (androidIcd == "") {
         // Rely on user to set VK_ICD_FILENAMES
         return;
     } else {
@@ -95,9 +98,7 @@ static void initIcdPaths(bool forTesting) {
             } else if (androidIcd == "portability-debug") {
                 setIcdPath(icdJsonNameToProgramAndLauncherPaths("portability-macos-debug.json"));
             } else {
-                if (androidIcd == "swiftshader" ||
-                    emugl::getRenderer() == SELECTED_RENDERER_SWIFTSHADER ||
-                    emugl::getRenderer() == SELECTED_RENDERER_SWIFTSHADER_INDIRECT) {
+                if (androidIcd == "swiftshader") {
                     setIcdPath(icdJsonNameToProgramAndLauncherPaths("vk_swiftshader_icd.json"));
                     android::base::setEnvironmentVariable("ANDROID_EMU_VK_ICD", "swiftshader");
                 } else {
@@ -223,7 +224,7 @@ class VulkanDispatchImpl {
     void initialize(bool forTesting);
 
     void* dlopen() {
-        bool sandbox = android::base::getEnvironmentVariable("ANDROID_EMU_SANDBOX") == "1";
+        bool sandbox = android::base::getEnvironmentVariable("ANDROID_EMU_VK_ICD") == "";
 
         if (mVulkanLibs.size() == 0) {
             if (sandbox) {

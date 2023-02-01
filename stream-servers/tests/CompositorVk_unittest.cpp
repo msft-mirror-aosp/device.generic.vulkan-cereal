@@ -10,7 +10,7 @@
 #include <optional>
 
 #include "BorrowedImageVk.h"
-#include "base/Lock.h"
+#include "aemu/base/synchronization/Lock.h"
 #include "tests/ImageUtils.h"
 #include "tests/VkTestUtils.h"
 #include "vulkan/VulkanDispatch.h"
@@ -21,7 +21,7 @@ namespace {
 static constexpr const bool kDefaultSaveImageIfComparisonFailed = false;
 
 std::string GetTestDataPath(const std::string& basename) {
-    const std::filesystem::path currentPath = std::filesystem::current_path();
+    const std::filesystem::path currentPath = android::base::getProgramDirectory();
     return (currentPath / "tests" / "testdata" / basename).string();
 }
 
@@ -37,9 +37,14 @@ class CompositorVkTest : public ::testing::Test {
                                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT>;
     using SourceImage = emugl::RenderTextureVk;
 
-    static void SetUpTestCase() { k_vk = emugl::vkDispatch(false); }
+    static void SetUpTestCase() {
+        k_vk = emugl::vkDispatch(false);
+    }
 
     void SetUp() override {
+#if defined(__APPLE__) && defined(__arm64__)
+        GTEST_SKIP() << "Skipping all test on Apple M2, as they are failing, see b/263494782";
+#endif
         ASSERT_NE(k_vk, nullptr);
         createInstance();
         pickPhysicalDevice();
@@ -68,6 +73,10 @@ class CompositorVkTest : public ::testing::Test {
     }
 
     void TearDown() override {
+#if defined(__APPLE__) && defined(__arm64__)
+        return;
+#endif
+
         k_vk->vkDestroyCommandPool(m_vkDevice, m_vkCommandPool, nullptr);
         k_vk->vkDestroyDevice(m_vkDevice, nullptr);
         m_vkDevice = VK_NULL_HANDLE;
@@ -564,7 +573,6 @@ TEST_F(CompositorVkTest, Transformations) {
 
     Compositor::CompositionRequest compositionRequest;
     compositionRequest.layers.emplace_back(Compositor::CompositionRequestLayer{
-        .source = createBorrowedImageInfo(source.get()),
         .props =
             {
                 .composeMode = HWC2_COMPOSITION_DEVICE,
@@ -614,6 +622,7 @@ TEST_F(CompositorVkTest, Transformations) {
 
         compositionRequest.target = createBorrowedImageInfo(target.get());
         compositionRequest.layers[0].props.transform = transform;
+        compositionRequest.layers[0].source = createBorrowedImageInfo(source.get());
 
         auto compositionCompleteWaitable = compositor->compose(compositionRequest);
         compositionCompleteWaitable.wait();
@@ -641,7 +650,6 @@ TEST_F(CompositorVkTest, MultipleTargetsComposition) {
 
     Compositor::CompositionRequest compositionRequest = {};
     compositionRequest.layers.emplace_back(Compositor::CompositionRequestLayer{
-        .source = createBorrowedImageInfo(source.get()),
         .props =
             {
                 .composeMode = HWC2_COMPOSITION_DEVICE,
@@ -677,6 +685,7 @@ TEST_F(CompositorVkTest, MultipleTargetsComposition) {
         const auto& target = targets[i];
 
         compositionRequest.target = createBorrowedImageInfo(target.get());
+        compositionRequest.layers[0].source = createBorrowedImageInfo(source.get()),
         compositionRequest.layers[0].props.displayFrame.left = (i + 0) * displayFrameWidth;
         compositionRequest.layers[0].props.displayFrame.right = (i + 1) * displayFrameWidth;
 

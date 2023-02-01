@@ -61,8 +61,7 @@ DisplayVk::DisplayVk(const goldfish_vk::VulkanDispatch& vk, VkPhysicalDevice vkP
       m_swapChainVkQueue(swapChainVkqueue),
       m_swapChainVkQueueLock(swapChainVkQueueLock),
       m_vkCommandPool(VK_NULL_HANDLE),
-      m_swapChainStateVk(nullptr),
-      m_surfaceState(nullptr) {
+      m_swapChainStateVk(nullptr) {
     // TODO(kaiyili): validate the capabilites of the passed in Vulkan
     // components.
     VkCommandPoolCreateInfo commandPoolCi = {
@@ -71,14 +70,16 @@ DisplayVk::DisplayVk(const goldfish_vk::VulkanDispatch& vk, VkPhysicalDevice vkP
         .queueFamilyIndex = m_compositorQueueFamilyIndex,
     };
     VK_CHECK(m_vk.vkCreateCommandPool(m_vkDevice, &commandPoolCi, nullptr, &m_vkCommandPool));
+    constexpr size_t imageBorrowResourcePoolSize = 10;
+    for (size_t i = 0; i < imageBorrowResourcePoolSize; i++) {
+        m_imageBorrowResources.emplace_back(
+            ImageBorrowResource::create(m_vk, m_vkDevice, m_vkCommandPool));
+    }
 }
 
 DisplayVk::~DisplayVk() {
-    drainQueues();
-    m_freePostResources.clear();
-    m_postResourceFutures.clear();
-    m_surfaceState.reset();
-    m_swapChainStateVk.reset();
+    destroySwapchain();
+    m_imageBorrowResources.clear();
     m_vk.vkDestroyCommandPool(m_vkDevice, m_vkCommandPool, nullptr);
 }
 
@@ -96,20 +97,47 @@ void DisplayVk::drainQueues() {
     }
 }
 
-bool DisplayVk::bindToSurface(VkSurfaceKHR surface, uint32_t width, uint32_t height) {
+void DisplayVk::bindToSurfaceImpl(gfxstream::DisplaySurface* surface) {
+    m_needToRecreateSwapChain = true;
+}
+
+void DisplayVk::surfaceUpdated(gfxstream::DisplaySurface* surface) {
+    m_needToRecreateSwapChain = true;
+}
+
+void DisplayVk::unbindFromSurfaceImpl() {
+    destroySwapchain();
+}
+
+void DisplayVk::destroySwapchain() {
     drainQueues();
     m_freePostResources.clear();
     m_postResourceFutures.clear();
     m_swapChainStateVk.reset();
+    m_needToRecreateSwapChain = true;
+}
 
-    if (!SwapChainStateVk::validateQueueFamilyProperties(m_vk, m_vkPhysicalDevice, surface,
+bool DisplayVk::recreateSwapchain() {
+    destroySwapchain();
+
+    const auto* surface = getBoundSurface();
+    if (!surface) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+            << "DisplayVk can't create VkSwapchainKHR without a VkSurfaceKHR";
+    }
+    const auto* surfaceVk = static_cast<const DisplaySurfaceVk*>(surface->getImpl());
+
+    if (!SwapChainStateVk::validateQueueFamilyProperties(m_vk, m_vkPhysicalDevice,
+                                                         surfaceVk->getSurface(),
                                                          m_swapChainQueueFamilyIndex)) {
         GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
             << "DisplayVk can't create VkSwapchainKHR with given VkDevice and VkSurfaceKHR.";
     }
+    INFO("Creating swapchain with size %" PRIu32 "x%" PRIu32 ".", surface->getWidth(),
+         surface->getHeight());
     auto swapChainCi = SwapChainStateVk::createSwapChainCi(
-        m_vk, surface, m_vkPhysicalDevice, width, height,
-        {m_swapChainQueueFamilyIndex, m_compositorQueueFamilyIndex});
+        m_vk, surfaceVk->getSurface(), m_vkPhysicalDevice, surface->getWidth(),
+        surface->getHeight(), {m_swapChainQueueFamilyIndex, m_compositorQueueFamilyIndex});
     if (!swapChainCi) {
         return false;
     }
@@ -132,28 +160,203 @@ bool DisplayVk::bindToSurface(VkSurfaceKHR surface, uint32_t width, uint32_t hei
     }
 
     m_inFlightFrameIndex = 0;
-
-    auto surfaceState = std::make_unique<SurfaceState>();
-    surfaceState->m_height = height;
-    surfaceState->m_width = width;
-    m_surfaceState = std::move(surfaceState);
+    m_needToRecreateSwapChain = false;
     return true;
 }
 
-std::tuple<bool, std::shared_future<void>> DisplayVk::post(
+DisplayVk::PostResult DisplayVk::post(const BorrowedImageInfo* sourceImageInfo) {
+    auto completedFuture = std::async(std::launch::deferred, [] {}).share();
+    completedFuture.wait();
+
+    const auto* surface = getBoundSurface();
+    if (!surface) {
+        ERR("Trying to present to non-existing surface!");
+        return PostResult{
+            .success = true,
+            .postCompletedWaitable = completedFuture,
+        };
+    }
+
+    if (m_needToRecreateSwapChain) {
+        INFO("Recreating swapchain...");
+
+        constexpr const int kMaxRecreateSwapchainRetries = 8;
+        int retriesRemaining = kMaxRecreateSwapchainRetries;
+        while (retriesRemaining >= 0 && !recreateSwapchain()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            --retriesRemaining;
+            INFO("Swapchain recreation failed, retrying...");
+        }
+
+        if (retriesRemaining < 0) {
+            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+                << "Failed to create Swapchain."
+                << " w:" << surface->getWidth()
+                << " h:" << surface->getHeight();
+        }
+
+        INFO("Recreating swapchain completed.");
+    }
+
+    auto result = postImpl(sourceImageInfo);
+    if (!result.success) {
+        m_needToRecreateSwapChain = true;
+    }
+    return result;
+}
+
+DisplayVk::PostResult DisplayVk::postImpl(
     const BorrowedImageInfo* sourceImageInfo) {
     auto completedFuture = std::async(std::launch::deferred, [] {}).share();
     completedFuture.wait();
 
-    if (!m_swapChainStateVk || !m_surfaceState) {
+    // One for acquire, one for release.
+    const ImageBorrowResource* imageBorrowResources[2] = {nullptr};
+    for (size_t i = 0; i < std::size(imageBorrowResources); i++) {
+        auto freeImageBorrowResource =
+            std::find_if(m_imageBorrowResources.begin(), m_imageBorrowResources.end(),
+                         [this](const std::unique_ptr<ImageBorrowResource>& imageBorrowResource) {
+                             VkResult fenceStatus = m_vk.vkGetFenceStatus(
+                                 m_vkDevice, imageBorrowResource->m_completeFence);
+                             if (fenceStatus == VK_SUCCESS) { return true; }
+                             if (fenceStatus == VK_NOT_READY) { return false; }
+                             VK_CHECK(fenceStatus);
+                             return false;
+                         });
+        if (freeImageBorrowResource == m_imageBorrowResources.end()) {
+            freeImageBorrowResource = m_imageBorrowResources.begin();
+            VK_CHECK(m_vk.vkWaitForFences(
+                m_vkDevice, 1, &(*freeImageBorrowResource)->m_completeFence, VK_TRUE, UINT64_MAX));
+        }
+        VK_CHECK(m_vk.vkResetFences(m_vkDevice, 1, &(*freeImageBorrowResource)->m_completeFence));
+        imageBorrowResources[i] = freeImageBorrowResource->get();
+    }
+    // We need to unconditionally acquire and release the image to satisfy the requiremment for the
+    // borrowed image.
+    const auto* sourceImageInfoVk = static_cast<const BorrowedImageInfoVk*>(sourceImageInfo);
+    struct ImageBorrower {
+        ImageBorrower(const goldfish_vk::VulkanDispatch& vk, VkQueue queue,
+                      std::shared_ptr<android::base::Lock> queueLock, uint32_t usedQueueFamilyIndex,
+                      const BorrowedImageInfoVk& image, const ImageBorrowResource& acquireResource,
+                      const ImageBorrowResource& releaseResource)
+            : m_vk(vk),
+              m_vkQueue(queue),
+              m_queueLock(queueLock),
+              m_releaseResource(releaseResource) {
+            std::vector<VkImageMemoryBarrier> acquireQueueTransferBarriers;
+            std::vector<VkImageMemoryBarrier> acquireLayoutTransitionBarriers;
+            std::vector<VkImageMemoryBarrier> releaseLayoutTransitionBarriers;
+            std::vector<VkImageMemoryBarrier> releaseQueueTransferBarriers;
+            addNeededBarriersToUseBorrowedImage(
+                image, usedQueueFamilyIndex,
+                /*usedInitialImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                /*usedFinalImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, &acquireQueueTransferBarriers,
+                &acquireLayoutTransitionBarriers, &releaseLayoutTransitionBarriers,
+                &releaseQueueTransferBarriers);
+
+            // Record the acquire commands.
+            const VkCommandBufferBeginInfo acquireBeginInfo = {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            };
+            VK_CHECK(
+                m_vk.vkBeginCommandBuffer(acquireResource.m_vkCommandBuffer, &acquireBeginInfo));
+            if (!acquireQueueTransferBarriers.empty()) {
+                m_vk.vkCmdPipelineBarrier(
+                    acquireResource.m_vkCommandBuffer,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, 0, nullptr, 0, nullptr,
+                    static_cast<uint32_t>(acquireQueueTransferBarriers.size()),
+                    acquireQueueTransferBarriers.data());
+            }
+            if (!acquireLayoutTransitionBarriers.empty()) {
+                m_vk.vkCmdPipelineBarrier(
+                    acquireResource.m_vkCommandBuffer,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                    static_cast<uint32_t>(acquireLayoutTransitionBarriers.size()),
+                    acquireLayoutTransitionBarriers.data());
+            }
+            VK_CHECK(m_vk.vkEndCommandBuffer(acquireResource.m_vkCommandBuffer));
+
+            // Record the release commands.
+            const VkCommandBufferBeginInfo releaseBeginInfo = {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            };
+            VK_CHECK(
+                m_vk.vkBeginCommandBuffer(releaseResource.m_vkCommandBuffer, &releaseBeginInfo));
+            if (!releaseLayoutTransitionBarriers.empty()) {
+                m_vk.vkCmdPipelineBarrier(
+                    releaseResource.m_vkCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                    static_cast<uint32_t>(releaseLayoutTransitionBarriers.size()),
+                    releaseLayoutTransitionBarriers.data());
+            }
+            if (!releaseQueueTransferBarriers.empty()) {
+                m_vk.vkCmdPipelineBarrier(
+                    releaseResource.m_vkCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                    static_cast<uint32_t>(releaseQueueTransferBarriers.size()),
+                    releaseQueueTransferBarriers.data());
+            }
+            VK_CHECK(m_vk.vkEndCommandBuffer(releaseResource.m_vkCommandBuffer));
+
+            VkSubmitInfo submitInfo = {
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .waitSemaphoreCount = 0,
+                .pWaitSemaphores = nullptr,
+                .pWaitDstStageMask = nullptr,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &acquireResource.m_vkCommandBuffer,
+                .signalSemaphoreCount = 0,
+                .pSignalSemaphores = nullptr,
+            };
+            // Submit the acquire commands.
+            {
+                android::base::AutoLock lock(*m_queueLock);
+                VK_CHECK(
+                    m_vk.vkQueueSubmit(m_vkQueue, 1, &submitInfo, acquireResource.m_completeFence));
+            }
+        }
+
+        const goldfish_vk::VulkanDispatch& m_vk;
+        const VkQueue m_vkQueue;
+        std::shared_ptr<android::base::Lock> m_queueLock;
+        const ImageBorrowResource& m_releaseResource;
+        ~ImageBorrower() {
+            VkSubmitInfo submitInfo = {
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .waitSemaphoreCount = 0,
+                .pWaitSemaphores = nullptr,
+                .pWaitDstStageMask = nullptr,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &m_releaseResource.m_vkCommandBuffer,
+                .signalSemaphoreCount = 0,
+                .pSignalSemaphores = nullptr,
+            };
+            // Submit the release commands.
+            {
+                android::base::AutoLock lock(*m_queueLock);
+                VK_CHECK(m_vk.vkQueueSubmit(m_vkQueue, 1, &submitInfo,
+                                            m_releaseResource.m_completeFence));
+            }
+        }
+    } imageBorrower(m_vk, m_compositorVkQueue, m_compositorVkQueueLock,
+                    m_compositorQueueFamilyIndex, *sourceImageInfoVk, *imageBorrowResources[0],
+                    *imageBorrowResources[1]);
+
+    const auto* surface = getBoundSurface();
+    if (!m_swapChainStateVk || !surface) {
         DISPLAY_VK_ERROR("Haven't bound to a surface, can't post ColorBuffer.");
-        return std::make_tuple(true, std::move(completedFuture));
+        return PostResult{true, std::move(completedFuture)};
     }
 
-    const auto* sourceImageInfoVk = static_cast<const BorrowedImageInfoVk*>(sourceImageInfo);
     if (!canPost(sourceImageInfoVk->imageCreateInfo)) {
         DISPLAY_VK_ERROR("Can't post ColorBuffer.");
-        return std::make_tuple(true, std::move(completedFuture));
+        return PostResult{true, std::move(completedFuture)};
     }
 
     for (auto& postResourceFutureOpt : m_postResourceFutures) {
@@ -178,6 +381,7 @@ std::tuple<bool, std::shared_future<void>> DisplayVk::post(
             }
             m_freePostResources.emplace_back(postResourceFutureOpt.value().get());
             postResourceFutureOpt = std::nullopt;
+            break;
         }
     }
     std::shared_ptr<PostResource> postResource = m_freePostResources.front();
@@ -190,7 +394,7 @@ std::tuple<bool, std::shared_future<void>> DisplayVk::post(
         m_vk.vkAcquireNextImageKHR(m_vkDevice, m_swapChainStateVk->getSwapChain(), UINT64_MAX,
                                    imageReadySem, VK_NULL_HANDLE, &imageIndex);
     if (shouldRecreateSwapchain(acquireRes)) {
-        return std::make_tuple(false, std::shared_future<void>());
+        return PostResult{false, std::shared_future<void>()};
     }
     VK_CHECK(acquireRes);
 
@@ -208,38 +412,13 @@ std::tuple<bool, std::shared_future<void>> DisplayVk::post(
     };
     VK_CHECK(m_vk.vkBeginCommandBuffer(cmdBuff, &beginInfo));
 
-    std::vector<VkImageMemoryBarrier> preBlitQueueTransferBarriers;
-    std::vector<VkImageMemoryBarrier> preBlitLayoutTransitionBarriers;
-    std::vector<VkImageMemoryBarrier> postBlitLayoutTransitionBarriers;
-    std::vector<VkImageMemoryBarrier> postBlitQueueTransferBarriers;
-    addNeededBarriersToUseBorrowedImage(
-        *sourceImageInfoVk, m_compositorQueueFamilyIndex,
-        /*usedInitialImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        /*usedFinalImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        &preBlitQueueTransferBarriers, &preBlitLayoutTransitionBarriers,
-        &postBlitLayoutTransitionBarriers, &postBlitQueueTransferBarriers);
-    preBlitLayoutTransitionBarriers.push_back(
-        VkImageMemoryBarrier{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                             .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-                             .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-                             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                             .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                             .image = m_swapChainStateVk->getVkImages()[imageIndex],
-                             .subresourceRange = {
-                                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                 .baseMipLevel = 0,
-                                 .levelCount = 1,
-                                 .baseArrayLayer = 0,
-                                 .layerCount = 1,
-                             }});
-    postBlitLayoutTransitionBarriers.push_back(VkImageMemoryBarrier{
+    VkImageMemoryBarrier acquireSwapchainImageBarrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        .pNext = nullptr,
+        .srcAccessMask = VK_PIPELINE_STAGE_TRANSFER_BIT,
+        .dstAccessMask = VK_PIPELINE_STAGE_TRANSFER_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = m_swapChainStateVk->getVkImages()[imageIndex],
@@ -251,23 +430,16 @@ std::tuple<bool, std::shared_future<void>> DisplayVk::post(
                 .baseArrayLayer = 0,
                 .layerCount = 1,
             },
-    });
+    };
+    m_vk.vkCmdPipelineBarrier(cmdBuff, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                              &acquireSwapchainImageBarrier);
 
-    if (!preBlitQueueTransferBarriers.empty()) {
-        m_vk.vkCmdPipelineBarrier(
-            cmdBuff, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-            static_cast<uint32_t>(preBlitQueueTransferBarriers.size()),
-            preBlitQueueTransferBarriers.data());
-    }
-    if (!preBlitLayoutTransitionBarriers.empty()) {
-        m_vk.vkCmdPipelineBarrier(
-            cmdBuff, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-            static_cast<uint32_t>(preBlitLayoutTransitionBarriers.size()),
-            preBlitLayoutTransitionBarriers.data());
-    }
-
+    // Note: The extent used during swapchain creation must be used here and not the
+    // current surface's extent as the swapchain may not have been updated after the
+    // surface resized. The blit must not try to write outside of the extent of the
+    // existing swapchain images.
+    const VkExtent2D swapchainImageExtent = m_swapChainStateVk->getImageExtent();
     const VkImageBlit region = {
         .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                            .mipLevel = 0,
@@ -281,8 +453,8 @@ std::tuple<bool, std::shared_future<void>> DisplayVk::post(
                            .baseArrayLayer = 0,
                            .layerCount = 1},
         .dstOffsets = {{0, 0, 0},
-                       {static_cast<int32_t>(m_surfaceState->m_width),
-                        static_cast<int32_t>(m_surfaceState->m_height), 1}},
+                       {static_cast<int32_t>(swapchainImageExtent.width),
+                        static_cast<int32_t>(swapchainImageExtent.height), 1}},
     };
     VkFormat displayBufferFormat = sourceImageInfoVk->imageCreateInfo.format;
     VkImageTiling displayBufferTiling = sourceImageInfoVk->imageCreateInfo.tiling;
@@ -311,18 +483,27 @@ std::tuple<bool, std::shared_future<void>> DisplayVk::post(
                         m_swapChainStateVk->getVkImages()[imageIndex],
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, filter);
 
-    if (!postBlitLayoutTransitionBarriers.empty()) {
-        m_vk.vkCmdPipelineBarrier(cmdBuff, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
-                                  static_cast<uint32_t>(postBlitLayoutTransitionBarriers.size()),
-                                  postBlitLayoutTransitionBarriers.data());
-    }
-    if (!postBlitQueueTransferBarriers.empty()) {
-        m_vk.vkCmdPipelineBarrier(cmdBuff, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
-                                  static_cast<uint32_t>(postBlitQueueTransferBarriers.size()),
-                                  postBlitQueueTransferBarriers.data());
-    }
+    VkImageMemoryBarrier releaseSwapchainImageBarrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_PIPELINE_STAGE_TRANSFER_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = m_swapChainStateVk->getVkImages()[imageIndex],
+        .subresourceRange =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+    };
+    m_vk.vkCmdPipelineBarrier(cmdBuff, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                              &releaseSwapchainImageBarrier);
 
     VK_CHECK(m_vk.vkEndCommandBuffer(cmdBuff));
 
@@ -344,7 +525,17 @@ std::tuple<bool, std::shared_future<void>> DisplayVk::post(
     }
     std::shared_future<std::shared_ptr<PostResource>> postResourceFuture =
         std::async(std::launch::deferred, [postCompleteFence, postResource, this]() mutable {
-            VK_CHECK(m_vk.vkWaitForFences(m_vkDevice, 1, &postCompleteFence, VK_TRUE, UINT64_MAX));
+            VkResult res = m_vk.vkWaitForFences(m_vkDevice, 1, &postCompleteFence, VK_TRUE,
+                                                kVkWaitForFencesTimeoutNsecs);
+            if (res == VK_SUCCESS) {
+                return postResource;
+            }
+            if (res == VK_TIMEOUT) {
+                // Retry. If device lost, hopefully this returns immediately.
+                res = m_vk.vkWaitForFences(m_vkDevice, 1, &postCompleteFence, VK_TRUE,
+                                           kVkWaitForFencesTimeoutNsecs);
+            }
+            VK_CHECK(res);
             return postResource;
         }).share();
     m_postResourceFutures[imageIndex] = postResourceFuture;
@@ -363,17 +554,17 @@ std::tuple<bool, std::shared_future<void>> DisplayVk::post(
     }
     if (shouldRecreateSwapchain(presentRes)) {
         postResourceFuture.wait();
-        return std::make_tuple(false, std::shared_future<void>());
+        return PostResult{false, std::shared_future<void>()};
     }
     VK_CHECK(presentRes);
-    return std::make_tuple(true, std::async(std::launch::deferred, [postResourceFuture] {
-                                     // We can't directly wait for the VkFence here, because we
-                                     // share the VkFences on different frames, but we don't share
-                                     // the future on different frames. If we directly wait for the
-                                     // VkFence here, we may wait for a different frame if a new
-                                     // frame starts to be drawn before this future is waited.
-                                     postResourceFuture.wait();
-                                 }).share());
+    return PostResult{true, std::async(std::launch::deferred, [postResourceFuture] {
+                                // We can't directly wait for the VkFence here, because we
+                                // share the VkFences on different frames, but we don't share
+                                // the future on different frames. If we directly wait for the
+                                // VkFence here, we may wait for a different frame if a new
+                                // frame starts to be drawn before this future is waited.
+                                postResourceFuture.wait();
+                            }).share()};
 }
 
 VkFormatFeatureFlags DisplayVk::getFormatFeatures(VkFormat format, VkImageTiling tiling) {
@@ -532,3 +723,38 @@ DisplayVk::PostResource::PostResource(const goldfish_vk::VulkanDispatch& vk, VkD
       m_vk(vk),
       m_vkDevice(vkDevice),
       m_vkCommandPool(vkCommandPool) {}
+
+std::unique_ptr<DisplayVk::ImageBorrowResource> DisplayVk::ImageBorrowResource::create(
+    const goldfish_vk::VulkanDispatch& vk, VkDevice device, VkCommandPool commandPool) {
+    const VkCommandBufferAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .pNext = nullptr,
+        .commandPool = commandPool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VK_CHECK(vk.vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer));
+    const VkFenceCreateInfo fenceCi = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+    };
+    VkFence fence = VK_NULL_HANDLE;
+    VK_CHECK(vk.vkCreateFence(device, &fenceCi, nullptr, &fence));
+    return std::unique_ptr<ImageBorrowResource>(
+        new ImageBorrowResource(vk, device, commandPool, fence, commandBuffer));
+}
+
+DisplayVk::ImageBorrowResource::~ImageBorrowResource() {
+    m_vk.vkFreeCommandBuffers(m_vkDevice, m_vkCommandPool, 1, &m_vkCommandBuffer);
+}
+
+DisplayVk::ImageBorrowResource::ImageBorrowResource(const goldfish_vk::VulkanDispatch& vk,
+                                                    VkDevice device, VkCommandPool commandPool,
+                                                    VkFence fence, VkCommandBuffer commandBuffer)
+    : m_completeFence(fence),
+      m_vkCommandBuffer(commandBuffer),
+      m_vk(vk),
+      m_vkDevice(device),
+      m_vkCommandPool(commandPool) {}

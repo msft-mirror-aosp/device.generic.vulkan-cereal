@@ -13,7 +13,9 @@ cc_library_static {
     defaults: [ "gfxstream_defaults" ],
     static_libs: [
         "gfxstream_base",
+        "gfxstream_glm",
         "gfxstream_compressedTextures",
+        "gfxstream_emulated_textures",
         "gfxstream_host_common",
         "gfxstream_apigen_codec_common",
         "gfxstream_vulkan_cereal_host",
@@ -31,11 +33,11 @@ cc_library_static {
         "-Wno-unreachable-code-loop-increment",
     ],
     srcs: [
-        "AstcCpuDecompressorNoOp.cpp",
         "BorrowedImageVk.cpp",
         "CompositorVk.cpp",
         "DebugUtilsHelper.cpp",
         "DisplayVk.cpp",
+        "DisplaySurfaceVk.cpp",
         "SwapChainStateVk.cpp",
         "VkAndroidNativeBuffer.cpp",
         "VkCommonOperations.cpp",
@@ -51,9 +53,11 @@ cc_library_static {
     ],
     // http://b/178667698 - clang-tidy crashes with VulkanStream.cpp
     // https://android-review.googlesource.com/c/device/generic/vulkan-cereal/+/1560695/
+    // http://b/255937616 - clang-tidy can take long with VkDecoder.cpp
     tidy_disabled_srcs: [
         "VulkanStream.cpp",
         "VkDecoderGlobalState.cpp", // took more than 400 seconds
+        "VkDecoder.cpp",
     ],
 }
 
@@ -69,6 +73,7 @@ cc_test_host {
         "liblog",
     ],
     static_libs: [
+        "gfxstream_glm",
         "gfxstream_host_common",
         "gfxstream_vulkan_server",
         "libgtest",

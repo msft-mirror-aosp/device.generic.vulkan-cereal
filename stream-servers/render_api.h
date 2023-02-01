@@ -15,9 +15,9 @@
 */
 #pragma once
 
-#include "render_api_functions.h"
+#include "render-utils/render_api_functions.h"
 
-#include "base/c_header.h"
+#include "aemu/base/c_header.h"
 
 #include <KHR/khrplatform.h>
 

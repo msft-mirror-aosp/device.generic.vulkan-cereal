@@ -12,34 +12,44 @@
 
 #include "BorrowedImage.h"
 #include "CompositorVk.h"
+#include "Display.h"
+#include "DisplaySurfaceVk.h"
 #include "Hwc2.h"
-#include "RenderContext.h"
 #include "SwapChainStateVk.h"
-#include "base/Lock.h"
+#include "aemu/base/synchronization/Lock.h"
 #include "vulkan/cereal/common/goldfish_vk_dispatch.h"
 
 // The DisplayVk class holds the Vulkan and other states required to draw a
 // frame in a host window.
 
-class DisplayVk {
+class DisplayVk : public gfxstream::Display {
    public:
     DisplayVk(const goldfish_vk::VulkanDispatch&, VkPhysicalDevice,
               uint32_t swapChainQueueFamilyIndex, uint32_t compositorQueueFamilyIndex, VkDevice,
               VkQueue compositorVkQueue, std::shared_ptr<android::base::Lock> compositorVkQueueLock,
               VkQueue swapChainVkQueue, std::shared_ptr<android::base::Lock> swapChainVkQueueLock);
     ~DisplayVk();
-    bool bindToSurface(VkSurfaceKHR, uint32_t width, uint32_t height);
+
+    PostResult post(const BorrowedImageInfo* info);
 
     void drainQueues();
 
-    // The first component of the returned tuple is false when the swapchain is no longer valid and
-    // bindToSurface() needs to be called again. When the first component is true, the second
-    // component of the returned tuple is a/ future that will complete when the GPU side of work
-    // completes. The caller is responsible to guarantee the synchronization and the layout of
-    // ColorBufferCompositionInfo::m_vkImage is VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL.
-    std::tuple<bool, std::shared_future<void>> post(const BorrowedImageInfo* info);
+   protected:
+    void bindToSurfaceImpl(gfxstream::DisplaySurface* surface) override;
+    void surfaceUpdated(gfxstream::DisplaySurface* surface) override;
+    void unbindFromSurfaceImpl() override;
 
    private:
+    void destroySwapchain();
+    bool recreateSwapchain();
+
+    // The success component of the result is false when the swapchain is no longer valid and
+    // bindToSurface() needs to be called again. When the success component is true, the waitable
+    // component of the returned result is a future that will complete when the GPU side of work
+    // completes. The caller is responsible to guarantee the synchronization and the layout of
+    // ColorBufferCompositionInfo::m_vkImage is VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL.
+    PostResult postImpl(const BorrowedImageInfo* info);
+
     VkFormatFeatureFlags getFormatFeatures(VkFormat, VkImageTiling);
     bool canPost(const VkImageCreateInfo&);
 
@@ -79,13 +89,26 @@ class DisplayVk {
         m_postResourceFutures;
     int m_inFlightFrameIndex;
 
-    std::unique_ptr<SwapChainStateVk> m_swapChainStateVk;
+    class ImageBorrowResource {
+       public:
+        const VkFence m_completeFence;
+        const VkCommandBuffer m_vkCommandBuffer;
+        static std::unique_ptr<ImageBorrowResource> create(const goldfish_vk::VulkanDispatch&,
+                                                           VkDevice, VkCommandPool);
+        ~ImageBorrowResource();
+        DISALLOW_COPY_ASSIGN_AND_MOVE(ImageBorrowResource);
 
-    struct SurfaceState {
-        uint32_t m_width = 0;
-        uint32_t m_height = 0;
+       private:
+        ImageBorrowResource(const goldfish_vk::VulkanDispatch&, VkDevice, VkCommandPool, VkFence,
+                            VkCommandBuffer);
+        const goldfish_vk::VulkanDispatch& m_vk;
+        const VkDevice m_vkDevice;
+        const VkCommandPool m_vkCommandPool;
     };
-    std::unique_ptr<SurfaceState> m_surfaceState;
+    std::vector<std::unique_ptr<ImageBorrowResource>> m_imageBorrowResources;
+
+    std::unique_ptr<SwapChainStateVk> m_swapChainStateVk;
+    bool m_needToRecreateSwapChain = true;
 
     std::unordered_map<VkFormat, VkFormatProperties> m_vkFormatProperties;
 };

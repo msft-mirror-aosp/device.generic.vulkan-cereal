@@ -17,9 +17,9 @@
 #include "SyncThread.h"
 
 #include "OpenGLESDispatch/OpenGLDispatchLoader.h"
-#include "base/Metrics.h"
-#include "base/System.h"
-#include "base/Thread.h"
+#include "aemu/base/Metrics.h"
+#include "aemu/base/system/System.h"
+#include "aemu/base/threads/Thread.h"
 #include "host-common/GfxstreamFatalError.h"
 #include "host-common/crash_reporter.h"
 #include "host-common/logging.h"
@@ -33,6 +33,7 @@
 using android::base::EventHangMetadata;
 using emugl::ABORT_REASON_OTHER;
 using emugl::FatalError;
+using gfxstream::EmulatedEglFenceSync;
 
 #define DEBUG 0
 
@@ -68,10 +69,10 @@ class GlobalSyncThread {
 public:
     GlobalSyncThread() = default;
 
-    void initialize(bool noGL, HealthMonitor<>& healthMonitor) {
+    void initialize(bool hasGl, HealthMonitor<>* healthMonitor) {
         AutoLock mutex(mLock);
         SYNC_THREAD_CHECK(!mSyncThread);
-        mSyncThread = std::make_unique<SyncThread>(noGL, healthMonitor);
+        mSyncThread = std::make_unique<SyncThread>(hasGl, healthMonitor);
     }
     SyncThread* syncThreadPtr() {
         AutoLock mutex(mLock);
@@ -98,17 +99,17 @@ static GlobalSyncThread* sGlobalSyncThread() {
 static const uint32_t kTimelineInterval = 1;
 static const uint64_t kDefaultTimeoutNsecs = 5ULL * 1000ULL * 1000ULL * 1000ULL;
 
-SyncThread::SyncThread(bool noGL, HealthMonitor<>& healthMonitor)
+SyncThread::SyncThread(bool hasGl, HealthMonitor<>* healthMonitor)
     : android::base::Thread(android::base::ThreadFlags::MaskSignals, 512 * 1024),
       mWorkerThreadPool(kNumWorkerThreads,
                         [this](Command&& command, ThreadPool::WorkerId id) {
                             doSyncThreadCmd(std::move(command), id);
                         }),
-      mNoGL(noGL),
+      mHasGl(hasGl),
       mHealthMonitor(healthMonitor) {
     this->start();
     mWorkerThreadPool.start();
-    if (!noGL) {
+    if (hasGl) {
         initSyncEGLContext();
     }
 }
@@ -117,7 +118,7 @@ SyncThread::~SyncThread() {
     cleanup();
 }
 
-void SyncThread::triggerWait(FenceSync* fenceSync,
+void SyncThread::triggerWait(EmulatedEglFenceSync* fenceSync,
                              uint64_t timeline) {
     std::stringstream ss;
     ss << "triggerWait fenceSyncInfo=0x" << std::hex << reinterpret_cast<uintptr_t>(fenceSync)
@@ -146,7 +147,7 @@ void SyncThread::triggerWaitVk(VkFence vkFence, uint64_t timeline) {
         ss.str());
 }
 
-void SyncThread::triggerBlockedWaitNoTimeline(FenceSync* fenceSync) {
+void SyncThread::triggerBlockedWaitNoTimeline(EmulatedEglFenceSync* fenceSync) {
     std::stringstream ss;
     ss << "triggerBlockedWaitNoTimeline fenceSyncInfo=0x" << std::hex
        << reinterpret_cast<uintptr_t>(fenceSync);
@@ -158,7 +159,7 @@ void SyncThread::triggerBlockedWaitNoTimeline(FenceSync* fenceSync) {
         ss.str());
 }
 
-void SyncThread::triggerWaitWithCompletionCallback(FenceSync* fenceSync, FenceCompletionCallback cb) {
+void SyncThread::triggerWaitWithCompletionCallback(EmulatedEglFenceSync* fenceSync, FenceCompletionCallback cb) {
     std::stringstream ss;
     ss << "triggerWaitWithCompletionCallback fenceSyncInfo=0x" << std::hex
        << reinterpret_cast<uintptr_t>(fenceSync);
@@ -202,7 +203,7 @@ void SyncThread::triggerGeneral(FenceCompletionCallback cb, std::string descript
 void SyncThread::cleanup() {
     sendAndWaitForResult(
         [this](WorkerId workerId) {
-            if (!mNoGL) {
+            if (mHasGl) {
                 const EGLDispatch* egl = emugl::LazyLoadedEGLDispatch::get();
 
                 egl->eglMakeCurrent(mDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -269,9 +270,13 @@ void SyncThread::sendAsync(std::function<void(WorkerId)> job, std::string descri
 }
 
 void SyncThread::doSyncThreadCmd(Command&& command, WorkerId workerId) {
-    HealthWatchdog watchdog(mHealthMonitor,
-                            WATCHDOG_DATA("SyncThread task execution",
-                                          EventHangMetadata::HangType::kSyncThread, nullptr));
+    std::unique_ptr<std::unordered_map<std::string, std::string>> syncThreadData =
+        std::make_unique<std::unordered_map<std::string, std::string>>();
+    syncThreadData->insert({{"syncthread_cmd_desc", command.mDescription}});
+    auto watchdog = WATCHDOG_BUILDER(mHealthMonitor, "SyncThread task execution")
+                        .setHangType(EventHangMetadata::HangType::kSyncThread)
+                        .setAnnotations(std::move(syncThreadData))
+                        .build();
     command.mTask(workerId);
 }
 
@@ -282,7 +287,7 @@ void SyncThread::initSyncEGLContext() {
                 DPRINT("for worker id: %d", workerId);
                 // We shouldn't initialize EGL context, when SyncThread is initialized
                 // without GL enabled.
-                SYNC_THREAD_CHECK(!mNoGL);
+                SYNC_THREAD_CHECK(mHasGl);
 
                 const EGLDispatch* egl = emugl::LazyLoadedEGLDispatch::get();
 
@@ -326,20 +331,21 @@ void SyncThread::initSyncEGLContext() {
             .mDescription = "init sync EGL context",
         };
     });
+    mWorkerThreadPool.waitAllItems();
 }
 
-void SyncThread::doSyncWait(FenceSync* fenceSync, std::function<void()> onComplete) {
+void SyncThread::doSyncWait(EmulatedEglFenceSync* fenceSync, std::function<void()> onComplete) {
     DPRINT("enter");
 
-    if (!FenceSync::getFromHandle((uint64_t)(uintptr_t)fenceSync)) {
+    if (!EmulatedEglFenceSync::getFromHandle((uint64_t)(uintptr_t)fenceSync)) {
         if (onComplete) {
             onComplete();
         }
         return;
     }
-    // We shouldn't use FenceSync to wait, when SyncThread is initialized
-    // without GL enabled, because FenceSync uses EGL/GLES.
-    SYNC_THREAD_CHECK(!mNoGL);
+    // We shouldn't use EmulatedEglFenceSync to wait, when SyncThread is initialized
+    // without GL enabled, because EmulatedEglFenceSync uses EGL/GLES.
+    SYNC_THREAD_CHECK(mHasGl);
 
     EGLint wait_result = 0x0;
 
@@ -386,7 +392,7 @@ void SyncThread::doSyncWait(FenceSync* fenceSync, std::function<void()> onComple
     if (onComplete) {
         onComplete();
     }
-    FenceSync::incrementTimelineAndDeleteOldFences();
+    EmulatedEglFenceSync::incrementTimelineAndDeleteOldFences();
 
     DPRINT("done timeline increment");
 
@@ -426,8 +432,8 @@ SyncThread* SyncThread::get() {
     return res;
 }
 
-void SyncThread::initialize(bool noEGL, HealthMonitor<>& healthMonitor) {
-    sGlobalSyncThread()->initialize(noEGL, healthMonitor);
+void SyncThread::initialize(bool hasGl, HealthMonitor<>* healthMonitor) {
+    sGlobalSyncThread()->initialize(hasGl, healthMonitor);
 }
 
 void SyncThread::destroy() { sGlobalSyncThread()->destroy(); }

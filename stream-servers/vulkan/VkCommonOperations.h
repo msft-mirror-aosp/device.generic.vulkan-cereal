@@ -25,11 +25,12 @@
 #include "BorrowedImageVk.h"
 #include "CompositorVk.h"
 #include "DisplayVk.h"
-#include "base/Lock.h"
-#include "base/ManagedDescriptor.hpp"
-#include "base/Optional.h"
+#include "aemu/base/synchronization/Lock.h"
+#include "aemu/base/ManagedDescriptor.hpp"
+#include "aemu/base/Optional.h"
 #include "cereal/common/goldfish_vk_private_defs.h"
-#include "host-common/RenderDoc.h"
+#include "utils/GfxApiLogger.h"
+#include "utils/RenderDoc.h"
 
 namespace goldfish_vk {
 
@@ -61,6 +62,13 @@ typedef int VK_EXT_MEMORY_HANDLE;
 
 VK_EXT_MEMORY_HANDLE dupExternalMemory(VK_EXT_MEMORY_HANDLE);
 
+enum class AstcEmulationMode {
+    Disabled,  // No ASTC emulation (ie: ASTC not supported unless the GPU supports it natively)
+    Auto,      // Use either GPU or CPU decompression depending on what's most appropriate
+    CpuOnly,   // Force to use CPU decompression always
+    GpuOnly,   // Force to use GPU decompression always
+};
+
 // Global state that holds a global Vulkan instance along with globally
 // exported memory allocations + images. This is in order to service things
 // like AndroidHardwareBuffer/FuchsiaImagePipeHandle. Each such allocation is
@@ -82,7 +90,7 @@ struct VkEmulation {
 
     // Whether to use ASTC emulation. Our current ASTC decoder implementation may lead to device
     // lost on certain device on Windows.
-    bool enableAstcLdrEmulation = false;
+    AstcEmulationMode astcLdrEmulationMode = AstcEmulationMode::Disabled;
 
     // Whether to use ETC2 emulation.
     bool enableEtc2Emulation = false;
@@ -92,10 +100,15 @@ struct VkEmulation {
     // conversion or not.
     bool enableYcbcrEmulation = false;
 
+    bool guestUsesAngle = false;
+
     // Instance and device for creating the system-wide shareable objects.
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physdev = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
+
+    // Physical device index
+    uint32_t physicalDeviceIndex = 0;
 
     // Global, instance and device dispatch tables.
     VulkanDispatch* gvk = nullptr;
@@ -103,13 +116,16 @@ struct VkEmulation {
     VulkanDispatch* dvk = nullptr;
 
     bool instanceSupportsExternalMemoryCapabilities = false;
+    bool instanceSupportsExternalSemaphoreCapabilities = false;
     PFN_vkGetPhysicalDeviceImageFormatProperties2KHR getImageFormatProperties2Func = nullptr;
     PFN_vkGetPhysicalDeviceProperties2KHR getPhysicalDeviceProperties2Func = nullptr;
     PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2Func = nullptr;
 
+#ifdef VK_MVK_moltenvk
     bool instanceSupportsMoltenVK = false;
     PFN_vkSetMTLTextureMVK setMTLTextureFunc = nullptr;
     PFN_vkGetMTLTextureMVK getMTLTextureFunc = nullptr;
+#endif
 
     // Queue, command pool, and command buffer
     // for running commands to sync stuff system-wide.
@@ -364,14 +380,19 @@ struct VkEmulationFeatures {
     bool useVulkanComposition = false;
     bool useVulkanNativeSwapchain = false;
     std::unique_ptr<emugl::RenderDocWithMultipleVkInstances> guestRenderDoc = nullptr;
-    bool enableAstcLdrEmulation = false;
+    AstcEmulationMode astcLdrEmulationMode = AstcEmulationMode::Disabled;
     bool enableEtc2Emulation = false;
     bool enableYcbcrEmulation = false;
+    bool guestUsesAngle = false;
 };
 void initVkEmulationFeatures(std::unique_ptr<VkEmulationFeatures>);
 
 VkEmulation* getGlobalVkEmulation();
 void teardownGlobalVkEmulation();
+
+std::unique_ptr<gfxstream::DisplaySurface> createDisplaySurface(FBNativeWindowType window,
+                                                                uint32_t width,
+                                                                uint32_t height);
 
 bool allocExternalMemory(
     VulkanDispatch* vk, VkEmulation::ExternalMemoryInfo* info, bool actuallyExternal = true,

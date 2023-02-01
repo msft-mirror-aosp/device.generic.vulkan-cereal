@@ -17,43 +17,50 @@
 #include <type_traits>
 #include <unordered_map>
 
+#include "FrameBuffer.h"
+#include "GfxStreamAgents.h"
 #include "VirtioGpuTimelines.h"
-#include "base/AlignedBuf.h"
-#include "base/Lock.h"
-#include "base/SharedMemory.h"
-#include "base/Tracing.h"
+#include "aemu/base/AlignedBuf.h"
+#include "aemu/base/ManagedDescriptor.hpp"
+#include "aemu/base/Metrics.h"
+#include "aemu/base/Tracing.h"
+#include "aemu/base/memory/SharedMemory.h"
+#include "aemu/base/synchronization/Lock.h"
 #include "host-common/AddressSpaceService.h"
 #include "host-common/GfxstreamFatalError.h"
 #include "host-common/HostmemIdMapping.h"
 #include "host-common/address_space_device.h"
 #include "host-common/android_pipe_common.h"
+#include "host-common/android_pipe_device.h"
 #include "host-common/feature_control.h"
+#include "host-common/globals.h"
 #include "host-common/linux_types.h"
+#include "host-common/opengles-pipe.h"
 #include "host-common/opengles.h"
+#include "host-common/refcount-pipe.h"
 #include "host-common/vm_operations.h"
 #include "virtgpu_gfxstream_protocol.h"
+#include "vk_util.h"
 
 extern "C" {
-#include "virtio-gpu-gfxstream-renderer.h"
 #include "drm_fourcc.h"
-#include "virgl_hw.h"
 #include "host-common/goldfish_pipe.h"
+#include "virgl_hw.h"
+#include "virtio-gpu-gfxstream-renderer.h"
 }  // extern "C"
 
 #define DEBUG_VIRTIO_GOLDFISH_PIPE 0
 
 #if DEBUG_VIRTIO_GOLDFISH_PIPE
 
-#define VGPLOG(fmt,...) \
-    fprintf(stderr, "%s:%d: " fmt "\n", __func__, __LINE__, ##__VA_ARGS__);
+#define VGPLOG(fmt, ...) fprintf(stderr, "%s:%d: " fmt "\n", __func__, __LINE__, ##__VA_ARGS__);
 
 #else
-#define VGPLOG(fmt,...)
+#define VGPLOG(fmt, ...)
 #endif
 
-#define VGP_FATAL()                                    \
-    GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << \
-            "virtio-goldfish-pipe fatal error: "
+#define VGP_FATAL() \
+    GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "virtio-goldfish-pipe fatal error: "
 
 #ifdef VIRTIO_GOLDFISH_EXPORT_API
 
@@ -67,7 +74,24 @@ extern "C" {
 
 #define VG_EXPORT
 
-#endif // !VIRTIO_GOLDFISH_EXPORT_API
+#endif  // !VIRTIO_GOLDFISH_EXPORT_API
+
+#define GFXSTREAM_DEBUG_LEVEL 1
+
+#if GFXSTREAM_DEBUG_LEVEL >= 1
+#define GFXS_LOG(fmt, ...)                                                     \
+    do {                                                                       \
+        fprintf(stdout, "%s:%d " fmt "\n", __func__, __LINE__, ##__VA_ARGS__); \
+        fflush(stdout);                                                        \
+    } while (0)
+
+#else
+#define GFXS_LOG(fmt, ...)
+#endif
+
+#define POST_CALLBACK_DISPLAY_TYPE_X 0
+#define POST_CALLBACK_DISPLAY_TYPE_WAYLAND_SHARED_MEM 1
+#define POST_CALLBACK_DISPLAY_TYPE_WINDOWS_HWND 2
 
 // Virtio Goldfish Pipe: Overview-----------------------------------------------
 //
@@ -147,11 +171,16 @@ extern "C" {
 // linear buffer if necessary, and then perform a corresponding pip operation
 // based on the box parameter's x and width values.
 
+using android::AndroidPipe;
 using android::base::AutoLock;
+using android::base::DescriptorType;
 using android::base::Lock;
+using android::base::ManagedDescriptor;
+using android::base::MetricsLogger;
 using android::base::SharedMemory;
 
 using android::emulation::HostmemIdMapping;
+using android::emulation::ManagedDescriptorInfo;
 using emugl::ABORT_REASON_OTHER;
 using emugl::FatalError;
 
@@ -166,11 +195,14 @@ struct VirtioGpuCmd {
 } __attribute__((packed));
 
 struct PipeCtxEntry {
+    std::string name;
+    uint32_t capsetId;
     VirtioGpuCtxId ctxId;
     GoldfishHostPipe* hostPipe;
     int fence;
     uint32_t addressSpaceHandle;
     bool hasAddressSpaceHandle;
+    std::unordered_map<VirtioGpuResId, uint32_t> addressSpaceHandles;
 };
 
 enum class ResType {
@@ -194,16 +226,16 @@ struct PipeResEntry {
     void* hva;
     uint64_t hvaSize;
     uint64_t blobId;
-    uint64_t blobMem;
+    uint32_t blobMem;
+    uint32_t blobFlags;
     uint32_t caching;
     ResType type;
     std::shared_ptr<SharedMemory> ringBlob = nullptr;
     bool externalAddr = false;
+    std::shared_ptr<ManagedDescriptorInfo> descriptorInfo = nullptr;
 };
 
-static inline uint32_t align_up(uint32_t n, uint32_t a) {
-    return ((n + a - 1) / a) * a;
-}
+static inline uint32_t align_up(uint32_t n, uint32_t a) { return ((n + a - 1) / a) * a; }
 
 static inline uint32_t align_up_power_of_2(uint32_t n, uint32_t a) {
     return (n + (a - 1)) & ~(a - 1);
@@ -303,7 +335,7 @@ static inline uint32_t virgl_format_to_fwk_format(uint32_t virgl_format) {
         case VIRGL_FORMAT_R8G8B8A8_UNORM:
         case VIRGL_FORMAT_B5G6R5_UNORM:
         case VIRGL_FORMAT_R10G10B10A2_UNORM:
-        default: // kFwkFormatGlCompat: No extra conversions needed
+        default:  // kFwkFormatGlCompat: No extra conversions needed
             return kFwkFormatGlCompat;
     }
 }
@@ -322,10 +354,9 @@ static inline uint32_t gl_format_to_natural_type(uint32_t format) {
     }
 }
 
-static inline size_t virgl_format_to_linear_base(
-    uint32_t format,
-    uint32_t totalWidth, uint32_t totalHeight,
-    uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+static inline size_t virgl_format_to_linear_base(uint32_t format, uint32_t totalWidth,
+                                                 uint32_t totalHeight, uint32_t x, uint32_t y,
+                                                 uint32_t w, uint32_t h) {
     if (virgl_format_is_yuv(format)) {
         return 0;
     } else {
@@ -359,34 +390,44 @@ static inline size_t virgl_format_to_linear_base(
     return 0;
 }
 
-static inline size_t virgl_format_to_total_xfer_len(
-    uint32_t format,
-    uint32_t totalWidth, uint32_t totalHeight,
-    uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+static inline size_t virgl_format_to_total_xfer_len(uint32_t format, uint32_t totalWidth,
+                                                    uint32_t totalHeight, uint32_t x, uint32_t y,
+                                                    uint32_t w, uint32_t h) {
     if (virgl_format_is_yuv(format)) {
         uint32_t bpp = format == VIRGL_FORMAT_P010 ? 2 : 1;
+
         uint32_t yWidth = totalWidth;
         uint32_t yHeight = totalHeight;
-        uint32_t yStride = yWidth * bpp;
-        uint32_t ySize = yStride * yHeight;
+        uint32_t yStridePixels;
+        if (format == VIRGL_FORMAT_NV12) {
+            yStridePixels = yWidth;
+        } else if (format == VIRGL_FORMAT_P010) {
+            yStridePixels = yWidth;
+        } else if (format == VIRGL_FORMAT_YV12) {
+            yStridePixels = align_up_power_of_2(yWidth, 32);
+        } else {
+            VGP_FATAL() << "Unknown yuv virgl format: 0x" << std::hex << format;
+        }
+        uint32_t yStrideBytes = yStridePixels * bpp;
+        uint32_t ySize = yStrideBytes * yHeight;
 
-        uint32_t uvWidth;
+        uint32_t uvStridePixels;
         uint32_t uvPlaneCount;
         if (format == VIRGL_FORMAT_NV12) {
-            uvWidth = totalWidth;
+            uvStridePixels = yStridePixels;
             uvPlaneCount = 1;
         } else if (format == VIRGL_FORMAT_P010) {
-            uvWidth = totalWidth;
+            uvStridePixels = yStridePixels;
             uvPlaneCount = 1;
         } else if (format == VIRGL_FORMAT_YV12) {
-            uvWidth = totalWidth / 2;
+            uvStridePixels = yStridePixels / 2;
             uvPlaneCount = 2;
         } else {
             VGP_FATAL() << "Unknown yuv virgl format: 0x" << std::hex << format;
         }
+        uint32_t uvStrideBytes = uvStridePixels * bpp;
         uint32_t uvHeight = totalHeight / 2;
-        uint32_t uvStride = uvWidth * bpp;
-        uint32_t uvSize = uvStride * uvHeight * uvPlaneCount;
+        uint32_t uvSize = uvStrideBytes * uvHeight * uvPlaneCount;
 
         uint32_t dataSize = ySize + uvSize;
         return dataSize;
@@ -421,7 +462,6 @@ static inline size_t virgl_format_to_total_xfer_len(
     return 0;
 }
 
-
 enum IovSyncDir {
     IOV_TO_LINEAR = 0,
     LINEAR_TO_IOV = 1,
@@ -429,11 +469,8 @@ enum IovSyncDir {
 
 static int sync_iov(PipeResEntry* res, uint64_t offset, const virgl_box* box, IovSyncDir dir) {
     VGPLOG("offset: 0x%llx box: %u %u %u %u size %u x %u iovs %u linearSize %zu",
-            (unsigned long long)offset,
-            box->x, box->y, box->w, box->h,
-            res->args.width, res->args.height,
-            res->numIovs,
-            res->linearSize);
+           (unsigned long long)offset, box->x, box->y, box->w, box->h, res->args.width,
+           res->args.height, res->numIovs, res->linearSize);
 
     if (box->x > res->args.width || box->y > res->args.height) {
         VGP_FATAL() << "Box out of range of resource";
@@ -446,24 +483,17 @@ static int sync_iov(PipeResEntry* res, uint64_t offset, const virgl_box* box, Io
     }
 
     size_t linearBase = virgl_format_to_linear_base(
-        res->args.format,
-        res->args.width,
-        res->args.height,
-        box->x, box->y, box->w, box->h);
+        res->args.format, res->args.width, res->args.height, box->x, box->y, box->w, box->h);
     size_t start = linearBase;
     // height - 1 in order to treat the (w * bpp) row specially
     // (i.e., the last row does not occupy the full stride)
     size_t length = virgl_format_to_total_xfer_len(
-        res->args.format,
-        res->args.width,
-        res->args.height,
-        box->x, box->y, box->w, box->h);
+        res->args.format, res->args.width, res->args.height, box->x, box->y, box->w, box->h);
     size_t end = start + length;
 
     if (end > res->linearSize) {
-        VGP_FATAL() << "start + length overflows! linearSize "
-            << res->linearSize << " start " << start << " length " << length << " (wanted "
-            << start + length << ")";
+        VGP_FATAL() << "start + length overflows! linearSize " << res->linearSize << " start "
+                    << start << " length " << length << " (wanted " << start + length << ")";
     }
 
     uint32_t iovIndex = 0;
@@ -472,7 +502,6 @@ static int sync_iov(PipeResEntry* res, uint64_t offset, const virgl_box* box, Io
     char* linear = static_cast<char*>(res->linear);
 
     while (written < length) {
-
         if (iovIndex >= res->numIovs) {
             VGP_FATAL() << "write request overflowed numIovs";
         }
@@ -488,13 +517,11 @@ static int sync_iov(PipeResEntry* res, uint64_t offset, const virgl_box* box, Io
             size_t toWrite = upper_intersect - lower_intersect;
             switch (dir) {
                 case IOV_TO_LINEAR:
-                    memcpy(linear + lower_intersect,
-                           iovBase_const + lower_intersect - iovOffset,
+                    memcpy(linear + lower_intersect, iovBase_const + lower_intersect - iovOffset,
                            toWrite);
                     break;
                 case LINEAR_TO_IOV:
-                    memcpy(iovBase + lower_intersect - iovOffset,
-                           linear + lower_intersect,
+                    memcpy(iovBase + lower_intersect - iovOffset, linear + lower_intersect,
                            toWrite);
                     break;
                 default:
@@ -514,7 +541,7 @@ static uint64_t convert32to64(uint32_t lo, uint32_t hi) {
 }
 
 class PipeVirglRenderer {
-public:
+   public:
     PipeVirglRenderer() = default;
 
     int init(void* cookie, int flags, const struct virgl_renderer_callbacks* callbacks) {
@@ -527,8 +554,7 @@ public:
         }
         mReadPixelsFunc = android_getReadPixelsFunc();
         if (!mReadPixelsFunc) {
-            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-                << "Could not get read pixels func!";
+            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "Could not get read pixels func!";
         }
         mAddressSpaceDeviceControlOps = get_address_space_device_control_ops();
         if (!mAddressSpaceDeviceControlOps) {
@@ -577,23 +603,29 @@ public:
     int createContext(VirtioGpuCtxId ctx_id, uint32_t nlen, const char* name,
                       uint32_t context_init) {
         AutoLock lock(mLock);
-        VGPLOG("ctxid: %u len: %u name: %s", ctx_id, nlen, name);
+
+        std::string contextName(name, nlen);
+
+        VGPLOG("ctxid: %u len: %u name: %s", ctx_id, nlen, contextName.c_str());
         auto ops = ensureAndGetServiceOps();
-        auto hostPipe = ops->guest_open_with_flags(
-            reinterpret_cast<GoldfishHwPipe*>(ctx_id),
-            0x1 /* is virtio */);
+        auto hostPipe = ops->guest_open_with_flags(reinterpret_cast<GoldfishHwPipe*>(ctx_id),
+                                                   0x1 /* is virtio */);
 
         if (!hostPipe) {
             fprintf(stderr, "%s: failed to create hw pipe!\n", __func__);
             return -1;
         }
+        std::unordered_map<uint32_t, uint32_t> map;
 
         PipeCtxEntry res = {
-            ctx_id, // ctxId
-            hostPipe, // hostPipe
-            0, // fence
-            0, // AS handle
-            false, // does not have an AS handle
+            std::move(contextName),  // contextName
+            context_init,            // capsetId
+            ctx_id,                  // ctxId
+            hostPipe,                // hostPipe
+            0,                       // fence
+            0,                       // AS handle
+            false,                   // does not have an AS handle
+            map,                     // resourceId --> ASG handle map
         };
 
         VGPLOG("initial host pipe for ctxid %u: %p", ctx_id, hostPipe);
@@ -612,8 +644,9 @@ public:
         }
 
         if (it->second.hasAddressSpaceHandle) {
-            mAddressSpaceDeviceControlOps->destroy_handle(
-                it->second.addressSpaceHandle);
+            for (auto const& [resourceId, handle] : it->second.addressSpaceHandles) {
+                mAddressSpaceDeviceControlOps->destroy_handle(handle);
+            }
         }
 
         auto ops = ensureAndGetServiceOps();
@@ -630,52 +663,33 @@ public:
         return 0;
     }
 
-    void setContextAddressSpaceHandleLocked(VirtioGpuCtxId ctxId, uint32_t handle) {
+    void setContextAddressSpaceHandleLocked(VirtioGpuCtxId ctxId, uint32_t handle,
+                                            uint32_t resourceId) {
         auto ctxIt = mContexts.find(ctxId);
         if (ctxIt == mContexts.end()) {
-            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-                << "ctx id " << ctxId << " not found";
+            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "ctx id " << ctxId << " not found";
         }
 
         auto& ctxEntry = ctxIt->second;
         ctxEntry.addressSpaceHandle = handle;
         ctxEntry.hasAddressSpaceHandle = true;
+        ctxEntry.addressSpaceHandles[resourceId] = handle;
     }
 
-    uint32_t getAddressSpaceHandleLocked(VirtioGpuCtxId ctxId) {
+    uint32_t getAddressSpaceHandleLocked(VirtioGpuCtxId ctxId, uint32_t resourceId) {
         auto ctxIt = mContexts.find(ctxId);
         if (ctxIt == mContexts.end()) {
-            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-                << "ctx id " << ctxId << " not found ";
+            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "ctx id " << ctxId << " not found ";
         }
 
         auto& ctxEntry = ctxIt->second;
 
-        if (!ctxEntry.hasAddressSpaceHandle) {
+        if (!ctxEntry.addressSpaceHandles.count(resourceId)) {
             GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-                << "ctx id " << ctxId << " doesn't have address space handle";
+                << "ASG context with resource id " << resourceId << " not found ";
         }
 
-        return ctxEntry.addressSpaceHandle;
-    }
-
-    void writeWordsToFirstIovPageLocked(uint32_t* dwords, size_t dwordCount, uint32_t resId) {
-
-        auto resEntryIt = mResources.find(resId);
-        if (resEntryIt == mResources.end()) {
-            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-                << " resid " << resId << " not found";
-        }
-
-        auto& resEntry = resEntryIt->second;
-
-        if (!resEntry.iov) {
-            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-                << "resid " << resId << " has empty iov ";
-        }
-
-        uint32_t* iovWords = (uint32_t*)(resEntry.iov[0].iov_base);
-        memcpy(iovWords, dwords, sizeof(uint32_t) * dwordCount);
+        return ctxEntry.addressSpaceHandles[resourceId];
     }
 
 #define DECODE(variable, type, input) \
@@ -689,78 +703,51 @@ public:
             case GFXSTREAM_CONTEXT_CREATE: {
                 DECODE(contextCreate, gfxstreamContextCreate, dwords)
 
+                auto resEntryIt = mResources.find(contextCreate.resourceId);
+                if (resEntryIt == mResources.end()) {
+                    GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+                        << " ASG coherent resource " << contextCreate.resourceId << " not found";
+                }
+
+                auto ctxIt = mContexts.find(ctxId);
+                if (ctxIt == mContexts.end()) {
+                    GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+                        << "ctx id " << ctxId << " not found ";
+                }
+
+                auto& ctxEntry = ctxIt->second;
+                auto& resEntry = resEntryIt->second;
+
+                std::string name = ctxEntry.name + "-" + std::to_string(contextCreate.resourceId);
                 uint32_t handle = mAddressSpaceDeviceControlOps->gen_handle();
 
-                struct android::emulation::AddressSpaceDevicePingInfo pingInfo = {
-                    .metadata = (uint64_t)contextCreate.deviceType,
+                struct AddressSpaceCreateInfo createInfo = {
+                    .handle = handle,
+                    .type = android::emulation::VirtioGpuGraphics,
+                    .createRenderThread = true,
+                    .externalAddr = resEntry.hva,
+                    .externalAddrSize = resEntry.hvaSize,
+                    .virtioGpuContextId = ctxId,
+                    .virtioGpuCapsetId = ctxEntry.capsetId,
+                    .contextName = name.c_str(),
+                    .contextNameSize = static_cast<uint32_t>(ctxEntry.name.size()),
                 };
 
-                mAddressSpaceDeviceControlOps->ping_at_hva(handle, &pingInfo);
-
+                mAddressSpaceDeviceControlOps->create_instance(createInfo);
                 AutoLock lock(mLock);
-                setContextAddressSpaceHandleLocked(ctxId, handle);
+                setContextAddressSpaceHandleLocked(ctxId, handle, contextCreate.resourceId);
                 break;
             }
             case GFXSTREAM_CONTEXT_PING: {
                 DECODE(contextPing, gfxstreamContextPing, dwords)
 
-                struct android::emulation::AddressSpaceDevicePingInfo pingInfo = {
-                    .phys_addr = convert32to64(contextPing.phys_addr_lo, contextPing.phys_addr_hi),
-                    .size = convert32to64(contextPing.size_lo, contextPing.size_hi),
-                    .metadata = convert32to64(contextPing.metadata_lo, contextPing.metadata_hi),
-                    .wait_phys_addr = convert32to64(contextPing.wait_phys_addr_lo, contextPing.wait_phys_addr_hi),
-                    .wait_flags = contextPing.wait_flags,
-                    .direction = contextPing.direction,
-                };
-
                 AutoLock lock(mLock);
+
+                struct android::emulation::AddressSpaceDevicePingInfo ping = {0};
+                ping.metadata = ASG_NOTIFY_AVAILABLE;
+
                 mAddressSpaceDeviceControlOps->ping_at_hva(
-                    getAddressSpaceHandleLocked(ctxId),
-                    &pingInfo);
-                break;
-            }
-            case GFXSTREAM_CONTEXT_PING_WITH_RESPONSE: {
-                DECODE(contextPing, gfxstreamContextPingWithResponse, dwords)
-
-                uint32_t resp_resid = contextPing.resp_resid;
-
-                struct android::emulation::AddressSpaceDevicePingInfo pingInfo = {
-                    .phys_addr = convert32to64(contextPing.phys_addr_lo, contextPing.phys_addr_hi),
-                    .size = convert32to64(contextPing.size_lo, contextPing.size_hi),
-                    .metadata = convert32to64(contextPing.metadata_lo, contextPing.metadata_hi),
-                    .wait_phys_addr = convert32to64(contextPing.wait_phys_addr_lo, contextPing.wait_phys_addr_hi),
-                    .wait_flags = contextPing.wait_flags,
-                    .direction = contextPing.direction,
-                };
-
-                AutoLock lock(mLock);
-                mAddressSpaceDeviceControlOps->ping_at_hva(
-                    getAddressSpaceHandleLocked(ctxId),
-                    &pingInfo);
-
-                uint32_t phys_addr_lo = (uint32_t)pingInfo.phys_addr;
-                uint32_t phys_addr_hi = (uint32_t)(pingInfo.phys_addr >> 32);
-                uint32_t size_lo = (uint32_t)(pingInfo.size >> 0);
-                uint32_t size_hi = (uint32_t)(pingInfo.size >> 32);
-                uint32_t metadata_lo = (uint32_t)(pingInfo.metadata >> 0);
-                uint32_t metadata_hi = (uint32_t)(pingInfo.metadata >> 32);
-                uint32_t wait_phys_addr_lo = (uint32_t)(pingInfo.wait_phys_addr >> 0);
-                uint32_t wait_phys_addr_hi = (uint32_t)(pingInfo.wait_phys_addr >> 32);
-                uint32_t wait_flags = (uint32_t)(pingInfo.wait_flags >> 0);
-                uint32_t direction = (uint32_t)(pingInfo.direction >> 0);
-
-                uint32_t response[] = {
-                    phys_addr_lo, phys_addr_hi,
-                    size_lo, size_hi,
-                    metadata_lo, metadata_hi,
-                    wait_phys_addr_lo, wait_phys_addr_hi,
-                    wait_flags, direction,
-                };
-
-                writeWordsToFirstIovPageLocked(
-                    response,
-                    sizeof(response) / sizeof(uint32_t),
-                    resp_resid);
+                    getAddressSpaceHandleLocked(ctxId, contextPing.resourceId), &ping);
                 break;
             }
             default:
@@ -795,8 +782,8 @@ public:
             case GFXSTREAM_CREATE_EXPORT_SYNC: {
                 DECODE(exportSync, gfxstreamCreateExportSync, buffer)
 
-                uint64_t sync_handle = convert32to64(exportSync.syncHandleLo,
-                                                     exportSync.syncHandleHi);
+                uint64_t sync_handle =
+                    convert32to64(exportSync.syncHandleLo, exportSync.syncHandleHi);
 
                 VGPLOG("wait for gpu ring %s", to_string(ring));
                 auto taskId = mVirtioGpuTimelines->enqueueTask(ring);
@@ -809,11 +796,11 @@ public:
             case GFXSTREAM_CREATE_IMPORT_SYNC_VK: {
                 DECODE(exportSyncVK, gfxstreamCreateExportSyncVK, buffer)
 
-                uint64_t device_handle = convert32to64(exportSyncVK.deviceHandleLo,
-                                                       exportSyncVK.deviceHandleHi);
+                uint64_t device_handle =
+                    convert32to64(exportSyncVK.deviceHandleLo, exportSyncVK.deviceHandleHi);
 
-                uint64_t fence_handle = convert32to64(exportSyncVK.fenceHandleLo,
-                                                      exportSyncVK.fenceHandleHi);
+                uint64_t fence_handle =
+                    convert32to64(exportSyncVK.fenceHandleLo, exportSyncVK.fenceHandleHi);
 
                 VGPLOG("wait for gpu ring %s", to_string(ring));
                 auto taskId = mVirtioGpuTimelines->enqueueTask(ring);
@@ -834,8 +821,8 @@ public:
 
                 DECODE(exportQSRI, gfxstreamCreateQSRIExportVK, buffer)
 
-                uint64_t image_handle = convert32to64(exportQSRI.imageHandleLo,
-                                                      exportQSRI.imageHandleHi);
+                uint64_t image_handle =
+                    convert32to64(exportQSRI.imageHandleLo, exportQSRI.imageHandleHi);
 
                 VGPLOG("wait for gpu vk qsri ring %u image 0x%llx", to_string(ring).c_str(),
                        (unsigned long long)image_handle);
@@ -910,24 +897,24 @@ public:
      *  * Resource binding flags -- state tracker must specify in advance all
      *   * the ways a resource might be used.
      *    */
-#define PIPE_BIND_DEPTH_STENCIL        (1 << 0) /* create_surface */
-#define PIPE_BIND_RENDER_TARGET        (1 << 1) /* create_surface */
-#define PIPE_BIND_BLENDABLE            (1 << 2) /* create_surface */
-#define PIPE_BIND_SAMPLER_VIEW         (1 << 3) /* create_sampler_view */
-#define PIPE_BIND_VERTEX_BUFFER        (1 << 4) /* set_vertex_buffers */
-#define PIPE_BIND_INDEX_BUFFER         (1 << 5) /* draw_elements */
-#define PIPE_BIND_CONSTANT_BUFFER      (1 << 6) /* set_constant_buffer */
-#define PIPE_BIND_DISPLAY_TARGET       (1 << 7) /* flush_front_buffer */
+#define PIPE_BIND_DEPTH_STENCIL (1 << 0)   /* create_surface */
+#define PIPE_BIND_RENDER_TARGET (1 << 1)   /* create_surface */
+#define PIPE_BIND_BLENDABLE (1 << 2)       /* create_surface */
+#define PIPE_BIND_SAMPLER_VIEW (1 << 3)    /* create_sampler_view */
+#define PIPE_BIND_VERTEX_BUFFER (1 << 4)   /* set_vertex_buffers */
+#define PIPE_BIND_INDEX_BUFFER (1 << 5)    /* draw_elements */
+#define PIPE_BIND_CONSTANT_BUFFER (1 << 6) /* set_constant_buffer */
+#define PIPE_BIND_DISPLAY_TARGET (1 << 7)  /* flush_front_buffer */
     /* gap */
-#define PIPE_BIND_STREAM_OUTPUT        (1 << 10) /* set_stream_output_buffers */
-#define PIPE_BIND_CURSOR               (1 << 11) /* mouse cursor */
-#define PIPE_BIND_CUSTOM               (1 << 12) /* state-tracker/winsys usages */
-#define PIPE_BIND_GLOBAL               (1 << 13) /* set_global_binding */
-#define PIPE_BIND_SHADER_BUFFER        (1 << 14) /* set_shader_buffers */
-#define PIPE_BIND_SHADER_IMAGE         (1 << 15) /* set_shader_images */
-#define PIPE_BIND_COMPUTE_RESOURCE     (1 << 16) /* set_compute_resources */
-#define PIPE_BIND_COMMAND_ARGS_BUFFER  (1 << 17) /* pipe_draw_info.indirect */
-#define PIPE_BIND_QUERY_BUFFER         (1 << 18) /* get_query_result_resource */
+#define PIPE_BIND_STREAM_OUTPUT (1 << 10)       /* set_stream_output_buffers */
+#define PIPE_BIND_CURSOR (1 << 11)              /* mouse cursor */
+#define PIPE_BIND_CUSTOM (1 << 12)              /* state-tracker/winsys usages */
+#define PIPE_BIND_GLOBAL (1 << 13)              /* set_global_binding */
+#define PIPE_BIND_SHADER_BUFFER (1 << 14)       /* set_shader_buffers */
+#define PIPE_BIND_SHADER_IMAGE (1 << 15)        /* set_shader_images */
+#define PIPE_BIND_COMPUTE_RESOURCE (1 << 16)    /* set_compute_resources */
+#define PIPE_BIND_COMMAND_ARGS_BUFFER (1 << 17) /* pipe_draw_info.indirect */
+#define PIPE_BIND_QUERY_BUFFER (1 << 18)        /* get_query_result_resource */
 
     ResType getResourceType(const struct virgl_renderer_resource_create_args& args) const {
         if (args.target == PIPE_BUFFER) {
@@ -962,8 +949,8 @@ public:
 
     void handleCreateResourceColorBuffer(struct virgl_renderer_resource_create_args* args) {
         // corresponds to allocation of gralloc buffer in minigbm
-        VGPLOG("w h %u %u resid %u -> rcCreateColorBufferWithHandle",
-               args->width, args->height, args->handle);
+        VGPLOG("w h %u %u resid %u -> rcCreateColorBufferWithHandle", args->width, args->height,
+               args->handle);
 
         const uint32_t glformat = virgl_format_to_gl(args->format);
         const uint32_t fwkformat = virgl_format_to_fwk_format(args->format);
@@ -973,10 +960,8 @@ public:
         mVirtioGpuOps->open_color_buffer(args->handle);
     }
 
-    int createResource(
-            struct virgl_renderer_resource_create_args *args,
-            struct iovec *iov, uint32_t num_iovs) {
-
+    int createResource(struct virgl_renderer_resource_create_args* args, struct iovec* iov,
+                       uint32_t num_iovs) {
         VGPLOG("handle: %u. num iovs: %u", args->handle, num_iovs);
 
         const auto resType = getResourceType(*args);
@@ -1242,15 +1227,12 @@ public:
                                            res->args.height, glformat, gltype, res->linear);
     }
 
-    int transferReadIov(int resId, uint64_t offset, virgl_box* box, struct iovec* iov, int iovec_cnt) {
+    int transferReadIov(int resId, uint64_t offset, virgl_box* box, struct iovec* iov,
+                        int iovec_cnt) {
         AutoLock lock(mLock);
 
-        VGPLOG("resid: %d offset: 0x%llx. box: %u %u %u %u", resId,
-               (unsigned long long)offset,
-               box->x,
-               box->y,
-               box->w,
-               box->h);
+        VGPLOG("resid: %d offset: 0x%llx. box: %u %u %u %u", resId, (unsigned long long)offset,
+               box->x, box->y, box->w, box->h);
 
         auto it = mResources.find(resId);
         if (it == mResources.end()) return EINVAL;
@@ -1278,11 +1260,7 @@ public:
 
         if (iovec_cnt) {
             PipeResEntry e = {
-                entry.args,
-                iov,
-                (uint32_t)iovec_cnt,
-                entry.linear,
-                entry.linearSize,
+                entry.args, iov, (uint32_t)iovec_cnt, entry.linear, entry.linearSize,
             };
             ret = sync_iov(&e, offset, box, LINEAR_TO_IOV);
         } else {
@@ -1293,10 +1271,10 @@ public:
         return ret;
     }
 
-    int transferWriteIov(int resId, uint64_t offset, virgl_box* box, struct iovec* iov, int iovec_cnt) {
+    int transferWriteIov(int resId, uint64_t offset, virgl_box* box, struct iovec* iov,
+                         int iovec_cnt) {
         AutoLock lock(mLock);
-        VGPLOG("resid: %d offset: 0x%llx", resId,
-               (unsigned long long)offset);
+        VGPLOG("resid: %d offset: 0x%llx", resId, (unsigned long long)offset);
         auto it = mResources.find(resId);
         if (it == mResources.end()) return EINVAL;
 
@@ -1305,11 +1283,7 @@ public:
         int ret = 0;
         if (iovec_cnt) {
             PipeResEntry e = {
-                entry.args,
-                iov,
-                (uint32_t)iovec_cnt,
-                entry.linear,
-                entry.linearSize,
+                entry.args, iov, (uint32_t)iovec_cnt, entry.linear, entry.linearSize,
             };
             ret = sync_iov(&e, offset, box, IOV_TO_LINEAR);
         } else {
@@ -1349,8 +1323,7 @@ public:
         } else {
             auto& ids = resourcesIt->second;
             auto idIt = std::find(ids.begin(), ids.end(), resId);
-            if (idIt == ids.end())
-                ids.push_back(resId);
+            if (idIt == ids.end()) ids.push_back(resId);
         }
 
         auto contextsIt = mResourceContexts.find(resId);
@@ -1362,18 +1335,16 @@ public:
         } else {
             auto& ids = contextsIt->second;
             auto idIt = std::find(ids.begin(), ids.end(), ctxId);
-            if (idIt == ids.end())
-                ids.push_back(ctxId);
+            if (idIt == ids.end()) ids.push_back(ctxId);
         }
 
         // Associate the host pipe of the resource entry with the host pipe of
         // the context entry.  That is, the last context to call attachResource
         // wins if there is any conflict.
-        auto ctxEntryIt = mContexts.find(ctxId); auto resEntryIt =
-            mResources.find(resId);
+        auto ctxEntryIt = mContexts.find(ctxId);
+        auto resEntryIt = mResources.find(resId);
 
-        if (ctxEntryIt == mContexts.end() ||
-            resEntryIt == mResources.end()) return;
+        if (ctxEntryIt == mContexts.end() || resEntryIt == mResources.end()) return;
 
         VGPLOG("hostPipe: %p", ctxEntryIt->second.hostPipe);
         resEntryIt->second.hostPipe = ctxEntryIt->second.hostPipe;
@@ -1386,15 +1357,13 @@ public:
         detachResourceLocked(ctxId, toUnrefId);
     }
 
-    int getResourceInfo(uint32_t resId, struct virgl_renderer_resource_info *info) {
+    int getResourceInfo(uint32_t resId, struct virgl_renderer_resource_info* info) {
         VGPLOG("resid: %u", resId);
-        if (!info)
-            return EINVAL;
+        if (!info) return EINVAL;
 
         AutoLock lock(mLock);
         auto it = mResources.find(resId);
-        if (it == mResources.end())
-            return ENOENT;
+        if (it == mResources.end()) return ENOENT;
 
         auto& entry = it->second;
 
@@ -1432,9 +1401,8 @@ public:
         return 0;
     }
 
-    void flushResourceAndReadback(
-        uint32_t res_handle, uint32_t x, uint32_t y, uint32_t width, uint32_t height,
-        void* pixels, uint32_t max_bytes) {
+    void flushResourceAndReadback(uint32_t res_handle, uint32_t x, uint32_t y, uint32_t width,
+                                  uint32_t height, void* pixels, uint32_t max_bytes) {
         (void)x;
         (void)y;
         (void)width;
@@ -1455,7 +1423,6 @@ public:
     int createRingBlob(PipeResEntry& entry, uint32_t res_handle,
                        const struct stream_renderer_create_blob* create_blob,
                        const struct stream_renderer_handle* handle) {
-
         if (feature_is_enabled(kFeature_ExternalBlob)) {
             std::string name = "shared-memory-" + std::to_string(res_handle);
             auto ringBlob = std::make_shared<SharedMemory>(name, create_blob->size);
@@ -1468,8 +1435,8 @@ public:
             entry.ringBlob = ringBlob;
             entry.hva = ringBlob->get();
         } else {
-            void *addr = android::aligned_buf_alloc(ADDRESS_SPACE_GRAPHICS_PAGE_SIZE,
-                                                    create_blob->size);
+            void* addr =
+                android::aligned_buf_alloc(ADDRESS_SPACE_GRAPHICS_PAGE_SIZE, create_blob->size);
             if (addr == nullptr) {
                 VGPLOG("Failed to allocate ring blob");
                 return -ENOMEM;
@@ -1488,9 +1455,8 @@ public:
     int createBlob(uint32_t ctx_id, uint32_t res_handle,
                    const struct stream_renderer_create_blob* create_blob,
                    const struct stream_renderer_handle* handle) {
-
         PipeResEntry e;
-        struct virgl_renderer_resource_create_args args = { 0 };
+        struct virgl_renderer_resource_create_args args = {0};
         e.args = args;
         e.hostPipe = 0;
 
@@ -1499,6 +1465,17 @@ public:
             if (ret) {
                 return ret;
             }
+        } else if (feature_is_enabled(kFeature_ExternalBlob)) {
+            auto descriptorInfoOpt =
+                HostmemIdMapping::get()->removeDescriptorInfo(create_blob->blob_id);
+            if (descriptorInfoOpt) {
+                e.descriptorInfo =
+                    std::make_shared<ManagedDescriptorInfo>(std::move(*descriptorInfoOpt));
+            } else {
+                return -EINVAL;
+            }
+
+            e.caching = e.descriptorInfo->caching;
         } else {
             auto entry = HostmemIdMapping::get()->get(create_blob->blob_id);
             e.hva = entry.hva;
@@ -1509,6 +1486,7 @@ public:
 
         e.blobId = create_blob->blob_id;
         e.blobMem = create_blob->blob_mem;
+        e.blobFlags = create_blob->blob_flags;
         e.iov = nullptr;
         e.numIovs = 0;
         e.linear = 0;
@@ -1521,6 +1499,9 @@ public:
 
     int resourceMap(uint32_t res_handle, void** hvaOut, uint64_t* sizeOut) {
         AutoLock lock(mLock);
+
+        if (feature_is_enabled(kFeature_ExternalBlob)) return -EINVAL;
+
         auto it = mResources.find(res_handle);
         if (it == mResources.end()) {
             if (hvaOut) *hvaOut = nullptr;
@@ -1551,8 +1532,7 @@ public:
         AutoLock lock(mLock);
         auto it = mResources.find(res_handle);
         if (it == mResources.end()) return -1;
-        bool success =
-            mVirtioGpuOps->platform_import_resource(res_handle, res_info, resource);
+        bool success = mVirtioGpuOps->platform_import_resource(res_handle, res_info, resource);
         return success ? 0 : -1;
     }
 
@@ -1574,7 +1554,7 @@ public:
         return success ? 0 : -1;
     }
 
-    int resourceMapInfo(uint32_t res_handle, uint32_t *map_info) {
+    int resourceMapInfo(uint32_t res_handle, uint32_t* map_info) {
         AutoLock lock(mLock);
         auto it = mResources.find(res_handle);
         if (it == mResources.end()) return -1;
@@ -1592,7 +1572,7 @@ public:
             return -EINVAL;
         }
 
-        const auto& entry = it->second;
+        auto& entry = it->second;
         if (entry.ringBlob) {
             // Handle ownership transferred to VMM, gfxstream keeps the mapping.
 #ifdef _WIN32
@@ -1605,10 +1585,59 @@ public:
             return 0;
         }
 
+        if (entry.descriptorInfo) {
+            bool shareable = entry.blobFlags &
+                             (STREAM_BLOB_FLAG_USE_SHAREABLE | STREAM_BLOB_FLAG_USE_CROSS_DEVICE);
+
+            DescriptorType rawDescriptor;
+            if (shareable) {
+                // TODO: Add ManagedDescriptor::{clone, dup} method and use it;
+                // This should have no affect since gfxstream allocates mappable-only buffers
+                // currently
+                return -EINVAL;
+            } else {
+                auto rawDescriptorOpt = entry.descriptorInfo->descriptor.release();
+                if (rawDescriptorOpt)
+                    rawDescriptor = *rawDescriptorOpt;
+                else
+                    return -EINVAL;
+            }
+
+            handle->handle_type = entry.descriptorInfo->handleType;
+
+#ifdef _WIN32
+            handle->os_handle = static_cast<int64_t>(reinterpret_cast<intptr_t>(rawDescriptor));
+#else
+            handle->os_handle = static_cast<int64_t>(rawDescriptor);
+#endif
+
+            return 0;
+        }
+
         return -EINVAL;
     }
 
-private:
+    int vulkanInfo(uint32_t res_handle, struct stream_renderer_vulkan_info* vulkan_info) {
+        AutoLock lock(mLock);
+        auto it = mResources.find(res_handle);
+        if (it == mResources.end()) return -EINVAL;
+
+        const auto& entry = it->second;
+        if (entry.descriptorInfo && entry.descriptorInfo->vulkanInfoOpt) {
+            vulkan_info->memory_index = (*entry.descriptorInfo->vulkanInfoOpt).memoryIndex;
+            memcpy(vulkan_info->device_id.device_uuid,
+                   (*entry.descriptorInfo->vulkanInfoOpt).deviceUUID,
+                   sizeof(vulkan_info->device_id.device_uuid));
+            memcpy(vulkan_info->device_id.driver_uuid,
+                   (*entry.descriptorInfo->vulkanInfoOpt).driverUUID,
+                   sizeof(vulkan_info->device_id.driver_uuid));
+            return 0;
+        }
+
+        return -EINVAL;
+    }
+
+   private:
     void allocResource(PipeResEntry& entry, iovec* iov, int num_iovs) {
         VGPLOG("entry linear: %p", entry.linear);
         if (entry.linear) free(entry.linear);
@@ -1617,8 +1646,7 @@ private:
         for (uint32_t i = 0; i < num_iovs; ++i) {
             VGPLOG("iov base: %p", iov[i].iov_base);
             linearSize += iov[i].iov_len;
-            VGPLOG("has iov of %zu. linearSize current: %zu",
-                   iov[i].iov_len, linearSize);
+            VGPLOG("has iov of %zu. linearSize current: %zu", iov[i].iov_len, linearSize);
         }
         VGPLOG("final linearSize: %zu", linearSize);
 
@@ -1658,6 +1686,16 @@ private:
 
         resIt->second.hostPipe = 0;
         resIt->second.ctxId = 0;
+
+        auto ctxIt = mContexts.find(ctxId);
+        if (ctxIt != mContexts.end()) {
+            auto& ctxEntry = ctxIt->second;
+            if (ctxEntry.addressSpaceHandles.count(toUnrefId)) {
+                uint32_t handle = ctxEntry.addressSpaceHandles[toUnrefId];
+                mAddressSpaceDeviceControlOps->destroy_handle(handle);
+                ctxEntry.addressSpaceHandles.erase(toUnrefId);
+            }
+        }
     }
 
     inline const GoldfishPipeServiceOps* ensureAndGetServiceOps() {
@@ -1672,8 +1710,7 @@ private:
     virgl_renderer_callbacks mVirglRendererCallbacks;
     AndroidVirtioGpuOps* mVirtioGpuOps = nullptr;
     ReadPixelsFunc mReadPixelsFunc = nullptr;
-    struct address_space_device_control_ops* mAddressSpaceDeviceControlOps =
-        nullptr;
+    struct address_space_device_control_ops* mAddressSpaceDeviceControlOps = nullptr;
 
     const GoldfishPipeServiceOps* mServiceOps = nullptr;
 
@@ -1695,23 +1732,21 @@ static PipeVirglRenderer* sRenderer() {
 
 extern "C" {
 
-VG_EXPORT int pipe_virgl_renderer_init(
-    void *cookie, int flags, struct virgl_renderer_callbacks *cb) {
+VG_EXPORT int pipe_virgl_renderer_init(void* cookie, int flags,
+                                       struct virgl_renderer_callbacks* cb) {
     sRenderer()->init(cookie, flags, cb);
     return 0;
 }
 
 VG_EXPORT void pipe_virgl_renderer_poll(void) { sRenderer()->poll(); }
 
-VG_EXPORT void* pipe_virgl_renderer_get_cursor_data(
-    uint32_t resource_id, uint32_t *width, uint32_t *height) {
+VG_EXPORT void* pipe_virgl_renderer_get_cursor_data(uint32_t resource_id, uint32_t* width,
+                                                    uint32_t* height) {
     return 0;
 }
 
-VG_EXPORT int pipe_virgl_renderer_resource_create(
-    struct virgl_renderer_resource_create_args *args,
-    struct iovec *iov, uint32_t num_iovs) {
-
+VG_EXPORT int pipe_virgl_renderer_resource_create(struct virgl_renderer_resource_create_args* args,
+                                                  struct iovec* iov, uint32_t num_iovs) {
     return sRenderer()->createResource(args, iov, num_iovs);
 }
 
@@ -1719,8 +1754,7 @@ VG_EXPORT void pipe_virgl_renderer_resource_unref(uint32_t res_handle) {
     sRenderer()->unrefResource(res_handle);
 }
 
-VG_EXPORT int pipe_virgl_renderer_context_create(
-    uint32_t handle, uint32_t nlen, const char *name) {
+VG_EXPORT int pipe_virgl_renderer_context_create(uint32_t handle, uint32_t nlen, const char* name) {
     return sRenderer()->createContext(handle, nlen, name, 0);
 }
 
@@ -1728,77 +1762,61 @@ VG_EXPORT void pipe_virgl_renderer_context_destroy(uint32_t handle) {
     sRenderer()->destroyContext(handle);
 }
 
-VG_EXPORT int pipe_virgl_renderer_submit_cmd(void *buffer,
-                                          int ctx_id,
-                                          int dwordCount) {
+VG_EXPORT int pipe_virgl_renderer_submit_cmd(void* buffer, int ctx_id, int dwordCount) {
     return sRenderer()->submitCmd(ctx_id, buffer, dwordCount);
 }
 
-VG_EXPORT int pipe_virgl_renderer_transfer_read_iov(
-    uint32_t handle, uint32_t ctx_id,
-    uint32_t level, uint32_t stride,
-    uint32_t layer_stride,
-    struct virgl_box *box,
-    uint64_t offset, struct iovec *iov,
-    int iovec_cnt) {
+VG_EXPORT int pipe_virgl_renderer_transfer_read_iov(uint32_t handle, uint32_t ctx_id,
+                                                    uint32_t level, uint32_t stride,
+                                                    uint32_t layer_stride, struct virgl_box* box,
+                                                    uint64_t offset, struct iovec* iov,
+                                                    int iovec_cnt) {
     return sRenderer()->transferReadIov(handle, offset, box, iov, iovec_cnt);
 }
 
-VG_EXPORT int pipe_virgl_renderer_transfer_write_iov(
-    uint32_t handle,
-    uint32_t ctx_id,
-    int level,
-    uint32_t stride,
-    uint32_t layer_stride,
-    struct virgl_box *box,
-    uint64_t offset,
-    struct iovec *iovec,
-    unsigned int iovec_cnt) {
+VG_EXPORT int pipe_virgl_renderer_transfer_write_iov(uint32_t handle, uint32_t ctx_id, int level,
+                                                     uint32_t stride, uint32_t layer_stride,
+                                                     struct virgl_box* box, uint64_t offset,
+                                                     struct iovec* iovec, unsigned int iovec_cnt) {
     return sRenderer()->transferWriteIov(handle, offset, box, iovec, iovec_cnt);
 }
 
 // Not implemented
-VG_EXPORT void pipe_virgl_renderer_get_cap_set(uint32_t, uint32_t*, uint32_t*) { }
-VG_EXPORT void pipe_virgl_renderer_fill_caps(uint32_t, uint32_t, void *caps) { }
+VG_EXPORT void pipe_virgl_renderer_get_cap_set(uint32_t, uint32_t*, uint32_t*) {}
+VG_EXPORT void pipe_virgl_renderer_fill_caps(uint32_t, uint32_t, void* caps) {}
 
-VG_EXPORT int pipe_virgl_renderer_resource_attach_iov(
-    int res_handle, struct iovec *iov,
-    int num_iovs) {
+VG_EXPORT int pipe_virgl_renderer_resource_attach_iov(int res_handle, struct iovec* iov,
+                                                      int num_iovs) {
     return sRenderer()->attachIov(res_handle, iov, num_iovs);
 }
 
-VG_EXPORT void pipe_virgl_renderer_resource_detach_iov(
-    int res_handle, struct iovec **iov, int *num_iovs) {
+VG_EXPORT void pipe_virgl_renderer_resource_detach_iov(int res_handle, struct iovec** iov,
+                                                       int* num_iovs) {
     return sRenderer()->detachIov(res_handle, iov, num_iovs);
 }
 
-VG_EXPORT int pipe_virgl_renderer_create_fence(
-    int client_fence_id, uint32_t ctx_id) {
+VG_EXPORT int pipe_virgl_renderer_create_fence(int client_fence_id, uint32_t ctx_id) {
     sRenderer()->createFence(client_fence_id, VirtioGpuRingGlobal{});
     return 0;
 }
 
-VG_EXPORT void pipe_virgl_renderer_force_ctx_0(void) {
-    VGPLOG("call");
-}
+VG_EXPORT void pipe_virgl_renderer_force_ctx_0(void) { VGPLOG("call"); }
 
-VG_EXPORT void pipe_virgl_renderer_ctx_attach_resource(
-    int ctx_id, int res_handle) {
+VG_EXPORT void pipe_virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle) {
     sRenderer()->attachResource(ctx_id, res_handle);
 }
 
-VG_EXPORT void pipe_virgl_renderer_ctx_detach_resource(
-    int ctx_id, int res_handle) {
+VG_EXPORT void pipe_virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle) {
     sRenderer()->detachResource(ctx_id, res_handle);
 }
 
-VG_EXPORT int pipe_virgl_renderer_resource_get_info(
-    int res_handle,
-    struct virgl_renderer_resource_info *info) {
+VG_EXPORT int pipe_virgl_renderer_resource_get_info(int res_handle,
+                                                    struct virgl_renderer_resource_info* info) {
     return sRenderer()->getResourceInfo(res_handle, info);
 }
 
-VG_EXPORT int pipe_virgl_renderer_resource_map(uint32_t res_handle, void** hvaOut, uint64_t* sizeOut) {
+VG_EXPORT int pipe_virgl_renderer_resource_map(uint32_t res_handle, void** hvaOut,
+                                               uint64_t* sizeOut) {
     return sRenderer()->resourceMap(res_handle, hvaOut, sizeOut);
 }
 
@@ -1806,9 +1824,10 @@ VG_EXPORT int pipe_virgl_renderer_resource_unmap(uint32_t res_handle) {
     return sRenderer()->resourceUnmap(res_handle);
 }
 
-VG_EXPORT void stream_renderer_flush_resource_and_readback(
-    uint32_t res_handle, uint32_t x, uint32_t y, uint32_t width, uint32_t height,
-    void* pixels, uint32_t max_bytes) {
+VG_EXPORT void stream_renderer_flush_resource_and_readback(uint32_t res_handle, uint32_t x,
+                                                           uint32_t y, uint32_t width,
+                                                           uint32_t height, void* pixels,
+                                                           uint32_t max_bytes) {
     sRenderer()->flushResourceAndReadback(res_handle, x, y, width, height, pixels, max_bytes);
 }
 
@@ -1833,13 +1852,13 @@ VG_EXPORT int stream_renderer_resource_unmap(uint32_t res_handle) {
     return sRenderer()->resourceUnmap(res_handle);
 }
 
-VG_EXPORT int stream_renderer_context_create(uint32_t ctx_id, uint32_t nlen, const char *name,
+VG_EXPORT int stream_renderer_context_create(uint32_t ctx_id, uint32_t nlen, const char* name,
                                              uint32_t context_init) {
     return sRenderer()->createContext(ctx_id, nlen, name, context_init);
 }
 
-VG_EXPORT int stream_renderer_context_create_fence(
-    uint64_t fence_id, uint32_t ctx_id, uint8_t ring_idx) {
+VG_EXPORT int stream_renderer_context_create_fence(uint64_t fence_id, uint32_t ctx_id,
+                                                   uint8_t ring_idx) {
     sRenderer()->createFence(fence_id, VirtioGpuRingContextSpecific{
                                            .mCtxId = ctx_id,
                                            .mRingIdx = ring_idx,
@@ -1847,11 +1866,13 @@ VG_EXPORT int stream_renderer_context_create_fence(
     return 0;
 }
 
-VG_EXPORT int stream_renderer_platform_import_resource(int res_handle, int res_info, void* resource) {
+VG_EXPORT int stream_renderer_platform_import_resource(int res_handle, int res_info,
+                                                       void* resource) {
     return sRenderer()->platformImportResource(res_handle, res_info, resource);
 }
 
-VG_EXPORT int stream_renderer_platform_resource_info(int res_handle, int* width, int*  height, int* internal_format) {
+VG_EXPORT int stream_renderer_platform_resource_info(int res_handle, int* width, int* height,
+                                                     int* internal_format) {
     return sRenderer()->platformResourceInfo(res_handle, width, height, internal_format);
 }
 
@@ -1863,23 +1884,609 @@ VG_EXPORT int stream_renderer_platform_destroy_shared_egl_context(void* context)
     return sRenderer()->platformDestroySharedEglContext(context);
 }
 
-VG_EXPORT int stream_renderer_resource_map_info(uint32_t res_handle, uint32_t *map_info) {
+VG_EXPORT int stream_renderer_resource_map_info(uint32_t res_handle, uint32_t* map_info) {
     return sRenderer()->resourceMapInfo(res_handle, map_info);
 }
+
+VG_EXPORT int stream_renderer_vulkan_info(uint32_t res_handle,
+                                          struct stream_renderer_vulkan_info* vulkan_info) {
+    return sRenderer()->vulkanInfo(res_handle, vulkan_info);
+}
+
+struct renderer_display_info;
+typedef void (*get_pixels_t)(void*, uint32_t, uint32_t);
+static get_pixels_t sGetPixelsFunc = 0;
+typedef void (*post_callback_t)(void*, uint32_t, int, int, int, int, int, unsigned char*);
+
+// For reading back rendered contents to display
+VG_EXPORT void get_pixels(void* pixels, uint32_t bytes);
+
+static const GoldfishPipeServiceOps goldfish_pipe_service_ops = {
+    // guest_open()
+    [](GoldfishHwPipe* hwPipe) -> GoldfishHostPipe* {
+        return static_cast<GoldfishHostPipe*>(android_pipe_guest_open(hwPipe));
+    },
+    // guest_open_with_flags()
+    [](GoldfishHwPipe* hwPipe, uint32_t flags) -> GoldfishHostPipe* {
+        return static_cast<GoldfishHostPipe*>(android_pipe_guest_open_with_flags(hwPipe, flags));
+    },
+    // guest_close()
+    [](GoldfishHostPipe* hostPipe, GoldfishPipeCloseReason reason) {
+        static_assert((int)GOLDFISH_PIPE_CLOSE_GRACEFUL == (int)PIPE_CLOSE_GRACEFUL,
+                      "Invalid PIPE_CLOSE_GRACEFUL value");
+        static_assert((int)GOLDFISH_PIPE_CLOSE_REBOOT == (int)PIPE_CLOSE_REBOOT,
+                      "Invalid PIPE_CLOSE_REBOOT value");
+        static_assert((int)GOLDFISH_PIPE_CLOSE_LOAD_SNAPSHOT == (int)PIPE_CLOSE_LOAD_SNAPSHOT,
+                      "Invalid PIPE_CLOSE_LOAD_SNAPSHOT value");
+        static_assert((int)GOLDFISH_PIPE_CLOSE_ERROR == (int)PIPE_CLOSE_ERROR,
+                      "Invalid PIPE_CLOSE_ERROR value");
+
+        android_pipe_guest_close(hostPipe, static_cast<PipeCloseReason>(reason));
+    },
+    // guest_pre_load()
+    [](QEMUFile* file) { (void)file; },
+    // guest_post_load()
+    [](QEMUFile* file) { (void)file; },
+    // guest_pre_save()
+    [](QEMUFile* file) { (void)file; },
+    // guest_post_save()
+    [](QEMUFile* file) { (void)file; },
+    // guest_load()
+    [](QEMUFile* file, GoldfishHwPipe* hwPipe, char* force_close) -> GoldfishHostPipe* {
+        (void)file;
+        (void)hwPipe;
+        (void)force_close;
+        return nullptr;
+    },
+    // guest_save()
+    [](GoldfishHostPipe* hostPipe, QEMUFile* file) {
+        (void)hostPipe;
+        (void)file;
+    },
+    // guest_poll()
+    [](GoldfishHostPipe* hostPipe) {
+        static_assert((int)GOLDFISH_PIPE_POLL_IN == (int)PIPE_POLL_IN, "invalid POLL_IN values");
+        static_assert((int)GOLDFISH_PIPE_POLL_OUT == (int)PIPE_POLL_OUT, "invalid POLL_OUT values");
+        static_assert((int)GOLDFISH_PIPE_POLL_HUP == (int)PIPE_POLL_HUP, "invalid POLL_HUP values");
+
+        return static_cast<GoldfishPipePollFlags>(android_pipe_guest_poll(hostPipe));
+    },
+    // guest_recv()
+    [](GoldfishHostPipe* hostPipe, GoldfishPipeBuffer* buffers, int numBuffers) -> int {
+        // NOTE: Assumes that AndroidPipeBuffer and GoldfishPipeBuffer
+        //       have exactly the same layout.
+        static_assert(sizeof(AndroidPipeBuffer) == sizeof(GoldfishPipeBuffer),
+                      "Invalid PipeBuffer sizes");
+    // We can't use a static_assert with offsetof() because in msvc, it uses
+    // reinterpret_cast.
+    // TODO: Add runtime assertion instead?
+    // https://developercommunity.visualstudio.com/content/problem/22196/static-assert-cannot-compile-constexprs-method-tha.html
+#ifndef _MSC_VER
+        static_assert(offsetof(AndroidPipeBuffer, data) == offsetof(GoldfishPipeBuffer, data),
+                      "Invalid PipeBuffer::data offsets");
+        static_assert(offsetof(AndroidPipeBuffer, size) == offsetof(GoldfishPipeBuffer, size),
+                      "Invalid PipeBuffer::size offsets");
+#endif
+        return android_pipe_guest_recv(hostPipe, reinterpret_cast<AndroidPipeBuffer*>(buffers),
+                                       numBuffers);
+    },
+    // guest_send()
+    [](GoldfishHostPipe** hostPipe, const GoldfishPipeBuffer* buffers, int numBuffers) -> int {
+        return android_pipe_guest_send(reinterpret_cast<void**>(hostPipe),
+                                       reinterpret_cast<const AndroidPipeBuffer*>(buffers),
+                                       numBuffers);
+    },
+    // guest_wake_on()
+    [](GoldfishHostPipe* hostPipe, GoldfishPipeWakeFlags wakeFlags) {
+        android_pipe_guest_wake_on(hostPipe, static_cast<int>(wakeFlags));
+    },
+    // dma_add_buffer()
+    [](void* pipe, uint64_t paddr, uint64_t sz) {
+        // not considered for virtio
+    },
+    // dma_remove_buffer()
+    [](uint64_t paddr) {
+        // not considered for virtio
+    },
+    // dma_invalidate_host_mappings()
+    []() {
+        // not considered for virtio
+    },
+    // dma_reset_host_mappings()
+    []() {
+        // not considered for virtio
+    },
+    // dma_save_mappings()
+    [](QEMUFile* file) { (void)file; },
+    // dma_load_mappings()
+    [](QEMUFile* file) { (void)file; },
+};
+
+extern const QAndroidVmOperations* const gQAndroidVmOperations;
+
+static void default_post_callback(void* context, uint32_t displayId, int width, int height,
+                                  int ydir, int format, int frame_type, unsigned char* pixels) {
+    (void)context;
+    (void)width;
+    (void)height;
+    (void)ydir;
+    (void)format;
+    (void)frame_type;
+    (void)pixels;
+    // no-op
+}
+
+VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer_params,
+                                   uint64_t num_params) {
+    // Required parameters.
+    std::unordered_set<uint64_t> required_params{STREAM_RENDERER_PARAM_USER_DATA,
+                                                 STREAM_RENDERER_PARAM_RENDERER_FLAGS,
+                                                 STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK};
+
+    // String names of the parameters.
+    std::unordered_map<uint64_t, std::string> param_strings{
+        {STREAM_RENDERER_PARAM_USER_DATA, "USER_DATA"},
+        {STREAM_RENDERER_PARAM_RENDERER_FLAGS, "RENDERER_FLAGS"},
+        {STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK, "WRITE_FENCE_CALLBACK"},
+        {STREAM_RENDERER_PARAM_WRITE_CONTEXT_FENCE_CALLBACK, "WRITE_CONTEXT_FENCE_CALLBACK"},
+        {STREAM_RENDERER_PARAM_WIN0_WIDTH, "WIN0_WIDTH"},
+        {STREAM_RENDERER_PARAM_WIN0_HEIGHT, "WIN0_HEIGHT"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT,
+         "METRICS_CALLBACK_ADD_INSTANT_EVENT"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR,
+         "METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC,
+         "METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT,
+         "METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION, "METRICS_CALLBACK_SET_ANNOTATION"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT, "METRICS_CALLBACK_ABORT"}};
+
+    // Print full values for these parameters:
+    // Values here must not be pointers (e.g. callback functions), to avoid potentially identifying
+    // someone via ASLR. Pointers in ASLR are randomized on boot, which means pointers may be
+    // different between users but similar across a single user's sessions.
+    // As a convenience, any value <= 4096 is also printed, to catch small or null pointer errors.
+    std::unordered_set<uint64_t> printed_param_values{STREAM_RENDERER_PARAM_RENDERER_FLAGS,
+                                                      STREAM_RENDERER_PARAM_WIN0_WIDTH,
+                                                      STREAM_RENDERER_PARAM_WIN0_HEIGHT};
+
+    // We may have unknown parameters, so this function is lenient.
+    auto get_param_string = [&](uint64_t key) -> std::string {
+        auto param_string = param_strings.find(key);
+        if (param_string != param_strings.end()) {
+            return param_string->second;
+        } else {
+            return "Unknown param with key=" + std::to_string(key);
+        }
+    };
+
+    // Initialization data.
+    uint32_t display_width = 0;
+    uint32_t display_height = 0;
+    void* renderer_cookie = nullptr;
+    int renderer_flags = 0;
+    virgl_renderer_callbacks virglrenderer_callbacks = {};
+
+    // Iterate all parameters that we support.
+    GFXS_LOG("Reading stream renderer parameters:");
+    for (uint64_t i = 0; i < num_params; ++i) {
+        stream_renderer_param& param = stream_renderer_params[i];
+
+        // Print out parameter we are processing. See comment above `printed_param_values` before
+        // adding new prints.
+        if (printed_param_values.find(param.key) != printed_param_values.end() ||
+            param.value <= 4096) {
+            GFXS_LOG("%s - %llu", get_param_string(param.key).c_str(),
+                     static_cast<unsigned long long>(param.value));
+        } else {
+            // If not full value, print that it was passed.
+            GFXS_LOG("%s", get_param_string(param.key).c_str());
+        }
+
+        // Removing every param we process will leave required_params empty if all provided.
+        required_params.erase(param.key);
+
+        switch (param.key) {
+            case STREAM_RENDERER_PARAM_USER_DATA: {
+                renderer_cookie = reinterpret_cast<void*>(static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_RENDERER_FLAGS: {
+                renderer_flags = static_cast<int>(param.value);
+                break;
+            }
+            case STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK: {
+                virglrenderer_callbacks.write_fence =
+                    reinterpret_cast<stream_renderer_param_write_fence_callback>(
+                        static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_WRITE_CONTEXT_FENCE_CALLBACK: {
+#ifdef VIRGL_RENDERER_UNSTABLE_APIS
+                virglrenderer_callbacks.write_context_fence =
+                    reinterpret_cast<stream_renderer_param_write_context_fence_callback>(
+                        static_cast<uintptr_t>(param.value));
+#else
+                ERR("Cannot use WRITE_CONTEXT_FENCE_CALLBACK with unstable APIs OFF.");
+#endif
+                break;
+            }
+            case STREAM_RENDERER_PARAM_WIN0_WIDTH: {
+                display_width = static_cast<uint32_t>(param.value);
+                break;
+            }
+            case STREAM_RENDERER_PARAM_WIN0_HEIGHT: {
+                display_height = static_cast<uint32_t>(param.value);
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT: {
+                MetricsLogger::add_instant_event_callback =
+                    reinterpret_cast<stream_renderer_param_metrics_callback_add_instant_event>(
+                        static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR: {
+                MetricsLogger::add_instant_event_with_descriptor_callback = reinterpret_cast<
+                    stream_renderer_param_metrics_callback_add_instant_event_with_descriptor>(
+                    static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC: {
+                MetricsLogger::add_instant_event_with_metric_callback = reinterpret_cast<
+                    stream_renderer_param_metrics_callback_add_instant_event_with_metric>(
+                    static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT: {
+                MetricsLogger::add_vulkan_out_of_memory_event = reinterpret_cast<
+                    stream_renderer_param_metrics_callback_add_vulkan_out_of_memory_event>(
+                    static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION: {
+                MetricsLogger::set_crash_annotation_callback =
+                    reinterpret_cast<stream_renderer_param_metrics_callback_set_annotation>(
+                        static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT: {
+                emugl::setDieFunction(
+                    reinterpret_cast<stream_renderer_param_metrics_callback_abort>(
+                        static_cast<uintptr_t>(param.value)));
+                break;
+            }
+            default: {
+                // We skip any parameters we don't recognize.
+                ERR("Skipping unknown parameter key: %llu. May need to upgrade gfxstream.",
+                    static_cast<unsigned long long>(param.key));
+                break;
+            }
+        }
+    }
+    GFXS_LOG("Finished reading parameters");
+
+    // Some required params not found.
+    if (required_params.size() > 0) {
+        ERR("Missing required parameters:");
+        for (uint64_t param : required_params) {
+            ERR("%s", get_param_string(param).c_str());
+        }
+        ERR("Failing initialization intentionally");
+        return -1;
+    }
+
+    // Set non product-specific callbacks
+    vk_util::setVkCheckCallbacks(
+        std::make_unique<vk_util::VkCheckCallbacks>(vk_util::VkCheckCallbacks{
+            .onVkErrorOutOfMemory =
+                [](VkResult result, const char* function, int line) {
+                    auto fb = FrameBuffer::getFB();
+                    if (!fb) {
+                        ERR("FrameBuffer not yet initialized. Dropping out of memory event");
+                        return;
+                    }
+                    fb->logVulkanOutOfMemory(result, function, line);
+                },
+            .onVkErrorOutOfMemoryOnAllocation =
+                [](VkResult result, const char* function, int line,
+                   std::optional<uint64_t> allocationSize) {
+                    auto fb = FrameBuffer::getFB();
+                    if (!fb) {
+                        ERR("FrameBuffer not yet initialized. Dropping out of memory event");
+                        return;
+                    }
+                    fb->logVulkanOutOfMemory(result, function, line, allocationSize);
+                }}));
+
+    gfxstream_backend_init_product_override();
+    // First we make some agents available.
+
+    GFXS_LOG("start. display dimensions: width %u height %u, renderer flags: 0x%x", display_width,
+             display_height, renderer_flags);
+
+    // Flags processing
+
+    // TODO: hook up "gfxstream egl" to the renderer flags
+    // GFXSTREAM_RENDERER_FLAGS_USE_EGL_BIT in crosvm
+    // as it's specified from launch_cvd.
+    // At the moment, use ANDROID_GFXSTREAM_EGL=1
+    // For test on GCE
+    if (android::base::getEnvironmentVariable("ANDROID_GFXSTREAM_EGL") == "1") {
+        android::base::setEnvironmentVariable("ANDROID_EGL_ON_EGL", "1");
+        android::base::setEnvironmentVariable("ANDROID_EMUGL_LOG_PRINT", "1");
+        android::base::setEnvironmentVariable("ANDROID_EMUGL_VERBOSE", "1");
+    }
+    // end for test on GCE
+
+    android::base::setEnvironmentVariable("ANDROID_EMU_HEADLESS", "1");
+    bool enableVk = !(renderer_flags & GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT);
+
+    bool egl2eglByEnv = android::base::getEnvironmentVariable("ANDROID_EGL_ON_EGL") == "1";
+    bool egl2eglByFlag = renderer_flags & GFXSTREAM_RENDERER_FLAGS_USE_EGL_BIT;
+    bool enable_egl2egl = egl2eglByFlag || egl2eglByEnv;
+    if (enable_egl2egl) {
+        android::base::setEnvironmentVariable("ANDROID_GFXSTREAM_EGL", "1");
+        android::base::setEnvironmentVariable("ANDROID_EGL_ON_EGL", "1");
+    }
+
+    bool surfaceless = renderer_flags & GFXSTREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT;
+    bool enableGlEs31Flag = renderer_flags & GFXSTREAM_RENDERER_FLAGS_ENABLE_GLES31_BIT;
+    bool useExternalBlob = renderer_flags & GFXSTREAM_RENDERER_FLAGS_USE_EXTERNAL_BLOB;
+    bool useSystemBlob = renderer_flags & GFXSTREAM_RENDERER_FLAGS_USE_SYSTEM_BLOB;
+    bool guestUsesAngle = renderer_flags & GFXSTREAM_RENDERER_FLAGS_GUEST_USES_ANGLE;
+    bool useVulkanNativeSwapchain =
+        renderer_flags & GFXSTREAM_RENDERER_FLAGS_VULKAN_NATIVE_SWAPCHAIN_BIT;
+
+    GFXS_LOG("Vulkan enabled? %d", enableVk);
+    GFXS_LOG("egl2egl enabled? %d", enable_egl2egl);
+    GFXS_LOG("surfaceless? %d", surfaceless);
+    GFXS_LOG("OpenGL ES 3.1 enabled? %d", enableGlEs31Flag);
+    GFXS_LOG("use external blob? %d", useExternalBlob);
+    GFXS_LOG("use system blob? %d", useSystemBlob);
+    GFXS_LOG("guest using ANGLE? %d", guestUsesAngle);
+    GFXS_LOG("use Vulkan native swapchain on the host? %d", useVulkanNativeSwapchain);
+
+    if (useSystemBlob) {
+        if (!useExternalBlob) {
+            GFXS_LOG("USE_EXTERNAL_BLOB must be on with USE_SYSTEM_BLOB");
+            return -2;
+        }
+
+#ifndef _WIN32
+        GFXS_LOG("Warning: USE_SYSTEM_BLOB has only been tested on Windows");
+#endif
+    }
+
+    // Need to manually set the GLES backend paths in gfxstream environment
+    // because the library search paths are not automatically set to include
+    // the directory in whioch the GLES backend resides.
+#if defined(__linux__)
+#define GFXSTREAM_LIB_SUFFIX ".so"
+#elif defined(__APPLE__)
+#define GFXSTREAM_LIB_SUFFIX ".dylib"
+#else  // Windows
+#define GFXSTREAM_LIB_SUFFIX ".dll"
+#endif
+
+    feature_set_enabled_override(kFeature_GLPipeChecksum, false);
+    feature_set_enabled_override(kFeature_GLESDynamicVersion, true);
+    feature_set_enabled_override(kFeature_PlayStoreImage, !enableGlEs31Flag);
+    feature_set_enabled_override(kFeature_GLDMA, false);
+    feature_set_enabled_override(kFeature_GLAsyncSwap, false);
+    feature_set_enabled_override(kFeature_RefCountPipe, false);
+    feature_set_enabled_override(kFeature_NoDelayCloseColorBuffer, true);
+    feature_set_enabled_override(kFeature_NativeTextureDecompression, false);
+    feature_set_enabled_override(kFeature_GLDirectMem, false);
+    feature_set_enabled_override(kFeature_Vulkan, enableVk);
+    feature_set_enabled_override(kFeature_VulkanSnapshots, false);
+    feature_set_enabled_override(kFeature_VulkanNullOptionalStrings, true);
+    feature_set_enabled_override(kFeature_VulkanShaderFloat16Int8, true);
+    feature_set_enabled_override(kFeature_HostComposition, true);
+    feature_set_enabled_override(kFeature_VulkanIgnoredHandles, true);
+    feature_set_enabled_override(kFeature_VirtioGpuNext, true);
+    feature_set_enabled_override(kFeature_VirtioGpuNativeSync, true);
+    feature_set_enabled_override(kFeature_GuestUsesAngle, guestUsesAngle);
+    feature_set_enabled_override(kFeature_VulkanQueueSubmitWithCommands, true);
+    feature_set_enabled_override(kFeature_VulkanNativeSwapchain, useVulkanNativeSwapchain);
+    feature_set_enabled_override(kFeature_VulkanBatchedDescriptorSetUpdate, true);
+    // TODO: Strictly speaking, renderer_flags check is insufficient because
+    // fence contexts require us to be running a new-enough guest kernel.
+    feature_set_enabled_override(kFeature_VirtioGpuFenceContexts,
+                                 (renderer_flags & GFXSTREAM_RENDERER_FLAGS_ASYNC_FENCE_CB));
+    feature_set_enabled_override(kFeature_VulkanAstcLdrEmulation, true);
+    feature_set_enabled_override(kFeature_VulkanEtc2Emulation, true);
+    feature_set_enabled_override(kFeature_VulkanYcbcrEmulation, false);
+    feature_set_enabled_override(kFeature_ExternalBlob, useExternalBlob);
+    feature_set_enabled_override(kFeature_SystemBlob, useSystemBlob);
+
+    android::featurecontrol::productFeatureOverride();
+
+    if (useVulkanNativeSwapchain && !enableVk) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+            << "can't enable vulkan native swapchain, Vulkan is disabled";
+    }
+
+    emugl::vkDispatch(false /* don't use test ICD */);
+
+    auto androidHw = aemu_get_android_hw();
+
+    androidHw->hw_gltransport_asg_writeBufferSize = 1048576;
+    androidHw->hw_gltransport_asg_writeStepSize = 262144;
+    androidHw->hw_gltransport_asg_dataRingSize = 524288;
+    androidHw->hw_gltransport_drawFlushInterval = 10000;
+
+    EmuglConfig config;
+
+    // Make all the console agents available.
+    android::emulation::injectGraphicsAgents(android::emulation::GfxStreamGraphicsAgentFactory());
+
+    emuglConfig_init(&config, true /* gpu enabled */, "auto",
+                     enable_egl2egl ? "swiftshader_indirect" : "host", 64, /* bitness */
+                     surfaceless,                                          /* no window */
+                     false,                                                /* blocklisted */
+                     false,                                                /* has guest renderer */
+                     WINSYS_GLESBACKEND_PREFERENCE_AUTO, true /* force host gpu vulkan */);
+
+    emuglConfig_setupEnv(&config);
+
+    android_prepareOpenglesEmulation();
+
+    {
+        static emugl::RenderLibPtr renderLibPtr = initLibrary();
+        void* egldispatch = renderLibPtr->getEGLDispatch();
+        void* glesv2Dispatch = renderLibPtr->getGLESv2Dispatch();
+        android_setOpenglesEmulation(renderLibPtr.get(), egldispatch, glesv2Dispatch);
+    }
+
+    int maj;
+    int min;
+    android_startOpenglesRenderer(display_width, display_height, 1, 28, getGraphicsAgents()->vm,
+                                  getGraphicsAgents()->emu, getGraphicsAgents()->multi_display,
+                                  &maj, &min);
+
+    char* vendor = nullptr;
+    char* renderer = nullptr;
+    char* version = nullptr;
+
+    android_getOpenglesHardwareStrings(&vendor, &renderer, &version);
+
+    GFXS_LOG("GL strings; [%s] [%s] [%s].\n", vendor, renderer, version);
+
+    auto openglesRenderer = android_getOpenglesRenderer();
+
+    if (!openglesRenderer) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "No renderer started, fatal";
+    }
+
+    address_space_set_vm_operations(getGraphicsAgents()->vm);
+    android_init_opengles_pipe();
+    android_opengles_pipe_set_recv_mode(2 /* virtio-gpu */);
+    android_init_refcount_pipe();
+
+    sGetPixelsFunc = android_getReadPixelsFunc();
+
+    pipe_virgl_renderer_init(renderer_cookie, renderer_flags, &virglrenderer_callbacks);
+
+    GFXS_LOG("Started renderer");
+
+    return 0;
+}
+
+VG_EXPORT void gfxstream_backend_init(uint32_t display_width, uint32_t display_height,
+                                      uint32_t display_type, void* renderer_cookie,
+                                      int renderer_flags,
+                                      struct virgl_renderer_callbacks* virglrenderer_callbacks,
+                                      struct gfxstream_callbacks* gfxstreamcallbacks) {
+    std::vector<stream_renderer_param> streamRendererParams{
+        {STREAM_RENDERER_PARAM_USER_DATA,
+         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(renderer_cookie))},
+        {STREAM_RENDERER_PARAM_RENDERER_FLAGS, static_cast<uint64_t>(renderer_flags)},
+        {STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK,
+         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(virglrenderer_callbacks->write_fence))},
+#ifdef VIRGL_RENDERER_UNSTABLE_APIS
+        {STREAM_RENDERER_PARAM_WRITE_CONTEXT_FENCE_CALLBACK,
+         static_cast<uint64_t>(
+             reinterpret_cast<uintptr_t>(virglrenderer_callbacks->write_context_fence))},
+#endif
+        {STREAM_RENDERER_PARAM_WIN0_WIDTH, display_width},
+        {STREAM_RENDERER_PARAM_WIN0_HEIGHT, display_height}};
+
+    // Convert metrics callbacks.
+    if (gfxstreamcallbacks) {
+        if (gfxstreamcallbacks->add_instant_event) {
+            streamRendererParams.push_back(
+                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT,
+                 static_cast<uint64_t>(
+                     reinterpret_cast<uintptr_t>(gfxstreamcallbacks->add_instant_event))});
+        }
+        if (gfxstreamcallbacks->add_instant_event_with_descriptor) {
+            streamRendererParams.push_back(
+                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR,
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                     gfxstreamcallbacks->add_instant_event_with_descriptor))});
+        }
+        if (gfxstreamcallbacks->add_instant_event_with_metric) {
+            streamRendererParams.push_back(
+                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC,
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                     gfxstreamcallbacks->add_instant_event_with_metric))});
+        }
+        if (gfxstreamcallbacks->add_vulkan_out_of_memory_event) {
+            streamRendererParams.push_back(
+                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT,
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                     gfxstreamcallbacks->add_vulkan_out_of_memory_event))});
+        }
+        if (gfxstreamcallbacks->set_annotation) {
+            streamRendererParams.push_back({STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION,
+                                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                                                gfxstreamcallbacks->set_annotation))});
+        }
+        if (gfxstreamcallbacks->abort) {
+            streamRendererParams.push_back(
+                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT,
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(gfxstreamcallbacks->abort))});
+        }
+    }
+
+    stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
+}
+
+VG_EXPORT void gfxstream_backend_setup_window(void* native_window_handle, int32_t window_x,
+                                              int32_t window_y, int32_t window_width,
+                                              int32_t window_height, int32_t fb_width,
+                                              int32_t fb_height) {
+    android_showOpenglesWindow(native_window_handle, window_x, window_y, window_width,
+                               window_height, fb_width, fb_height, 1.0f, 0, false, false);
+}
+
+VG_EXPORT void gfxstream_backend_teardown() {
+    android_finishOpenglesRenderer();
+    android_hideOpenglesWindow();
+    android_stopOpenglesRenderer(true);
+}
+
+VG_EXPORT void gfxstream_backend_set_screen_mask(int width, int height,
+                                                 const unsigned char* rgbaData) {
+    android_setOpenglesScreenMask(width, height, rgbaData);
+}
+
+VG_EXPORT void get_pixels(void* pixels, uint32_t bytes) {
+    // TODO: support display > 0
+    sGetPixelsFunc(pixels, bytes, 0);
+}
+
+VG_EXPORT void gfxstream_backend_getrender(char* buf, size_t bufSize, size_t* size) {
+    const char* render = "";
+    FrameBuffer* pFB = FrameBuffer::getFB();
+    if (pFB) {
+        const char* vendor = nullptr;
+        const char* version = nullptr;
+        pFB->getGLStrings(&vendor, &render, &version);
+    }
+    if (!buf || bufSize == 0) {
+        if (size) *size = strlen(render);
+        return;
+    }
+    *buf = '\0';
+    strncat(buf, render, bufSize - 1);
+    if (size) *size = strlen(buf);
+}
+
+const GoldfishPipeServiceOps* goldfish_pipe_get_service_ops() { return &goldfish_pipe_service_ops; }
 
 #define VIRGLRENDERER_API_PIPE_STRUCT_DEF(api) pipe_##api,
 
 static struct virgl_renderer_virtio_interface s_virtio_interface = {
-    LIST_VIRGLRENDERER_API(VIRGLRENDERER_API_PIPE_STRUCT_DEF)
-};
+    LIST_VIRGLRENDERER_API(VIRGLRENDERER_API_PIPE_STRUCT_DEF)};
 
-struct virgl_renderer_virtio_interface*
-get_goldfish_pipe_virgl_renderer_virtio_interface(void) {
+struct virgl_renderer_virtio_interface* get_goldfish_pipe_virgl_renderer_virtio_interface(void) {
     return &s_virtio_interface;
 }
 
-void virtio_goldfish_pipe_reset(void *pipe, void *host_pipe) {
+void virtio_goldfish_pipe_reset(void* pipe, void* host_pipe) {
     sRenderer()->resetPipe((GoldfishHwPipe*)pipe, (GoldfishHostPipe*)host_pipe);
 }
 
-} // extern "C"
+}  // extern "C"

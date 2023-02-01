@@ -1,20 +1,37 @@
+#
+# Copyright (C) 2022 The Android Open Source Project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import io
+from datetime import datetime
 import sys
 import textwrap
 from typing import Dict, Optional
-import vulkan_printer
-import opcodes
+from . import vulkan_printer
+from . import opcodes
 import struct
 
 
 class CommandPrinter:
     """This class is responsible for printing the commands found in the minidump file to the terminal."""
 
-    def __init__(self, opcode: int, original_size: int, data: bytes, stream_idx: int, cmd_idx: int,
-                 out=sys.stdout):
+    def __init__(self, opcode: int, original_size: int, data: bytes, timestamp: int,
+                 stream_idx: int, cmd_idx: int, out=sys.stdout):
         self.opcode = opcode
         self.original_size = original_size
         self.data = io.BytesIO(data)
+        self.timestamp = timestamp
         self.stream_idx = stream_idx
         self.cmd_idx = cmd_idx
         self.out = out
@@ -28,6 +45,7 @@ class CommandPrinter:
         # Print out the command name
         print("\n{}.{} - {}: ({} bytes)".format(self.stream_idx, self.cmd_idx, self.cmd_name(),
                                                 self.original_size - 8), file=self.out)
+        self.write_timestamp(4)
 
         if len(self.data.getbuffer()) == 0:
             return
@@ -174,6 +192,12 @@ class CommandPrinter:
         if pnext_size != 0:
             self.write_enum("ext type", vulkan_printer.VkStructureType, indent + 1)
             raise NotImplementedError("Decoding structs with extensions is not supported")
+
+    def write_timestamp(self, indent):
+        if self.timestamp != 0:
+            self.write(
+                "Recorded at: {}\n".format(datetime.fromtimestamp(self.timestamp / 1000000.0)),
+                indent)
 
     def check_null(self, field_name: str, indent) -> bool:
         is_null = self.read_int(8, big_endian=True) == 0
