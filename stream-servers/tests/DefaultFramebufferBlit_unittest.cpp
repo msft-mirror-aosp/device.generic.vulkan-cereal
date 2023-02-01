@@ -13,11 +13,18 @@
 // limitations under the License.
 #include <gtest/gtest.h>
 
-#include "host-common/testing/MockAndroidAgentFactory.h"
+#include "host-common/testing/MockGraphicsAgentFactory.h"
 #include "Standalone.h"
 #include "GLTestUtils.h"
 
 #include <memory>
+
+using gfxstream::GLESApi;
+using gfxstream::GLESApi_2;
+using gfxstream::GLESApi_3_0;
+using gfxstream::GLESApi_3_1;
+using gfxstream::GLESApi_3_2;
+using gfxstream::GLESApi_CM;
 
 namespace emugl {
 
@@ -50,12 +57,12 @@ public:
         if (!param.fastBlit) {
             // Disable fast blit and then recreate the color buffer to apply the
             // change.
-            mFb->disableFastBlit();
+            mFb->disableFastBlitForTesting();
 
             mFb->closeColorBuffer(mColorBuffer);
             mColorBuffer = mFb->createColorBuffer(
                     mWidth, mHeight, GL_RGBA, FRAMEWORK_FORMAT_GL_COMPATIBLE);
-            mFb->setWindowSurfaceColorBuffer(mSurface, mColorBuffer);
+            mFb->setEmulatedEglWindowSurfaceColorBuffer(mSurface, mColorBuffer);
         }
     }
 
@@ -174,8 +181,8 @@ static constexpr float kDrawColorGreen[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
 class CombinedFramebufferBlit : public ::testing::Test, public ::testing::WithParamInterface<ClearColorParam> {
 protected:
     static void SetUpTestSuite() {
-        android::emulation::injectConsoleAgents(
-                android::emulation::MockAndroidConsoleFactory());
+        android::emulation::injectGraphicsAgents(
+                android::emulation::MockGraphicsAgentFactory());
     }
 
     static void TearDownTestSuite() { }

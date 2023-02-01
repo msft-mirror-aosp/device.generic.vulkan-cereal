@@ -13,10 +13,14 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <vector>
 
-#include "GfxStreamBackend.h"
+#include "virtio-gpu-gfxstream-renderer.h"
+#include "host-common/testing/MockGraphicsAgentFactory.h"
 #include "OSWindow.h"
-#include "base/System.h"
+#include "aemu/base/system/System.h"
+
+using android::base::sleepMs;
 
 class GfxStreamBackendTest : public ::testing::Test {
 private:
@@ -29,28 +33,36 @@ private:
 protected:
     uint32_t cookie;
     static const bool useWindow;
-    struct virgl_renderer_callbacks callbacks;
-    struct gfxstream_callbacks gfxstreamcallbacks;
+    std::vector<stream_renderer_param> streamRendererParams;
+    std::vector<stream_renderer_param> minimumRequiredParams;
     static constexpr uint32_t width = 256;
     static constexpr uint32_t height = 256;
     static std::unique_ptr<OSWindow> window;
+    static constexpr int rendererFlags = GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT;
+    static constexpr int surfacelessFlags = GFXSTREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT |
+                                            GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT;
 
     GfxStreamBackendTest()
         : cookie(0),
-          callbacks({
-                  0,
-                  sWriteFence,
-                  0,
-                  0,
-                  0,
-          }),
-          gfxstreamcallbacks({
-                  0,
-                  0,
-                  0,
-          }) {}
+          streamRendererParams{
+              {STREAM_RENDERER_PARAM_USER_DATA,
+               static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&cookie))},
+              {STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK,
+               static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&sWriteFence))},
+              {STREAM_RENDERER_PARAM_RENDERER_FLAGS, surfacelessFlags},
+              {STREAM_RENDERER_PARAM_WIN0_WIDTH, width},
+              {STREAM_RENDERER_PARAM_WIN0_HEIGHT, height}
+          },
+          minimumRequiredParams{
+              {STREAM_RENDERER_PARAM_USER_DATA,
+               static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&cookie))},
+              {STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK,
+               static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&sWriteFence))},
+              {STREAM_RENDERER_PARAM_RENDERER_FLAGS, surfacelessFlags}
+          }{}
 
     static void SetUpTestSuite() {
+        android::emulation::injectGraphicsAgents(android::emulation::MockGraphicsAgentFactory());
         if (useWindow) {
             window.reset(CreateOSWindow());
         }
@@ -68,6 +80,8 @@ protected:
     }
 
     void TearDown() override {
+        // Ensure background threads aren't mid-initialization.
+        sleepMs(100);
         if (useWindow) {
             window->destroy();
         }
@@ -81,28 +95,27 @@ const bool GfxStreamBackendTest::useWindow =
         android::base::getEnvironmentVariable("ANDROID_EMU_TEST_WITH_WINDOW") == "1";
 
 TEST_F(GfxStreamBackendTest, Init) {
-    gfxstream_backend_init(width, height, 0, &cookie,
-                           GFXSTREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT |
-                                   GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT,
-                           &callbacks, &gfxstreamcallbacks);
+    stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
 }
 
 TEST_F(GfxStreamBackendTest, InitOpenGLWindow) {
     if (!useWindow) {
         return;
     }
-    gfxstream_backend_init(width, height, 0, &cookie,
-                           GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT, &callbacks,
-                           &gfxstreamcallbacks);
+
+    std::vector<stream_renderer_param> glParams = streamRendererParams;
+    for (auto& param: glParams) {
+        if (param.key == STREAM_RENDERER_PARAM_RENDERER_FLAGS) {
+            param.value = rendererFlags;
+        }
+    }
+    stream_renderer_init(glParams.data(), glParams.size());
     gfxstream_backend_setup_window(window->getFramebufferNativeWindow(), 0, 0,
                                        width, height, width, height);
 }
 
 TEST_F(GfxStreamBackendTest, SimpleFlush) {
-    gfxstream_backend_init(width, height, 0, &cookie,
-                           GFXSTREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT |
-                                   GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT,
-                           &callbacks, &gfxstreamcallbacks);
+    stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
 
     const uint32_t res_id = 8;
     struct virgl_renderer_resource_create_args create_resource_args = {
@@ -131,10 +144,7 @@ TEST_F(GfxStreamBackendTest, SimpleFlush) {
 
 // Tests compile and link only.
 TEST_F(GfxStreamBackendTest, DISABLED_ApiCallLinkTest) {
-    gfxstream_backend_init(width, height, 0, &cookie,
-            GFXSTREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT |
-            GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT,
-            &callbacks, &gfxstreamcallbacks);
+    stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
 
     const uint32_t res_id = 8;
     struct virgl_renderer_resource_create_args create_resource_args = {
@@ -181,4 +191,29 @@ TEST_F(GfxStreamBackendTest, DISABLED_ApiCallLinkTest) {
     pipe_virgl_renderer_ctx_attach_resource(0, 0);
     pipe_virgl_renderer_ctx_detach_resource(0, 0);
     pipe_virgl_renderer_resource_get_info(0, 0);
+}
+
+TEST_F(GfxStreamBackendTest, MinimumRequiredParameters) {
+    // Only the minimum required parameters.
+    int initResult =
+        stream_renderer_init(minimumRequiredParams.data(), minimumRequiredParams.size());
+    EXPECT_EQ(initResult, 0);
+}
+
+TEST_F(GfxStreamBackendTest, MissingRequiredParameter) {
+    for (size_t i = 0; i < minimumRequiredParams.size(); ++i) {
+        // For each parameter, remove it and try to init, expecting failure.
+        std::vector<stream_renderer_param> insufficientParams = minimumRequiredParams;
+        insufficientParams.erase(insufficientParams.begin() + i);
+        int initResult = stream_renderer_init(insufficientParams.data(), insufficientParams.size());
+        EXPECT_EQ(initResult, -1);
+
+        // Ensure background threads aren't mid-initialization.
+        sleepMs(100);
+        gfxstream_backend_teardown();
+    }
+
+    // Initialize once more for the teardown function.
+    int initResult = stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
+    EXPECT_EQ(initResult, 0);
 }
