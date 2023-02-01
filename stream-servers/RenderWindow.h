@@ -17,9 +17,9 @@
 
 #include "render_api.h"
 
-#include "base/MessageChannel.h"
-#include "base/FunctorThread.h"
-#include "base/Thread.h"
+#include "aemu/base/synchronization/MessageChannel.h"
+#include "aemu/base/threads/FunctorThread.h"
+#include "aemu/base/threads/Thread.h"
 
 class RenderWindowChannel;
 struct RenderWindowMessage;
@@ -144,6 +144,12 @@ public:
 
     void setPaused(bool paused);
 
+    void addListener(emugl::Renderer::FrameBufferChangeEventListener* listener);
+    void removeListener(emugl::Renderer::FrameBufferChangeEventListener* listener);
+
+    void setVsyncHz(int vsyncHz);
+    void setDisplayConfigs(int configId, int w, int h, int dpiX, int dpiY);
+    void setDisplayActiveConfig(int configId);
 private:
     bool processMessage(const RenderWindowMessage& msg);
     bool useThread() const { return mThread != nullptr; }
