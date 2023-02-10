@@ -139,6 +139,15 @@ struct InitializedGlobals {
     android::base::Lock lock;
     android::base::ConditionVariable condVar;
 };
+
+bool postOnlyOnMainThread() {
+#ifdef __APPLE__
+    return true;
+#else
+    return false;
+#endif
+}
+
 }  // namespace
 
 // |sInitialized| caches the initialized framebuffer state - this way
@@ -166,45 +175,6 @@ void FrameBuffer::waitUntilInitialized() {
     printf("Waited for FrameBuffer initialization for %.03f ms\n",
            (android::base::getHighResTimeUs() - startTime) / 1000.0);
 #endif
-}
-
-void FrameBuffer::finalize() {
-    AutoLock lock(sGlobals()->lock);
-    AutoLock fbLock(m_lock);
-    m_perfStats = false;
-    m_perfThread->wait(NULL);
-    sInitialized.store(true, std::memory_order_relaxed);
-    sGlobals()->condVar.broadcastAndUnlock(&lock);
-
-    for (auto it : m_platformEglContexts) {
-        destroySharedTrivialContext(it.second.context, it.second.surface);
-    }
-
-    if (m_shuttingDown) {
-        // The only visible thing in the framebuffer is subwindow. Everything else
-        // will get cleaned when the process exits.
-        if (m_useSubWindow) {
-            m_postWorker.reset();
-            removeSubWindow_locked();
-        }
-        return;
-    }
-
-    sweepColorBuffersLocked();
-
-    m_buffers.clear();
-    {
-        AutoLock lock(m_colorBufferMapLock);
-        m_colorbuffers.clear();
-    }
-    m_colorBufferDelayedCloseList.clear();
-    if (m_useSubWindow) {
-        removeSubWindow_locked();
-    }
-    m_windows.clear();
-    m_contexts.clear();
-
-    m_readbackThread.enqueue({ReadbackCmd::Exit});
 }
 
 bool FrameBuffer::initialize(int width, int height, bool useSubWindow, bool egl2egl) {
@@ -313,11 +283,9 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow, bool egl2
             .useVulkanComposition = fb->m_useVulkanComposition,
             .useVulkanNativeSwapchain = feature_is_enabled(kFeature_VulkanNativeSwapchain),
             .guestRenderDoc = std::move(renderDocMultipleVkInstances),
-            .astcLdrEmulationMode = feature_is_enabled(kFeature_VulkanAstcLdrEmulation)
-                                        ? AstcEmulationMode::Auto
-                                        : AstcEmulationMode::Disabled,
-            .enableEtc2Emulation = feature_is_enabled(kFeature_VulkanEtc2Emulation),
-            .enableYcbcrEmulation = feature_is_enabled(kFeature_VulkanYcbcrEmulation),
+            .astcLdrEmulationMode = AstcEmulationMode::Auto,
+            .enableEtc2Emulation = true,
+            .enableYcbcrEmulation = false,
             .guestUsesAngle = fb->m_guestUsesAngle,
         });
 
@@ -447,7 +415,7 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow, bool egl2
     // swapchain, then don't initialize SyncThread worker threads with EGL
     // contexts.
     SyncThread::initialize(
-        /* noGL */ fb->m_displayVk != nullptr, fb->getHealthMonitor());
+        /* hasGL */ fb->m_emulationGl != nullptr, fb->getHealthMonitor());
 
     // Start the vsync thread
     const uint64_t kOneSecondNs = 1000000000ULL;
@@ -465,6 +433,14 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow, bool egl2
 
     // Nothing else to do - we're ready to rock!
     return true;
+}
+
+void FrameBuffer::finalize() {
+    FrameBuffer* fb = s_theFrameBuffer;
+    s_theFrameBuffer = nullptr;
+    if (fb) {
+        delete fb;
+    }
 }
 
 bool FrameBuffer::importMemoryToColorBuffer(ManagedDescriptor externalDescriptor, uint64_t size,
@@ -534,27 +510,47 @@ FrameBuffer::FrameBuffer(int p_width, int p_height, bool useSubWindow)
 }
 
 FrameBuffer::~FrameBuffer() {
-    finalize();
+    AutoLock fbLock(m_lock);
 
-    m_postThread.enqueue({
-        PostCmd::Exit,
-    });
+    m_perfStats = false;
+    m_perfThread->wait(NULL);
+
+    m_postThread.enqueue({PostCmd::Exit});
+    m_postThread.join();
+    m_postWorker.reset();
+
+    if (m_useSubWindow) {
+        removeSubWindow_locked();
+    }
+
+    m_readbackThread.enqueue({ReadbackCmd::Exit});
+    m_readbackThread.join();
+
+    m_vsyncThread.reset();
 
     delete m_perfThread;
 
-    if (s_theFrameBuffer) {
-        s_theFrameBuffer = nullptr;
+    SyncThread::destroy();
+
+    sweepColorBuffersLocked();
+
+    m_buffers.clear();
+    {
+        AutoLock lock(m_colorBufferMapLock);
+        m_colorbuffers.clear();
     }
-    sInitialized.store(false, std::memory_order_relaxed);
+    m_colorBufferDelayedCloseList.clear();
 
-    m_readbackThread.join();
-    m_postThread.join();
+    m_windows.clear();
+    m_contexts.clear();
 
-    m_postWorker.reset();
-    m_vsyncThread.reset();
+    for (auto it : m_platformEglContexts) {
+        destroySharedTrivialContext(it.second.context, it.second.surface);
+    }
 
     goldfish_vk::teardownGlobalVkEmulation();
-    SyncThread::destroy();
+
+    sInitialized.store(false, std::memory_order_relaxed);
 }
 
 WorkerProcessingResult
@@ -656,11 +652,7 @@ WorkerProcessingResult FrameBuffer::postWorkerFunc(Post& post) {
 }
 
 std::future<void> FrameBuffer::sendPostWorkerCmd(Post post) {
-#ifdef __APPLE__
-    bool postOnlyOnMainThread = true;
-#else
-    bool postOnlyOnMainThread = false;
-#endif
+    bool postOnlyOnMainThread = ::postOnlyOnMainThread();
     bool expectedPostThreadStarted = false;
     if (m_postThreadStarted.compare_exchange_strong(expectedPostThreadStarted, true)) {
         if (m_emulationGl) {
@@ -2215,7 +2207,12 @@ bool FrameBuffer::bindColorBufferToTexture(HandleType p_colorbuffer) {
 }
 
 bool FrameBuffer::bindColorBufferToTexture2(HandleType p_colorbuffer) {
-    AutoLock mutex(m_lock);
+    // This is only called when using multi window display
+    // It will deadlock when posting from main thread.
+    std::unique_ptr<AutoLock> mutex;
+    if (!postOnlyOnMainThread()) {
+        mutex = std::make_unique<AutoLock>(m_lock);
+    }
 
     ColorBufferPtr colorBuffer = findColorBuffer(p_colorbuffer);
     if (!colorBuffer) {

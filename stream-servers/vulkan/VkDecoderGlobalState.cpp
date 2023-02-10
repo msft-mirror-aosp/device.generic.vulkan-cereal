@@ -1354,6 +1354,21 @@ class VkDecoderGlobalState::Impl {
         *pQueue = (VkQueue)queueInfo->boxed;
     }
 
+    void on_vkGetDeviceQueue2(android::base::BumpPool* pool, VkDevice boxed_device,
+                              const VkDeviceQueueInfo2* pQueueInfo, VkQueue* pQueue) {
+        // Protected memory is not supported on emulators. So we should
+        // not return any queue if a client requests a protected device
+        // queue.
+        if (pQueueInfo->flags & VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT) {
+            *pQueue = VK_NULL_HANDLE;
+            fprintf(stderr, "%s: Cannot get protected Vulkan device queue\n", __func__);
+            return;
+        }
+        uint32_t queueFamilyIndex = pQueueInfo->queueFamilyIndex;
+        uint32_t queueIndex = pQueueInfo->queueIndex;
+        on_vkGetDeviceQueue(pool, boxed_device, queueFamilyIndex, queueIndex, pQueue);
+    }
+
     void destroyDeviceLocked(VkDevice device, const VkAllocationCallbacks* pAllocator) {
         auto* deviceInfo = android::base::find(mDeviceInfo, device);
         if (!deviceInfo) return;
@@ -1622,6 +1637,41 @@ class VkDecoderGlobalState::Impl {
             return VK_SUCCESS;
         }
         return cmpInfo.bindCompressedMipmapsMemory(vk, memory, memoryOffset);
+    }
+
+    VkResult on_vkBindImageMemory2(android::base::BumpPool* pool, VkDevice boxed_device,
+                                   uint32_t bindInfoCount,
+                                   const VkBindImageMemoryInfo* pBindInfos) {
+        auto device = unbox_VkDevice(boxed_device);
+        auto vk = dispatch_VkDevice(boxed_device);
+        bool needEmulation = false;
+
+        auto* deviceInfo = android::base::find(mDeviceInfo, device);
+        if (!deviceInfo) return VK_ERROR_UNKNOWN;
+
+        for (uint32_t i = 0; i < bindInfoCount; i++) {
+            auto* imageInfo = android::base::find(mImageInfo, pBindInfos[i].image);
+            if (!imageInfo) return VK_ERROR_UNKNOWN;
+
+            if (deviceInfo->needEmulatedDecompression(imageInfo->cmpInfo)) {
+                needEmulation = true;
+                break;
+            }
+        }
+
+        if (needEmulation) {
+            VkResult result;
+            for (uint32_t i = 0; i < bindInfoCount; i++) {
+                result = on_vkBindImageMemory(pool, boxed_device, pBindInfos[i].image,
+                                              pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+
+                if (result != VK_SUCCESS) return result;
+            }
+
+            return VK_SUCCESS;
+        }
+
+        return vk->vkBindImageMemory2(device, bindInfoCount, pBindInfos);
     }
 
     VkResult on_vkCreateImageView(android::base::BumpPool* pool, VkDevice boxed_device,
@@ -6293,6 +6343,12 @@ void VkDecoderGlobalState::on_vkGetDeviceQueue(android::base::BumpPool* pool, Vk
     mImpl->on_vkGetDeviceQueue(pool, device, queueFamilyIndex, queueIndex, pQueue);
 }
 
+void VkDecoderGlobalState::on_vkGetDeviceQueue2(android::base::BumpPool* pool, VkDevice device,
+                                                const VkDeviceQueueInfo2* pQueueInfo,
+                                                VkQueue* pQueue) {
+    mImpl->on_vkGetDeviceQueue2(pool, device, pQueueInfo, pQueue);
+}
+
 void VkDecoderGlobalState::on_vkDestroyDevice(android::base::BumpPool* pool, VkDevice device,
                                               const VkAllocationCallbacks* pAllocator) {
     mImpl->on_vkDestroyDevice(pool, device, pAllocator);
@@ -6346,6 +6402,18 @@ VkResult VkDecoderGlobalState::on_vkBindImageMemory(android::base::BumpPool* poo
                                                     VkImage image, VkDeviceMemory memory,
                                                     VkDeviceSize memoryOffset) {
     return mImpl->on_vkBindImageMemory(pool, device, image, memory, memoryOffset);
+}
+
+VkResult VkDecoderGlobalState::on_vkBindImageMemory2(android::base::BumpPool* pool, VkDevice device,
+                                                     uint32_t bindInfoCount,
+                                                     const VkBindImageMemoryInfo* pBindInfos) {
+    return mImpl->on_vkBindImageMemory2(pool, device, bindInfoCount, pBindInfos);
+}
+
+VkResult VkDecoderGlobalState::on_vkBindImageMemory2KHR(android::base::BumpPool* pool,
+                                                        VkDevice device, uint32_t bindInfoCount,
+                                                        const VkBindImageMemoryInfo* pBindInfos) {
+    return mImpl->on_vkBindImageMemory2(pool, device, bindInfoCount, pBindInfos);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateImageView(android::base::BumpPool* pool, VkDevice device,

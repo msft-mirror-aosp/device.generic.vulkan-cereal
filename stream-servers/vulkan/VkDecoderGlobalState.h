@@ -189,6 +189,9 @@ class VkDecoderGlobalState {
     void on_vkGetDeviceQueue(android::base::BumpPool* pool, VkDevice device,
                              uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue* pQueue);
 
+    void on_vkGetDeviceQueue2(android::base::BumpPool* pool, VkDevice device,
+                              const VkDeviceQueueInfo2* pQueueInfo, VkQueue* pQueue);
+
     void on_vkDestroyDevice(android::base::BumpPool* pool, VkDevice device,
                             const VkAllocationCallbacks* pAllocator);
 
@@ -217,6 +220,11 @@ class VkDecoderGlobalState {
 
     VkResult on_vkBindImageMemory(android::base::BumpPool* pool, VkDevice device, VkImage image,
                                   VkDeviceMemory memory, VkDeviceSize memoryOffset);
+    VkResult on_vkBindImageMemory2(android::base::BumpPool* pool, VkDevice device,
+                                   uint32_t bindInfoCount, const VkBindImageMemoryInfo* pBindInfos);
+    VkResult on_vkBindImageMemory2KHR(android::base::BumpPool* pool, VkDevice device,
+                                      uint32_t bindInfoCount,
+                                      const VkBindImageMemoryInfo* pBindInfos);
 
     VkResult on_vkCreateImageView(android::base::BumpPool* pool, VkDevice device,
                                   const VkImageViewCreateInfo* pCreateInfo,
