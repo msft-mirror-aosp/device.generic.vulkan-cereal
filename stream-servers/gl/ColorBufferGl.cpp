@@ -1031,6 +1031,8 @@ bool ColorBufferGl::importMemory(ManagedDescriptor externalDescriptor, uint64_t 
     readContents(&bytes, prevContents.data());
 
     s_gles2.glDeleteTextures(1, &m_tex);
+    s_gles2.glDeleteFramebuffers(1, &m_fbo);
+    m_fbo = 0;
     s_egl.eglDestroyImageKHR(m_display, m_eglImage);
 
     s_gles2.glGenTextures(1, &m_tex);
