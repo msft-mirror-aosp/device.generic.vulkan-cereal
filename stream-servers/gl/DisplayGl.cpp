@@ -17,6 +17,8 @@
 #include "DisplaySurfaceGl.h"
 #include "OpenGLESDispatch/DispatchTables.h"
 #include "OpenGLESDispatch/EGLDispatch.h"
+#include "TextureDraw.h"
+#include "host-common/logging.h"
 
 namespace {
 
@@ -44,17 +46,25 @@ std::shared_future<void> DisplayGl::post(const Post& post) {
         }
     }
 
+    bool hasDrawLayer = false;
     for (const PostLayer& layer : post.layers) {
         if (layer.layerOptions) {
-            layer.colorBuffer->postLayer(*layer.layerOptions,
-                                         post.frameWidth,
-                                         post.frameHeight);
+            if (!hasDrawLayer) {
+                mTextureDraw->prepareForDrawLayer();
+                hasDrawLayer = true;
+            }
+            layer.colorBuffer->glOpPostLayer(*layer.layerOptions, post.frameWidth,
+                                             post.frameHeight);
         } else if (layer.overlayOptions) {
-            layer.colorBuffer->postWithOverlay(layer.colorBuffer->getViewportScaledTexture(),
-                                               layer.overlayOptions->rotation,
-                                               layer.overlayOptions->dx,
-                                               layer.overlayOptions->dy);
+            if (hasDrawLayer) {
+                ERR("Cannot mix colorBuffer.postLayer with postWithOverlay!");
+            }
+            layer.colorBuffer->glOpPostViewportScaledWithOverlay(
+                layer.overlayOptions->rotation, layer.overlayOptions->dx, layer.overlayOptions->dy);
         }
+    }
+    if (hasDrawLayer) {
+        mTextureDraw->cleanupForDrawLayer();
     }
 
     s_egl.eglSwapBuffers(surfaceGl->mDisplay, surfaceGl->mSurface);

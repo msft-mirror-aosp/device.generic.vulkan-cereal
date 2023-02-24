@@ -14,21 +14,21 @@
 
 #pragma once
 
-#include <atomic>
-#include <future>
-
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
+#include <atomic>
+#include <future>
+
+#include "ColorBuffer.h"
 #include "Display.h"
 #include "Hwc2.h"
-#include "gl/ColorBufferGl.h"
 
 class DisplayGl : public gfxstream::Display {
   public:
-    DisplayGl() {}
+    DisplayGl(TextureDraw* textureDraw): mTextureDraw(textureDraw) {}
     ~DisplayGl() {}
 
     // If false, this display will use the existing bound context when
@@ -66,6 +66,7 @@ class DisplayGl : public gfxstream::Display {
 
   protected:
     void bindToSurfaceImpl(gfxstream::DisplaySurface* surface) override {}
+    void surfaceUpdated(gfxstream::DisplaySurface* surface) override{} ;
     void unbindFromSurfaceImpl() override {}
 
   private:
@@ -73,4 +74,5 @@ class DisplayGl : public gfxstream::Display {
     int mViewportHeight = 0;
 
     std::atomic_bool mUseBoundSurfaceContext{true};
+    TextureDraw* mTextureDraw = nullptr;
 };

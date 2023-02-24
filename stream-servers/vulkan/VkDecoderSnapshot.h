@@ -53,7 +53,7 @@ class VkDecoderSnapshot {
 
     void save(android::base::Stream* stream);
     void load(android::base::Stream* stream, emugl::GfxApiLogger& gfx_logger,
-              emugl::HealthMonitor<>& healthMonitor);
+              emugl::HealthMonitor<>* healthMonitor);
 #ifdef VK_VERSION_1_0
     void vkCreateInstance(const uint8_t* snapshotTraceBegin, size_t snapshotTraceBytes,
                           android::base::BumpPool* pool, VkResult input_result,
@@ -2684,6 +2684,12 @@ class VkDecoderSnapshot {
                                                      uint32_t waitSemaphoreCount,
                                                      const VkSemaphore* pWaitSemaphores,
                                                      VkImage image);
+    void vkQueueFlushCommandsFromAuxMemoryGOOGLE(const uint8_t* snapshotTraceBegin,
+                                                 size_t snapshotTraceBytes,
+                                                 android::base::BumpPool* pool, VkQueue queue,
+                                                 VkCommandBuffer commandBuffer,
+                                                 VkDeviceMemory deviceMemory,
+                                                 VkDeviceSize dataOffset, VkDeviceSize dataSize);
 #endif
 #ifdef VK_EXT_global_priority_query
 #endif

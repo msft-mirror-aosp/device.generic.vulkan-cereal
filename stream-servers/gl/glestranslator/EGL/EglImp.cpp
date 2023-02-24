@@ -300,7 +300,7 @@ EGLAPI EGLDisplay EGLAPIENTRY eglGetDisplay(EGLNativeDisplayType display_id) {
 
 extern "C" {
 GLESiface* static_translator_glescm_getIfaces(const EGLiface*);
-GL_APICALL GLESiface* GL_APIENTRY static_translator_glesv2_getIfaces(const EGLiface*);
+GLESiface* static_translator_glesv2_getIfaces(const EGLiface*);
 }; // extern "C"
 
 #define STATIC_TRANSLATOR_GETIFACE_NAME_GLES_CM static_translator_glescm_getIfaces
@@ -1335,6 +1335,9 @@ EGLAPI EGLBoolean EGLAPIENTRY eglReleaseThread(void) {
     MEM_TRACE("EMUGL");
     ThreadInfo* thread  = getThreadInfo();
     EglDisplay* dpy     = static_cast<EglDisplay*>(thread->eglDisplay);
+    if (!dpy) {
+        return EGL_TRUE;
+    }
     if (!translator::egl::eglMakeCurrent(dpy,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT)) {
         return EGL_FALSE;
     }
@@ -1477,9 +1480,10 @@ EGLAPI EGLBoolean EGLAPIENTRY eglDestroyImageKHR(EGLDisplay display, EGLImageKHR
 
 EGLAPI EGLSyncKHR EGLAPIENTRY eglCreateSyncKHR(EGLDisplay dpy, EGLenum type, const EGLint* attrib_list) {
     MEM_TRACE("EMUGL");
-    // swiftshader_indirect does not work with eglCreateSyncKHR
-    // Disable it before we figure out a proper fix in swiftshader
+    // swiftshader_indirect used to have a bug with eglCreateSyncKHR
+    // but it seems to have been fixed now.
     // BUG: 65587659
+    // BUG: 246740239
     if (!g_eglInfo->isEgl2EglSyncSafeToUse()) {
         return (EGLSyncKHR)0x42;
     }
@@ -1745,9 +1749,7 @@ EGLAPI EGLBoolean EGLAPIENTRY eglPostLoadAllImages(EGLDisplay display, EGLStream
 EGLAPI void EGLAPIENTRY eglUseOsEglApi(EGLBoolean enable, EGLBoolean nullEgl) {
     MEM_TRACE("EMUGL");
     EglGlobalInfo::setEgl2Egl(enable, nullEgl == EGL_TRUE);
-    bool safeToUse = android::base::getEnvironmentVariable("ANDROID_GFXSTREAM_EGL") == "1";
-    EglGlobalInfo::setEgl2EglSyncSafeToUse(
-        safeToUse ? EGL_TRUE : EGL_FALSE);
+    EglGlobalInfo::setEgl2EglSyncSafeToUse(EGL_TRUE);
 }
 
 EGLAPI void EGLAPIENTRY eglSetMaxGLESVersion(EGLint version) {

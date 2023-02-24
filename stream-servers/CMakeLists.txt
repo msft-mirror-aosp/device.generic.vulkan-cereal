@@ -13,10 +13,11 @@ add_subdirectory(renderControl_dec)
 
 # Stream server core
 set(stream-server-core-sources
+    ColorBuffer.cpp
     GfxStreamAgents.cpp
     VirtioGpuTimelines.cpp
+    VsyncThread.cpp
     ChannelStream.cpp
-    Debug.cpp
     DisplaySurface.cpp
     DisplaySurfaceUser.cpp
     Hwc2.cpp
@@ -74,6 +75,9 @@ target_include_directories(
         ${GFXSTREAM_REPO_ROOT}/stream-servers/vulkan
         ${GFXSTREAM_REPO_ROOT}/third-party/glm/include)
 
+if (APPLE)
+    target_link_libraries(gfxstream_backend_static PUBLIC "-framework AppKit -framework QuartzCore")
+endif()
 if (WIN32)
     target_link_libraries(gfxstream_backend_static PRIVATE D3d9.lib)
 endif()
@@ -128,6 +132,22 @@ android_install_shared(gfxstream_backend)
 add_subdirectory(testlibs)
 
 if (ENABLE_VKCEREAL_TESTS)
+
+set(LIST_OF_TESTS)
+function(discover_tests test_name)
+if (WIN32)
+    gtest_discover_tests(
+        ${test_name}
+        ${ARGN})
+    list(APPEND LIST_OF_TESTS ${test_name})
+    set(LIST_OF_TESTS ${LIST_OF_TESTS} PARENT_SCOPE)
+else()
+    gtest_discover_tests(
+        ${test_name}
+        ${ARGN}
+    )
+endif()
+endfunction()
     # Backend unit tests
     add_executable(
         gfxstream_backend_unittests
@@ -140,7 +160,7 @@ if (ENABLE_VKCEREAL_TESTS)
         aemu-host-common-testing-support
         ${GFXSTREAM_BASE_LIB}
         gtest_main)
-    gtest_discover_tests(gfxstream_backend_unittests)
+        discover_tests(gfxstream_backend_unittests)
 
     # More functional tests#########################################################
 
@@ -193,7 +213,8 @@ if (ENABLE_VKCEREAL_TESTS)
         tests/GLES1Dispatch_unittest.cpp
         tests/DefaultFramebufferBlit_unittest.cpp
         tests/TextureDraw_unittest.cpp
-        tests/StalePtrRegistry_unittest.cpp)
+        tests/StalePtrRegistry_unittest.cpp
+        tests/VsyncThread_unittest.cpp)
     target_link_libraries(
         OpenglRender_unittests
         PRIVATE
@@ -203,11 +224,14 @@ if (ENABLE_VKCEREAL_TESTS)
         gfxstream_backend_static
         gtest_main)
     if (LINUX)
+        target_compile_definitions(
+            OpenglRender_unittests
+            PRIVATE GFXSTREAM_HAS_X11=1)
         target_link_libraries(
             OpenglRender_unittests
             PRIVATE x11_testing_support)
     endif()
-    gtest_discover_tests(OpenglRender_unittests)
+    discover_tests(OpenglRender_unittests)
 
     # Snapshot tests################################################################
     add_executable(
@@ -235,7 +259,7 @@ if (ENABLE_VKCEREAL_TESTS)
         aemu-base-testing-support
         gfxstream_backend_static
         gtest_main)
-    gtest_discover_tests(OpenglRender_snapshot_unittests)
+    discover_tests(OpenglRender_snapshot_unittests)
 
     # Vulkan tests##################################################################
     add_executable(
@@ -249,7 +273,6 @@ if (ENABLE_VKCEREAL_TESTS)
         vulkan/VkFormatUtils_unittest.cpp
         vulkan/VkQsriTimeline_unittest.cpp
         vulkan/VkDecoderGlobalState_unittest.cpp
-        vulkan/emulated_textures/CompressedImageInfo_unittest.cpp
     )
     target_link_libraries(
         Vulkan_unittests
@@ -265,9 +288,10 @@ if (ENABLE_VKCEREAL_TESTS)
         target_compile_definitions(Vulkan_unittests PRIVATE -DVK_USE_PLATFORM_METAL_EXT)
         target_link_libraries(Vulkan_unittests PUBLIC "-framework AppKit")
     endif()
-    gtest_discover_tests(
-        Vulkan_unittests
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    discover_tests(
+            Vulkan_unittests
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
     if (APPLE)
         target_compile_definitions(Vulkan_unittests PRIVATE -DVK_USE_PLATFORM_METAL_EXT)
     elseif (UNIX)
@@ -282,4 +306,26 @@ if (ENABLE_VKCEREAL_TESTS)
                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
                             ${Vulkan_unittests_datafiles}
                             ${CMAKE_BINARY_DIR}/tests/testdata)
+
+    add_executable(
+            Vulkan_integrationtests
+            vulkan/testing/VkDecoderTestDispatch.h
+            vulkan/testing/VulkanTestHelper.cpp
+    )
+    target_link_libraries(
+            Vulkan_integrationtests
+            PRIVATE
+            gfxstream_backend_static
+            gfxstream-gl-server
+            gfxstream-vulkan-server
+            stream-server-testing-support
+            gtest
+            gtest_main
+            gmock)
+    discover_tests(Vulkan_integrationtests)
+endif()
+if (WIN32)
+    set(BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+    configure_file(../cmake/SetWin32TestEnvironment.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/SetWin32TestEnvironment.cmake @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES ${CMAKE_CURRENT_BINARY_DIR}/SetWin32TestEnvironment.cmake)
 endif()

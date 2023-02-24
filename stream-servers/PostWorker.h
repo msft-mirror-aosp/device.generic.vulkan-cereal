@@ -63,8 +63,8 @@ class PostWorker {
     // if there is no last posted color buffer to show yet.
     void clear();
 
-    void screenshot(ColorBuffer* cb, int screenwidth, int screenheight,
-                    GLenum format, GLenum type, int skinRotation, void* pixels);
+    void screenshot(ColorBuffer* cb, int screenwidth, int screenheight, GLenum format, GLenum type,
+                    int skinRotation, void* pixels, emugl::Rect rect);
 
     // The block task will set the scheduledSignal promise when the task is scheduled, and wait
     // until continueSignal is ready before completes.
@@ -73,6 +73,7 @@ class PostWorker {
    private:
     // Impl versions of the above, so we can run it from separate threads
     std::shared_future<void> postImpl(ColorBuffer* cb);
+    DisplayGl::PostLayer postWithOverlay(ColorBuffer* cb);
     void viewportImpl(int width, int height);
     std::shared_future<void> composeImpl(const FlatComposeRequest& composeRequest);
     void clearImpl();

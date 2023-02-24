@@ -447,7 +447,7 @@ std::unique_ptr<EmulationGl> EmulationGl::create(uint32_t width, uint32_t height
     emulationGl->mCompositorGl = std::make_unique<CompositorGl>(emulationGl->mTextureDraw.get());
     emulationGl->mCompositorGl->bindToSurface(emulationGl->mFakeWindowSurface.get());
 
-    emulationGl->mDisplayGl = std::make_unique<DisplayGl>();
+    emulationGl->mDisplayGl = std::make_unique<DisplayGl>(emulationGl->mTextureDraw.get());
     emulationGl->mDisplayGl->bindToSurface(emulationGl->mFakeWindowSurface.get());
 
     {
@@ -489,13 +489,16 @@ EmulationGl::~EmulationGl() {
     }
 
     if (mPbufferSurface) {
-        const auto* displaySurfaceGl =
-            reinterpret_cast<const DisplaySurfaceGl*>(mPbufferSurface->getImpl());
-
-        RecursiveScopedContextBind contextBind(displaySurfaceGl->getContextHelper());
-        if (!contextBind.isOk()) {
-            mTextureDraw.reset();
-        }
+        // TODO(b/267349580): remove after Mac issue fixed.
+        mTextureDraw.release();
+        // const auto* displaySurfaceGl =
+        //    reinterpret_cast<const DisplaySurfaceGl*>(mPbufferSurface->getImpl());
+        // RecursiveScopedContextBind contextBind(displaySurfaceGl->getContextHelper());
+        // if (contextBind.isOk()) {
+        //     mTextureDraw.reset();
+        // } else {
+        //     ERR("Failed to bind context for destroying TextureDraw.");
+        // }
     }
 
     if (mEglDisplay != EGL_NO_DISPLAY) {
@@ -551,6 +554,8 @@ void EmulationGl::getGlesVersion(GLint* major, GLint* minor) const {
     }
 }
 
+bool EmulationGl::isMesa() const { return mGlesVersion.find("Mesa") != std::string::npos; }
+
 bool EmulationGl::isFastBlitSupported() const {
     return mFastBlitSupported;
 }
@@ -589,6 +594,29 @@ void EmulationGl::setUseBoundSurfaceContextForDisplay(bool use) {
     if (mCompositorGl) {
         mCompositorGl->setUseBoundSurfaceContext(use);
     }
+}
+
+ContextHelper* EmulationGl::getColorBufferContextHelper() {
+    if (!mPbufferSurface) {
+        return nullptr;
+    }
+
+    const auto* surfaceGl = static_cast<const DisplaySurfaceGl*>(mPbufferSurface->getImpl());
+    return surfaceGl->getContextHelper();
+}
+
+std::unique_ptr<ColorBufferGl> EmulationGl::createColorBuffer(uint32_t width, uint32_t height,
+                                                              GLenum internalFormat,
+                                                              FrameworkFormat frameworkFormat,
+                                                              HandleType handle) {
+    return ColorBufferGl::create(mEglDisplay, width, height, internalFormat, frameworkFormat,
+                                 handle, getColorBufferContextHelper(), mTextureDraw.get(),
+                                 isFastBlitSupported());
+}
+
+std::unique_ptr<ColorBufferGl> EmulationGl::loadColorBuffer(android::base::Stream* stream) {
+    return ColorBufferGl::onLoad(stream, mEglDisplay, getColorBufferContextHelper(),
+                                 mTextureDraw.get(), isFastBlitSupported());
 }
 
 std::unique_ptr<EmulatedEglContext> EmulationGl::createEmulatedEglContext(
@@ -631,10 +659,9 @@ std::unique_ptr<EmulatedEglFenceSync> EmulationGl::createEmulatedEglFenceSync(
 std::unique_ptr<EmulatedEglImage> EmulationGl::createEmulatedEglImage(
         EmulatedEglContext* context,
         EGLenum target,
-        EGLClientBuffer buffer,
-        HandleType handle) {
+        EGLClientBuffer buffer) {
     EGLContext eglContext = context ? context->getEGLContext() : EGL_NO_CONTEXT;
-    return EmulatedEglImage::create(mEglDisplay, eglContext, target, buffer, handle);
+    return EmulatedEglImage::create(mEglDisplay, eglContext, target, buffer);
 }
 
 std::unique_ptr<EmulatedEglWindowSurface> EmulationGl::createEmulatedEglWindowSurface(

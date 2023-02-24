@@ -151,6 +151,13 @@ AEMU_EXPORT struct AndroidVirtioGpuOps* android_getVirtioGpuOps(void);
 AEMU_EXPORT const void* android_getEGLDispatch();
 AEMU_EXPORT const void* android_getGLESv2Dispatch();
 
+/* Set vsync rate at runtime */
+AEMU_EXPORT void android_setVsyncHz(int vsyncHz);
+
+AEMU_EXPORT void android_setOpenglesDisplayConfigs(int configId, int w, int h,
+                                                   int dpiX, int dpiY);
+AEMU_EXPORT void android_setOpenglesDisplayActiveConfig(int configId);
+
 #ifndef USING_ANDROID_BP
 ANDROID_END_HEADER
 #endif

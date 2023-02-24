@@ -47,7 +47,7 @@ class VkDecoderSnapshot::Impl {
     void save(android::base::Stream* stream) { mReconstruction.save(stream); }
 
     void load(android::base::Stream* stream, GfxApiLogger& gfx_logger,
-              HealthMonitor<>& healthMonitor) {
+              HealthMonitor<>* healthMonitor) {
         mReconstruction.load(stream, gfx_logger, healthMonitor);
     }
 
@@ -1367,6 +1367,18 @@ class VkDecoderSnapshot::Impl {
                            android::base::BumpPool* pool, VkDevice device,
                            const VkDeviceQueueInfo2* pQueueInfo, VkQueue* pQueue) {
         // TODO: Implement
+        android::base::AutoLock lock(mLock);
+        // pQueue create
+        mReconstruction.addHandles((const uint64_t*)pQueue, 1);
+        mReconstruction.addHandleDependency((const uint64_t*)pQueue, 1,
+                                            (uint64_t)(uintptr_t)device);
+        if (!pQueue) return;
+        auto apiHandle = mReconstruction.createApiInfo();
+        auto apiInfo = mReconstruction.getApiInfo(apiHandle);
+        mReconstruction.setApiTrace(apiInfo, OP_vkGetDeviceQueue2, snapshotTraceBegin,
+                                    snapshotTraceBytes);
+        mReconstruction.forEachHandleAddApi((const uint64_t*)pQueue, 1, apiHandle);
+        mReconstruction.setCreatedHandlesForApi(apiHandle, (const uint64_t*)pQueue, 1);
     }
     void vkCreateSamplerYcbcrConversion(const uint8_t* snapshotTraceBegin,
                                         size_t snapshotTraceBytes, android::base::BumpPool* pool,
@@ -4331,6 +4343,14 @@ class VkDecoderSnapshot::Impl {
                                                      VkImage image) {
         // TODO: Implement
     }
+    void vkQueueFlushCommandsFromAuxMemoryGOOGLE(const uint8_t* snapshotTraceBegin,
+                                                 size_t snapshotTraceBytes,
+                                                 android::base::BumpPool* pool, VkQueue queue,
+                                                 VkCommandBuffer commandBuffer,
+                                                 VkDeviceMemory deviceMemory,
+                                                 VkDeviceSize dataOffset, VkDeviceSize dataSize) {
+        // TODO: Implement
+    }
 #endif
 #ifdef VK_EXT_global_priority_query
 #endif
@@ -4548,7 +4568,7 @@ VkDecoderSnapshot::VkDecoderSnapshot() : mImpl(new VkDecoderSnapshot::Impl()) {}
 void VkDecoderSnapshot::save(android::base::Stream* stream) { mImpl->save(stream); }
 
 void VkDecoderSnapshot::load(android::base::Stream* stream, GfxApiLogger& gfx_logger,
-                             HealthMonitor<>& healthMonitor) {
+                             HealthMonitor<>* healthMonitor) {
     mImpl->load(stream, gfx_logger, healthMonitor);
 }
 
@@ -9512,6 +9532,16 @@ void VkDecoderSnapshot::vkQueueSignalReleaseImageANDROIDAsyncGOOGLE(
     mImpl->vkQueueSignalReleaseImageANDROIDAsyncGOOGLE(snapshotTraceBegin, snapshotTraceBytes, pool,
                                                        queue, waitSemaphoreCount, pWaitSemaphores,
                                                        image);
+}
+#endif
+#ifdef VK_GOOGLE_gfxstream
+void VkDecoderSnapshot::vkQueueFlushCommandsFromAuxMemoryGOOGLE(
+    const uint8_t* snapshotTraceBegin, size_t snapshotTraceBytes, android::base::BumpPool* pool,
+    VkQueue queue, VkCommandBuffer commandBuffer, VkDeviceMemory deviceMemory,
+    VkDeviceSize dataOffset, VkDeviceSize dataSize) {
+    mImpl->vkQueueFlushCommandsFromAuxMemoryGOOGLE(snapshotTraceBegin, snapshotTraceBytes, pool,
+                                                   queue, commandBuffer, deviceMemory, dataOffset,
+                                                   dataSize);
 }
 #endif
 #ifdef VK_EXT_multi_draw

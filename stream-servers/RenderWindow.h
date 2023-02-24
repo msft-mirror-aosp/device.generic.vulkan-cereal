@@ -144,6 +144,12 @@ public:
 
     void setPaused(bool paused);
 
+    void addListener(emugl::Renderer::FrameBufferChangeEventListener* listener);
+    void removeListener(emugl::Renderer::FrameBufferChangeEventListener* listener);
+
+    void setVsyncHz(int vsyncHz);
+    void setDisplayConfigs(int configId, int w, int h, int dpiX, int dpiY);
+    void setDisplayActiveConfig(int configId);
 private:
     bool processMessage(const RenderWindowMessage& msg);
     bool useThread() const { return mThread != nullptr; }

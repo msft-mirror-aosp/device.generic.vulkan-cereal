@@ -48,13 +48,16 @@ using gfxstream::GLESApi;
 using gfxstream::GLESApi_CM;
 using gfxstream::EmulatedEglFenceSync;
 
+#define DEBUG 0
 #define DEBUG_GRALLOC_SYNC 0
 #define DEBUG_EGL_SYNC 0
 
-#define RENDERCONTROL_DPRINT(...) do { \
-    if (!VERBOSE_CHECK(gles)) { VERBOSE_ENABLE(gles); } \
-    VERBOSE_TID_FUNCTION_DPRINT(gles, __VA_ARGS__); \
-} while(0)
+#define RENDERCONTROL_DPRINT(...)         \
+    do {                                  \
+        if (DEBUG) {                      \
+            fprintf(stderr, __VA_ARGS__); \
+        }                                 \
+    } while (0)
 
 #if DEBUG_GRALLOC_SYNC
 #define GRSYNC_DPRINT RENDERCONTROL_DPRINT
@@ -242,6 +245,9 @@ static const char* kVulkanAsyncQsri = "ANDROID_EMU_vulkan_async_qsri";
 // Read color buffer DMA
 static const char* kReadColorBufferDma = "ANDROID_EMU_read_color_buffer_dma";
 
+// Multiple display configs
+static const char* kHWCMultiConfigs= "ANDROID_EMU_hwc_multi_configs";
+
 static void rcTriggerWait(uint64_t glsync_ptr,
                           uint64_t thread_ptr,
                           uint64_t timeline);
@@ -350,6 +356,10 @@ static bool shouldEnableVulkanAsyncQsri() {
         (feature_is_enabled(kFeature_GLAsyncSwap) ||
          (feature_is_enabled(kFeature_VirtioGpuNativeSync) &&
           feature_is_enabled(kFeature_VirtioGpuFenceContexts)));
+}
+
+static bool shouldEnableVsyncGatedSyncFences() {
+    return shouldEnableAsyncSwap();
 }
 
 const char* maxVersionToFeatureString(GLESDispatchMaxVersion version) {
@@ -491,6 +501,7 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
     bool syncBufferDataEnabled = true;
     bool vulkanAsyncQsri = shouldEnableVulkanAsyncQsri();
     bool readColorBufferDma = directMemEnabled && hasSharedSlotsHostMemoryAllocatorEnabled;
+    bool hwcMultiConfigs = feature_is_enabled(kFeature_HWCMultiConfigs);
 
     if (isChecksumEnabled && name == GL_EXTENSIONS) {
         glStr += ChecksumCalculatorThreadInfo::getMaxVersionString();
@@ -629,6 +640,11 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
         glStr += " ";
     }
 
+    if (hwcMultiConfigs && name == GL_EXTENSIONS) {
+        glStr += kHWCMultiConfigs;
+        glStr += " ";
+    }
+
     if (name == GL_EXTENSIONS) {
 
         GLESDispatchMaxVersion guestExtVer = GLES_DISPATCH_MAX_VERSION_2;
@@ -657,8 +673,9 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
         if (hasNativeAstc || hasAstcDecompressor) {
             glStr += "GL_KHR_texture_compression_astc_ldr ";
         } else {
-            INFO("rcGetGLString: ASTC not supported. CPU decompressor? %d. GL extensions: %s",
-                 hasAstcDecompressor, glExtensions.c_str());
+            RENDERCONTROL_DPRINT(
+                "rcGetGLString: ASTC not supported. CPU decompressor? %d. GL extensions: %s",
+                hasAstcDecompressor, glExtensions.c_str());
         }
 
         // Host side tracing support.
@@ -754,36 +771,7 @@ static EGLint rcGetFBParam(EGLint param)
     if (!fb) {
         return 0;
     }
-
-    EGLint ret = 0;
-
-    switch(param) {
-        case FB_WIDTH:
-            ret = fb->getWidth();
-            break;
-        case FB_HEIGHT:
-            ret = fb->getHeight();
-            break;
-        case FB_XDPI:
-            ret = 72; // XXX: should be implemented
-            break;
-        case FB_YDPI:
-            ret = 72; // XXX: should be implemented
-            break;
-        case FB_FPS:
-            ret = 60;
-            break;
-        case FB_MIN_SWAP_INTERVAL:
-            ret = 1; // XXX: should be implemented
-            break;
-        case FB_MAX_SWAP_INTERVAL:
-            ret = 1; // XXX: should be implemented
-            break;
-        default:
-            break;
-    }
-
-    return ret;
+    return fb->getDisplayConfigsParam(0, param);
 }
 
 static uint32_t rcCreateContext(uint32_t config,
@@ -889,18 +877,15 @@ static int rcFlushWindowColorBuffer(uint32_t windowSurface)
         return -1;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(
-        fb->getEmulatedEglWindowSurfaceColorBufferHandle(windowSurface));
+    HandleType colorBufferHandle = fb->getEmulatedEglWindowSurfaceColorBufferHandle(windowSurface);
 
     if (!fb->flushEmulatedEglWindowSurfaceColorBuffer(windowSurface)) {
         GRSYNC_DPRINT("unlock gralloc cb lock }");
         return -1;
     }
 
-    // Update to Vulkan if necessary
-    goldfish_vk::updateColorBufferFromGl(
-        fb->getEmulatedEglWindowSurfaceColorBufferHandle(windowSurface));
+    // Make the GL updates visible to other backings if necessary.
+    fb->flushColorBufferFromGl(colorBufferHandle);
 
     GRSYNC_DPRINT("unlock gralloc cb lock }");
 
@@ -965,9 +950,6 @@ static void rcFBPost(uint32_t colorBuffer)
         return;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(colorBuffer);
-
     fb->post(colorBuffer);
 }
 
@@ -983,8 +965,8 @@ static void rcBindTexture(uint32_t colorBuffer)
         return;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(colorBuffer);
+    // Update for GL use if necessary.
+    fb->invalidateColorBufferForGl(colorBuffer);
 
     fb->bindColorBufferToTexture(colorBuffer);
 }
@@ -996,8 +978,8 @@ static void rcBindRenderbuffer(uint32_t colorBuffer)
         return;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(colorBuffer);
+    // Update for GL use if necessary.
+    fb->invalidateColorBufferForGl(colorBuffer);
 
     fb->bindColorBufferToRenderbuffer(colorBuffer);
 }
@@ -1022,9 +1004,6 @@ static void rcReadColorBuffer(uint32_t colorBuffer,
         return;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(colorBuffer);
-
     fb->readColorBuffer(colorBuffer, x, y, width, height, format, type, pixels);
 }
 
@@ -1041,17 +1020,10 @@ static int rcUpdateColorBuffer(uint32_t colorBuffer,
         return -1;
     }
 
-    // Since this is a modify operation, also read the current contents
-    // of the VkImage, if any.
-    goldfish_vk::readColorBufferToGl(colorBuffer);
-
     fb->updateColorBuffer(colorBuffer, x, y, width, height, format, type, pixels);
 
     GRSYNC_DPRINT("unlock gralloc cb lock");
     sGrallocSync()->unlockColorBufferPrepare();
-
-    // Update to Vulkan if necessary
-    goldfish_vk::updateColorBufferFromGl(colorBuffer);
 
     return 0;
 }
@@ -1070,18 +1042,11 @@ static int rcUpdateColorBufferDMA(uint32_t colorBuffer,
         return -1;
     }
 
-    // Since this is a modify operation, also read the current contents
-    // of the VkImage, if any.
-    goldfish_vk::readColorBufferToGl(colorBuffer);
-
     fb->updateColorBuffer(colorBuffer, x, y, width, height,
                           format, type, pixels);
 
     GRSYNC_DPRINT("unlock gralloc cb lock");
     sGrallocSync()->unlockColorBufferPrepare();
-
-    // Update to Vulkan if necessary
-    goldfish_vk::updateColorBufferFromGl(colorBuffer);
 
     return 0;
 }
@@ -1127,11 +1092,22 @@ static void rcTriggerWait(uint64_t eglsync_ptr,
                                          timeline);
     } else {
         EmulatedEglFenceSync* fenceSync = reinterpret_cast<EmulatedEglFenceSync*>(eglsync_ptr);
-        EGLSYNC_DPRINT(
-                "eglsync=0x%llx fenceSync=%p thread_ptr=0x%llx "
-                "timeline=0x%llx",
-                eglsync_ptr, fenceSync, thread_ptr, timeline);
-        SyncThread::get()->triggerWait(fenceSync, timeline);
+        FrameBuffer *fb = FrameBuffer::getFB();
+        if (fb && fenceSync->isCompositionFence()) {
+            fb->scheduleVsyncTask([eglsync_ptr, fenceSync, timeline](uint64_t) {
+                EGLSYNC_DPRINT(
+                    "vsync: eglsync=0x%llx fenceSync=%p thread_ptr=0x%llx "
+                    "timeline=0x%llx",
+                    eglsync_ptr, fenceSync, thread_ptr, timeline);
+                SyncThread::get()->triggerWait(fenceSync, timeline);
+            });
+        } else {
+            EGLSYNC_DPRINT(
+                    "eglsync=0x%llx fenceSync=%p thread_ptr=0x%llx "
+                    "timeline=0x%llx",
+                    eglsync_ptr, fenceSync, thread_ptr, timeline);
+            SyncThread::get()->triggerWait(fenceSync, timeline);
+        }
     }
 }
 
@@ -1157,6 +1133,12 @@ static void rcCreateSyncKHR(EGLenum type,
                                                      destroyWhenSignaled,
                                                      outSync,
                                                      outSyncThread);
+
+    RenderThreadInfo* tInfo = RenderThreadInfo::get();
+    if (tInfo && outSync && shouldEnableVsyncGatedSyncFences()) {
+        auto fenceSync = reinterpret_cast<EmulatedEglFenceSync*>(outSync);
+        fenceSync->setIsCompositionFence(tInfo->m_isCompositionThread);
+    }
 }
 
 // |rcClientWaitSyncKHR| implements |eglClientWaitSyncKHR|
@@ -1247,6 +1229,9 @@ static void rcSetPuid(uint64_t puid) {
 }
 
 static int rcCompose(uint32_t bufferSize, void* buffer) {
+    RenderThreadInfo *tInfo = RenderThreadInfo::get();
+    if (tInfo) tInfo->m_isCompositionThread = true;
+
     FrameBuffer *fb = FrameBuffer::getFB();
     if (!fb) {
         return -1;
@@ -1255,6 +1240,9 @@ static int rcCompose(uint32_t bufferSize, void* buffer) {
 }
 
 static int rcComposeWithoutPost(uint32_t bufferSize, void* buffer) {
+    RenderThreadInfo *tInfo = RenderThreadInfo::get();
+    if (tInfo) tInfo->m_isCompositionThread = true;
+
     FrameBuffer *fb = FrameBuffer::getFB();
     if (!fb) {
         return -1;
@@ -1412,27 +1400,11 @@ static void rcCloseBuffer(uint32_t buffer) {
     fb->closeBuffer(buffer);
 }
 
-static int rcSetColorBufferVulkanMode2(uint32_t colorBuffer,
-                                       uint32_t mode,
+static int rcSetColorBufferVulkanMode2(uint32_t colorBuffer, uint32_t mode,
                                        uint32_t memoryProperty) {
-    if (!goldfish_vk::isColorBufferVulkanCompatible(colorBuffer)) {
-        fprintf(stderr,
-                "%s: error: colorBuffer 0x%x is not Vulkan compatible\n",
-                __func__, colorBuffer);
-        return -1;
-    }
-
 #define VULKAN_MODE_VULKAN_ONLY 1
 
     bool modeIsVulkanOnly = mode == VULKAN_MODE_VULKAN_ONLY;
-
-    if (!goldfish_vk::setupVkColorBuffer(colorBuffer, modeIsVulkanOnly,
-                                         memoryProperty)) {
-        fprintf(stderr,
-                "%s: error: failed to create VkImage for colorBuffer 0x%x\n",
-                __func__, colorBuffer);
-        return -1;
-    }
 
     if (!goldfish_vk::setColorBufferVulkanMode(colorBuffer, mode)) {
         fprintf(stderr,
@@ -1494,6 +1466,9 @@ static void rcMakeCurrentAsync(uint32_t context, uint32_t drawSurf, uint32_t rea
 }
 
 static void rcComposeAsync(uint32_t bufferSize, void* buffer) {
+    RenderThreadInfo *tInfo = RenderThreadInfo::get();
+    if (tInfo) tInfo->m_isCompositionThread = true;
+
     FrameBuffer* fb = FrameBuffer::getFB();
     if (!fb) {
         return;
@@ -1502,6 +1477,9 @@ static void rcComposeAsync(uint32_t bufferSize, void* buffer) {
 }
 
 static void rcComposeAsyncWithoutPost(uint32_t bufferSize, void* buffer) {
+    RenderThreadInfo *tInfo = RenderThreadInfo::get();
+    if (tInfo) tInfo->m_isCompositionThread = true;
+
     FrameBuffer *fb = FrameBuffer::getFB();
     if (!fb) {
         return;
@@ -1525,11 +1503,32 @@ static int rcReadColorBufferDMA(uint32_t colorBuffer,
         return -1;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(colorBuffer);
-
     fb->readColorBuffer(colorBuffer, x, y, width, height, format, type, pixels);
     return 0;
+}
+
+static int rcGetFBDisplayConfigsCount() {
+    FrameBuffer *fb = FrameBuffer::getFB();
+    if (!fb) {
+        return -1;
+    }
+    return fb->getDisplayConfigsCount();
+}
+
+static int rcGetFBDisplayConfigsParam(int configId, GLint param) {
+    FrameBuffer *fb = FrameBuffer::getFB();
+    if (!fb) {
+        return -1;
+    }
+    return fb->getDisplayConfigsParam(configId, param);
+}
+
+static int rcGetFBDisplayActiveConfig() {
+    FrameBuffer *fb = FrameBuffer::getFB();
+    if (!fb) {
+        return -1;
+    }
+    return fb->getDisplayActiveConfig();
 }
 
 static void rcSetProcessMetadata(char* key, RenderControlByte* valuePtr, uint32_t valueSize) {
@@ -1612,6 +1611,9 @@ void initRenderControlContext(renderControl_decoder_context_t *dec)
     dec->rcCreateDisplayById = rcCreateDisplayById;
     dec->rcSetDisplayPoseDpi = rcSetDisplayPoseDpi;
     dec->rcReadColorBufferDMA = rcReadColorBufferDMA;
+    dec->rcGetFBDisplayConfigsCount = rcGetFBDisplayConfigsCount;
+    dec->rcGetFBDisplayConfigsParam = rcGetFBDisplayConfigsParam;
+    dec->rcGetFBDisplayActiveConfig = rcGetFBDisplayActiveConfig;
     dec->rcSetProcessMetadata = rcSetProcessMetadata;
     dec->rcGetHostExtensionsString = rcGetHostExtensionsString;
 }

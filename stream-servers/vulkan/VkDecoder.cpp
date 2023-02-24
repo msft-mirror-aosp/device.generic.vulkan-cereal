@@ -50,6 +50,7 @@
 #include "host-common/GfxstreamFatalError.h"
 #include "host-common/feature_control.h"
 #include "host-common/logging.h"
+#include "stream-servers/FrameBuffer.h"
 #include "stream-servers/IOStream.h"
 
 #define MAX_PACKET_LENGTH (400 * 1024 * 1024)  // 400MB
@@ -77,8 +78,8 @@ class VkDecoder::Impl {
 
     void setForSnapshotLoad(bool forSnapshotLoad) { m_forSnapshotLoad = forSnapshotLoad; }
 
-    size_t decode(void* buf, size_t bufsize, IOStream* stream, uint32_t* seqnoPtr,
-                  const VkDecoderContext&);
+    size_t decode(void* buf, size_t bufsize, IOStream* stream,
+                  const ProcessResources* processResources, const VkDecoderContext&);
 
    private:
     bool m_logCalls;
@@ -104,18 +105,20 @@ void VkDecoder::setForSnapshotLoad(bool forSnapshotLoad) {
     mImpl->setForSnapshotLoad(forSnapshotLoad);
 }
 
-size_t VkDecoder::decode(void* buf, size_t bufsize, IOStream* stream, uint32_t* seqnoPtr,
+size_t VkDecoder::decode(void* buf, size_t bufsize, IOStream* stream,
+                         const ProcessResources* processResources,
                          const VkDecoderContext& context) {
-    return mImpl->decode(buf, bufsize, stream, seqnoPtr, context);
+    return mImpl->decode(buf, bufsize, stream, processResources, context);
 }
 
 // VkDecoder::Impl::decode to follow
 
-size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32_t* seqnoPtr,
+size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                               const ProcessResources* processResources,
                                const VkDecoderContext& context) {
     const char* processName = context.processName;
     auto& gfx_logger = *context.gfxApiLogger;
-    auto& healthMonitor = *context.healthMonitor;
+    auto* healthMonitor = context.healthMonitor;
     auto& metricsLogger = *context.metricsLogger;
     if (len < 8) return 0;
     bool queueSubmitWithCommandsEnabled =
@@ -149,21 +152,26 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
 
         std::unique_ptr<EventHangMetadata::HangAnnotations> executionData =
             std::make_unique<EventHangMetadata::HangAnnotations>();
-        executionData->insert(
-            {{"packet_length", std::to_string(packetLen)}, {"opcode", std::to_string(opcode)}});
-        if (processName) {
-            executionData->insert({{"renderthread_guest_process", std::string(processName)}});
+        if (healthMonitor) {
+            executionData->insert(
+                {{"packet_length", std::to_string(packetLen)}, {"opcode", std::to_string(opcode)}});
+            if (processName) {
+                executionData->insert({{"renderthread_guest_process", std::string(processName)}});
+            }
+            if (m_prevSeqno) {
+                executionData->insert({{"previous_seqno", std::to_string(m_prevSeqno.value())}});
+            }
         }
-        if (m_prevSeqno) {
-            executionData->insert({{"previous_seqno", std::to_string(m_prevSeqno.value())}});
-        }
+
+        std::atomic<uint32_t>* seqnoPtr = processResources->getSequenceNumberPtr();
+
         if (queueSubmitWithCommandsEnabled &&
             ((opcode >= OP_vkFirst && opcode < OP_vkLast) ||
              (opcode >= OP_vkFirst_old && opcode < OP_vkLast_old))) {
             uint32_t seqno;
             memcpy(&seqno, *readStreamPtrPtr, sizeof(uint32_t));
             *readStreamPtrPtr += sizeof(uint32_t);
-            executionData->insert({{"seqno", std::to_string(seqno)}});
+            if (healthMonitor) executionData->insert({{"seqno", std::to_string(seqno)}});
             if (m_prevSeqno && seqno == m_prevSeqno.value()) {
                 WARN(
                     "Seqno %d is the same as previously processed on thread %d. It might be a "
@@ -183,12 +191,12 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                                 auto annotations =
                                     std::make_unique<EventHangMetadata::HangAnnotations>();
                                 annotations->insert(
-                                    {{"seqnoPtr", std::to_string(__atomic_load_n(
-                                                      seqnoPtr, __ATOMIC_SEQ_CST))}});
-                                return std::move(annotations);
+                                    {{"seqnoPtr",
+                                      std::to_string(seqnoPtr->load(std::memory_order_seq_cst))}});
+                                return annotations;
                             })
                             .build();
-                    while ((seqno - __atomic_load_n(seqnoPtr, __ATOMIC_SEQ_CST) != 1)) {
+                    while ((seqno - seqnoPtr->load(std::memory_order_seq_cst) != 1)) {
 #if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))
                         _mm_pause();
 #elif (defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)))
@@ -274,7 +282,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -316,7 +324,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -413,7 +421,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -460,7 +468,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -514,7 +522,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -594,7 +602,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -643,7 +651,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -746,7 +754,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -798,7 +806,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -837,7 +845,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -876,7 +884,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -952,7 +960,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -994,7 +1002,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1108,7 +1116,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1229,7 +1237,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1324,7 +1332,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1431,7 +1439,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1481,7 +1489,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1537,7 +1545,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1554,7 +1562,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                             (unsigned long long)queue);
                 }
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 VkResult vkQueueWaitIdle_VkResult_return = (VkResult)0;
                 vkQueueWaitIdle_VkResult_return = m_state->on_vkQueueWaitIdle(&m_pool, queue);
                 if ((vkQueueWaitIdle_VkResult_return) == VK_ERROR_DEVICE_LOST)
@@ -1591,7 +1599,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                             (unsigned long long)device);
                 }
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 VkResult vkDeviceWaitIdle_VkResult_return = (VkResult)0;
                 vkDeviceWaitIdle_VkResult_return = vk->vkDeviceWaitIdle(unboxed_device);
                 if ((vkDeviceWaitIdle_VkResult_return) == VK_ERROR_DEVICE_LOST)
@@ -1690,7 +1698,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1745,7 +1753,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkDeviceMemory(boxed_memory_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1816,7 +1824,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1849,7 +1857,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -1926,7 +1934,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2006,7 +2014,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2054,7 +2062,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2105,7 +2113,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2156,7 +2164,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2212,7 +2220,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2266,7 +2274,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2380,7 +2388,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2500,7 +2508,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2559,7 +2567,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2635,7 +2643,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2689,7 +2697,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkFence(boxed_fence_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2739,7 +2747,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2781,7 +2789,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2824,7 +2832,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                             (unsigned long long)timeout);
                 }
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 VkResult vkWaitForFences_VkResult_return = (VkResult)0;
                 vkWaitForFences_VkResult_return =
                     vk->vkWaitForFences(unboxed_device, fenceCount, pFences, waitAll, timeout);
@@ -2922,7 +2930,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -2976,7 +2984,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkSemaphore(boxed_semaphore_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3056,7 +3064,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3113,7 +3121,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkEvent(boxed_event_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3155,7 +3163,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3195,7 +3203,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3237,7 +3245,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3320,7 +3328,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3377,7 +3385,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkQueryPool(boxed_queryPool_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3452,7 +3460,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3529,7 +3537,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3583,7 +3591,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkBuffer(boxed_buffer_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3665,7 +3673,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3723,7 +3731,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkBufferView(boxed_bufferView_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3800,7 +3808,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3854,7 +3862,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkImage(boxed_image_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3919,7 +3927,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -3997,7 +4005,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4051,7 +4059,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkImageView(boxed_imageView_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4132,7 +4140,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4187,7 +4195,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkShaderModule(boxed_shaderModule_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4269,7 +4277,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4325,7 +4333,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkPipelineCache(boxed_pipelineCache_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4411,7 +4419,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4475,7 +4483,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4583,7 +4591,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4695,7 +4703,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4749,7 +4757,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkPipeline(boxed_pipeline_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4837,7 +4845,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4902,7 +4910,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                                                 delayed_remove_callback);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -4980,7 +4988,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5034,7 +5042,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkSampler(boxed_sampler_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5070,9 +5078,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkDescriptorSetLayout*)pSetLayout =
-                    (VkDescriptorSetLayout)(VkDescriptorSetLayout)((
-                        VkDescriptorSetLayout)(*&cgen_var_2));
+                *(VkDescriptorSetLayout*)pSetLayout = (VkDescriptorSetLayout)(
+                    VkDescriptorSetLayout)((VkDescriptorSetLayout)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkDescriptorSetLayoutCreateInfo(
                         m_state, (VkDescriptorSetLayoutCreateInfo*)(pCreateInfo));
@@ -5121,7 +5128,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5140,9 +5147,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkDescriptorSetLayout*)&descriptorSetLayout =
-                    (VkDescriptorSetLayout)(VkDescriptorSetLayout)((
-                        VkDescriptorSetLayout)(*&cgen_var_1));
+                *(VkDescriptorSetLayout*)&descriptorSetLayout = (VkDescriptorSetLayout)(
+                    VkDescriptorSetLayout)((VkDescriptorSetLayout)(*&cgen_var_1));
                 boxed_descriptorSetLayout_preserve = descriptorSetLayout;
                 descriptorSetLayout = unbox_VkDescriptorSetLayout(descriptorSetLayout);
                 // WARNING PTR CHECK
@@ -5180,7 +5186,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkDescriptorSetLayout(boxed_descriptorSetLayout_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5262,7 +5268,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5318,7 +5324,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkDescriptorPool(boxed_descriptorPool_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5365,7 +5371,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5444,7 +5450,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5522,7 +5528,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 // Skipping handle cleanup for vkFreeDescriptorSets
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5593,7 +5599,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5674,7 +5680,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5729,7 +5735,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkFramebuffer(boxed_framebuffer_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5809,7 +5815,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5864,7 +5870,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkRenderPass(boxed_renderPass_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5918,7 +5924,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -5999,7 +6005,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6054,7 +6060,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkCommandPool(boxed_commandPool_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6100,7 +6106,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6175,7 +6181,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6249,7 +6255,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6295,7 +6301,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6331,7 +6337,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6371,7 +6377,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6410,7 +6416,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6464,7 +6470,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6516,7 +6522,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6550,7 +6556,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6596,7 +6602,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6632,7 +6638,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6671,7 +6677,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6712,7 +6718,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6753,7 +6759,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6794,7 +6800,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6871,7 +6877,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6916,7 +6922,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -6976,7 +6982,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7024,7 +7030,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7077,7 +7083,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7127,7 +7133,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7178,7 +7184,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7221,7 +7227,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7262,7 +7268,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7323,7 +7329,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7388,7 +7394,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7460,7 +7466,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7525,7 +7531,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7590,7 +7596,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7641,7 +7647,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7690,7 +7696,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7759,7 +7765,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7830,7 +7836,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7898,7 +7904,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -7968,7 +7974,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8009,7 +8015,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8050,7 +8056,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8172,7 +8178,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8281,7 +8287,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8328,7 +8334,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8369,7 +8375,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8416,7 +8422,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8464,7 +8470,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8529,7 +8535,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8586,7 +8592,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8631,7 +8637,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8665,7 +8671,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8696,7 +8702,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8744,7 +8750,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8783,7 +8789,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8836,7 +8842,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8845,14 +8851,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 VkDevice device;
                 uint32_t bindInfoCount;
                 const VkBindImageMemoryInfo* pBindInfos;
-                // Begin non wrapped dispatchable handle unboxing for device;
+                // Begin global wrapped dispatchable handle unboxing for device;
                 uint64_t cgen_var_0;
                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
-                auto unboxed_device = unbox_VkDevice(device);
-                auto vk = dispatch_VkDevice(device);
-                // End manual dispatchable handle unboxing for device;
                 memcpy((uint32_t*)&bindInfoCount, *readStreamPtrPtr, sizeof(uint32_t));
                 *readStreamPtrPtr += sizeof(uint32_t);
                 vkReadStream->alloc((void**)&pBindInfos,
@@ -8875,7 +8878,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 VkResult vkBindImageMemory2_VkResult_return = (VkResult)0;
                 vkBindImageMemory2_VkResult_return =
-                    vk->vkBindImageMemory2(unboxed_device, bindInfoCount, pBindInfos);
+                    m_state->on_vkBindImageMemory2(&m_pool, device, bindInfoCount, pBindInfos);
                 if ((vkBindImageMemory2_VkResult_return) == VK_ERROR_DEVICE_LOST)
                     m_state->on_DeviceLost();
                 m_state->on_CheckOutOfMemory(vkBindImageMemory2_VkResult_return, opcode, context);
@@ -8892,7 +8895,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8948,7 +8951,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -8982,7 +8985,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9038,7 +9041,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9154,7 +9157,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9212,7 +9215,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9273,7 +9276,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9392,7 +9395,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9439,7 +9442,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9488,7 +9491,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9542,7 +9545,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9616,7 +9619,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9719,7 +9722,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9771,7 +9774,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9882,7 +9885,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9923,7 +9926,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -9932,14 +9935,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 VkDevice device;
                 const VkDeviceQueueInfo2* pQueueInfo;
                 VkQueue* pQueue;
-                // Begin non wrapped dispatchable handle unboxing for device;
+                // Begin global wrapped dispatchable handle unboxing for device;
                 uint64_t cgen_var_0;
                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
-                auto unboxed_device = unbox_VkDevice(device);
-                auto vk = dispatch_VkDevice(device);
-                // End manual dispatchable handle unboxing for device;
                 vkReadStream->alloc((void**)&pQueueInfo, sizeof(const VkDeviceQueueInfo2));
                 reservedunmarshal_VkDeviceQueueInfo2(vkReadStream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                                      (VkDeviceQueueInfo2*)(pQueueInfo),
@@ -9959,11 +9959,13 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                             ioStream, (unsigned long long)device, (unsigned long long)pQueueInfo,
                             (unsigned long long)pQueue);
                 }
-                vk->vkGetDeviceQueue2(unboxed_device, pQueueInfo, pQueue);
+                m_state->on_vkGetDeviceQueue2(&m_pool, device, pQueueInfo, pQueue);
                 vkStream->unsetHandleMapping();
                 uint64_t cgen_var_2;
-                vkStream->handleMapping()->mapHandles_VkQueue_u64(pQueue, &cgen_var_2, 1);
-                vkStream->write((uint64_t*)&cgen_var_2, 8);
+                static_assert(8 == sizeof(VkQueue),
+                              "handle map overwrite requires VkQueue to be 8 bytes long");
+                vkStream->handleMapping()->mapHandles_VkQueue((VkQueue*)pQueue, 1);
+                vkStream->write((VkQueue*)pQueue, 8 * 1);
                 vkStream->commitWrite();
                 vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
                                          (uintptr_t)snapshotTraceBegin);
@@ -9974,7 +9976,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10010,9 +10012,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkSamplerYcbcrConversion*)pYcbcrConversion =
-                    (VkSamplerYcbcrConversion)(VkSamplerYcbcrConversion)((
-                        VkSamplerYcbcrConversion)(*&cgen_var_2));
+                *(VkSamplerYcbcrConversion*)pYcbcrConversion = (VkSamplerYcbcrConversion)(
+                    VkSamplerYcbcrConversion)((VkSamplerYcbcrConversion)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkSamplerYcbcrConversionCreateInfo(
                         m_state, (VkSamplerYcbcrConversionCreateInfo*)(pCreateInfo));
@@ -10061,7 +10062,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10080,9 +10081,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkSamplerYcbcrConversion*)&ycbcrConversion =
-                    (VkSamplerYcbcrConversion)(VkSamplerYcbcrConversion)((
-                        VkSamplerYcbcrConversion)(*&cgen_var_1));
+                *(VkSamplerYcbcrConversion*)&ycbcrConversion = (VkSamplerYcbcrConversion)(
+                    VkSamplerYcbcrConversion)((VkSamplerYcbcrConversion)(*&cgen_var_1));
                 boxed_ycbcrConversion_preserve = ycbcrConversion;
                 ycbcrConversion = unbox_VkSamplerYcbcrConversion(ycbcrConversion);
                 // WARNING PTR CHECK
@@ -10120,7 +10120,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkSamplerYcbcrConversion(boxed_ycbcrConversion_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10158,8 +10158,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
                 *(VkDescriptorUpdateTemplate*)pDescriptorUpdateTemplate =
-                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)((
-                        VkDescriptorUpdateTemplate)(*&cgen_var_2));
+                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)(
+                        (VkDescriptorUpdateTemplate)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkDescriptorUpdateTemplateCreateInfo(
                         m_state, (VkDescriptorUpdateTemplateCreateInfo*)(pCreateInfo));
@@ -10210,7 +10210,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10231,8 +10231,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkDescriptorUpdateTemplate*)&descriptorUpdateTemplate =
-                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)((
-                        VkDescriptorUpdateTemplate)(*&cgen_var_1));
+                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)(
+                        (VkDescriptorUpdateTemplate)(*&cgen_var_1));
                 boxed_descriptorUpdateTemplate_preserve = descriptorUpdateTemplate;
                 descriptorUpdateTemplate =
                     unbox_VkDescriptorUpdateTemplate(descriptorUpdateTemplate);
@@ -10272,7 +10272,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkDescriptorUpdateTemplate(boxed_descriptorUpdateTemplate_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10331,7 +10331,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10404,7 +10404,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10471,7 +10471,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10537,7 +10537,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10599,7 +10599,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10661,7 +10661,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10722,7 +10722,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10802,7 +10802,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10855,7 +10855,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10907,7 +10907,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10949,7 +10949,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -10994,7 +10994,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11048,7 +11048,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11081,7 +11081,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                             (unsigned long long)timeout);
                 }
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 VkResult vkWaitSemaphores_VkResult_return = (VkResult)0;
                 vkWaitSemaphores_VkResult_return =
                     vk->vkWaitSemaphores(unboxed_device, pWaitInfo, timeout);
@@ -11146,7 +11146,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11192,7 +11192,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11237,7 +11237,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11285,7 +11285,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11345,7 +11345,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkSurfaceKHR(boxed_surface_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11408,7 +11408,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11479,7 +11479,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11593,7 +11593,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11686,7 +11686,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11773,7 +11773,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11831,7 +11831,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkSwapchainKHR(boxed_swapchain_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -11934,7 +11934,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12005,7 +12005,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12051,7 +12051,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12119,7 +12119,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12190,7 +12190,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12301,7 +12301,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12358,7 +12358,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12469,7 +12469,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12578,7 +12578,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12681,7 +12681,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12794,7 +12794,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12888,7 +12888,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -12961,7 +12961,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13041,7 +13041,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13141,7 +13141,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13221,7 +13221,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13278,7 +13278,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13384,7 +13384,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13438,7 +13438,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13520,7 +13520,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13602,7 +13602,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13648,7 +13648,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13725,7 +13725,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13851,7 +13851,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13928,7 +13928,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -13980,7 +13980,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14111,7 +14111,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14179,7 +14179,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14261,7 +14261,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14322,7 +14322,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14378,7 +14378,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14419,7 +14419,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14461,7 +14461,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14504,7 +14504,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14547,7 +14547,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14591,7 +14591,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14622,7 +14622,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14674,7 +14674,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14723,7 +14723,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14777,7 +14777,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14851,7 +14851,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -14954,7 +14954,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15007,7 +15007,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15119,7 +15119,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15178,7 +15178,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15213,7 +15213,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15269,7 +15269,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15315,7 +15315,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15435,7 +15435,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15510,7 +15510,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15573,7 +15573,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15646,7 +15646,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15703,7 +15703,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15770,7 +15770,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15841,7 +15841,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15900,7 +15900,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -15959,7 +15959,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16008,7 +16008,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16060,7 +16060,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16130,7 +16130,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16194,7 +16194,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16240,8 +16240,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
                 *(VkDescriptorUpdateTemplate*)pDescriptorUpdateTemplate =
-                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)((
-                        VkDescriptorUpdateTemplate)(*&cgen_var_2));
+                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)(
+                        (VkDescriptorUpdateTemplate)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkDescriptorUpdateTemplateCreateInfo(
                         m_state, (VkDescriptorUpdateTemplateCreateInfo*)(pCreateInfo));
@@ -16292,7 +16292,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16313,8 +16313,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkDescriptorUpdateTemplate*)&descriptorUpdateTemplate =
-                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)((
-                        VkDescriptorUpdateTemplate)(*&cgen_var_1));
+                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)(
+                        (VkDescriptorUpdateTemplate)(*&cgen_var_1));
                 boxed_descriptorUpdateTemplate_preserve = descriptorUpdateTemplate;
                 descriptorUpdateTemplate =
                     unbox_VkDescriptorUpdateTemplate(descriptorUpdateTemplate);
@@ -16354,7 +16354,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkDescriptorUpdateTemplate(boxed_descriptorUpdateTemplate_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16413,7 +16413,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16498,7 +16498,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16552,7 +16552,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16604,7 +16604,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16646,7 +16646,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16693,7 +16693,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16762,7 +16762,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16818,7 +16818,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16877,7 +16877,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16927,7 +16927,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -16982,7 +16982,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17156,7 +17156,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17215,7 +17215,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17263,7 +17263,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17293,7 +17293,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17374,7 +17374,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17494,7 +17494,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17607,7 +17607,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17717,7 +17717,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17830,7 +17830,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17904,7 +17904,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -17971,7 +17971,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18032,7 +18032,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18151,7 +18151,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18191,9 +18191,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkSamplerYcbcrConversion*)pYcbcrConversion =
-                    (VkSamplerYcbcrConversion)(VkSamplerYcbcrConversion)((
-                        VkSamplerYcbcrConversion)(*&cgen_var_2));
+                *(VkSamplerYcbcrConversion*)pYcbcrConversion = (VkSamplerYcbcrConversion)(
+                    VkSamplerYcbcrConversion)((VkSamplerYcbcrConversion)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkSamplerYcbcrConversionCreateInfo(
                         m_state, (VkSamplerYcbcrConversionCreateInfo*)(pCreateInfo));
@@ -18243,7 +18242,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18262,9 +18261,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkSamplerYcbcrConversion*)&ycbcrConversion =
-                    (VkSamplerYcbcrConversion)(VkSamplerYcbcrConversion)((
-                        VkSamplerYcbcrConversion)(*&cgen_var_1));
+                *(VkSamplerYcbcrConversion*)&ycbcrConversion = (VkSamplerYcbcrConversion)(
+                    VkSamplerYcbcrConversion)((VkSamplerYcbcrConversion)(*&cgen_var_1));
                 boxed_ycbcrConversion_preserve = ycbcrConversion;
                 ycbcrConversion = unbox_VkSamplerYcbcrConversion(ycbcrConversion);
                 // WARNING PTR CHECK
@@ -18302,7 +18300,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkSamplerYcbcrConversion(boxed_ycbcrConversion_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18359,7 +18357,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18368,14 +18366,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 VkDevice device;
                 uint32_t bindInfoCount;
                 const VkBindImageMemoryInfo* pBindInfos;
-                // Begin non wrapped dispatchable handle unboxing for device;
+                // Begin global wrapped dispatchable handle unboxing for device;
                 uint64_t cgen_var_0;
                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
-                auto unboxed_device = unbox_VkDevice(device);
-                auto vk = dispatch_VkDevice(device);
-                // End manual dispatchable handle unboxing for device;
                 memcpy((uint32_t*)&bindInfoCount, *readStreamPtrPtr, sizeof(uint32_t));
                 *readStreamPtrPtr += sizeof(uint32_t);
                 vkReadStream->alloc((void**)&pBindInfos,
@@ -18398,7 +18393,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 VkResult vkBindImageMemory2KHR_VkResult_return = (VkResult)0;
                 vkBindImageMemory2KHR_VkResult_return =
-                    vk->vkBindImageMemory2KHR(unboxed_device, bindInfoCount, pBindInfos);
+                    m_state->on_vkBindImageMemory2KHR(&m_pool, device, bindInfoCount, pBindInfos);
                 if ((vkBindImageMemory2KHR_VkResult_return) == VK_ERROR_DEVICE_LOST)
                     m_state->on_DeviceLost();
                 m_state->on_CheckOutOfMemory(vkBindImageMemory2KHR_VkResult_return, opcode,
@@ -18416,7 +18411,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18482,7 +18477,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18544,7 +18539,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18605,7 +18600,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18677,7 +18672,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18710,7 +18705,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                             (unsigned long long)timeout);
                 }
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 VkResult vkWaitSemaphoresKHR_VkResult_return = (VkResult)0;
                 vkWaitSemaphoresKHR_VkResult_return =
                     vk->vkWaitSemaphoresKHR(unboxed_device, pWaitInfo, timeout);
@@ -18775,7 +18770,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18900,7 +18895,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -18947,7 +18942,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19007,7 +19002,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19057,7 +19052,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19103,7 +19098,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19151,7 +19146,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19219,7 +19214,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19271,7 +19266,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19313,7 +19308,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19357,7 +19352,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19400,7 +19395,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19520,7 +19515,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19639,7 +19634,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19773,7 +19768,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19824,7 +19819,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19873,7 +19868,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19915,7 +19910,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -19979,7 +19974,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20021,7 +20016,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20069,7 +20064,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20131,7 +20126,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20183,7 +20178,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20281,7 +20276,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20331,7 +20326,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20371,7 +20366,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20414,7 +20409,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20457,7 +20452,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20497,7 +20492,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20540,7 +20535,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20607,7 +20602,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20670,7 +20665,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20789,7 +20784,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20847,7 +20842,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20907,7 +20902,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -20985,7 +20980,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21026,9 +21021,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkDebugReportCallbackEXT*)pCallback =
-                    (VkDebugReportCallbackEXT)(VkDebugReportCallbackEXT)((
-                        VkDebugReportCallbackEXT)(*&cgen_var_2));
+                *(VkDebugReportCallbackEXT*)pCallback = (VkDebugReportCallbackEXT)(
+                    VkDebugReportCallbackEXT)((VkDebugReportCallbackEXT)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkDebugReportCallbackCreateInfoEXT(
                         m_state, (VkDebugReportCallbackCreateInfoEXT*)(pCreateInfo));
@@ -21077,7 +21071,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21099,9 +21093,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkDebugReportCallbackEXT*)&callback =
-                    (VkDebugReportCallbackEXT)(VkDebugReportCallbackEXT)((
-                        VkDebugReportCallbackEXT)(*&cgen_var_1));
+                *(VkDebugReportCallbackEXT*)&callback = (VkDebugReportCallbackEXT)(
+                    VkDebugReportCallbackEXT)((VkDebugReportCallbackEXT)(*&cgen_var_1));
                 boxed_callback_preserve = callback;
                 callback = unbox_VkDebugReportCallbackEXT(callback);
                 // WARNING PTR CHECK
@@ -21138,7 +21131,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkDebugReportCallbackEXT(boxed_callback_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21198,7 +21191,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21260,7 +21253,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21310,7 +21303,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21352,7 +21345,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21383,7 +21376,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21425,7 +21418,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21504,7 +21497,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21582,7 +21575,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21660,7 +21653,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21713,7 +21706,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21760,7 +21753,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21822,7 +21815,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21898,7 +21891,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -21973,7 +21966,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22024,7 +22017,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22076,7 +22069,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22117,7 +22110,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22163,7 +22156,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22228,7 +22221,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22290,7 +22283,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22351,7 +22344,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22461,7 +22454,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22547,7 +22540,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22649,7 +22642,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22713,7 +22706,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22796,7 +22789,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22852,7 +22845,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22883,7 +22876,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22942,7 +22935,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -22990,7 +22983,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23047,7 +23040,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23113,7 +23106,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23187,7 +23180,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23247,7 +23240,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23325,7 +23318,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23411,7 +23404,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23471,7 +23464,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23542,7 +23535,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23662,7 +23655,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23731,7 +23724,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23803,7 +23796,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23883,7 +23876,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -23965,7 +23958,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24006,7 +23999,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24046,7 +24039,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24080,7 +24073,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24114,7 +24107,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24154,7 +24147,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24188,7 +24181,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24243,7 +24236,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24291,7 +24284,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24331,7 +24324,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24361,7 +24354,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24401,7 +24394,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24442,7 +24435,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24473,7 +24466,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24515,7 +24508,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24554,9 +24547,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkDebugUtilsMessengerEXT*)pMessenger =
-                    (VkDebugUtilsMessengerEXT)(VkDebugUtilsMessengerEXT)((
-                        VkDebugUtilsMessengerEXT)(*&cgen_var_2));
+                *(VkDebugUtilsMessengerEXT*)pMessenger = (VkDebugUtilsMessengerEXT)(
+                    VkDebugUtilsMessengerEXT)((VkDebugUtilsMessengerEXT)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkDebugUtilsMessengerCreateInfoEXT(
                         m_state, (VkDebugUtilsMessengerCreateInfoEXT*)(pCreateInfo));
@@ -24605,7 +24597,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24627,9 +24619,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkDebugUtilsMessengerEXT*)&messenger =
-                    (VkDebugUtilsMessengerEXT)(VkDebugUtilsMessengerEXT)((
-                        VkDebugUtilsMessengerEXT)(*&cgen_var_1));
+                *(VkDebugUtilsMessengerEXT*)&messenger = (VkDebugUtilsMessengerEXT)(
+                    VkDebugUtilsMessengerEXT)((VkDebugUtilsMessengerEXT)(*&cgen_var_1));
                 boxed_messenger_preserve = messenger;
                 messenger = unbox_VkDebugUtilsMessengerEXT(messenger);
                 // WARNING PTR CHECK
@@ -24666,7 +24657,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkDebugUtilsMessengerEXT(boxed_messenger_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24720,7 +24711,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24791,7 +24782,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24853,7 +24844,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24910,7 +24901,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -24971,7 +24962,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25055,7 +25046,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25096,9 +25087,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkValidationCacheEXT*)pValidationCache =
-                    (VkValidationCacheEXT)(VkValidationCacheEXT)((
-                        VkValidationCacheEXT)(*&cgen_var_2));
+                *(VkValidationCacheEXT*)pValidationCache = (VkValidationCacheEXT)(
+                    VkValidationCacheEXT)((VkValidationCacheEXT)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkValidationCacheCreateInfoEXT(
                         m_state, (VkValidationCacheCreateInfoEXT*)(pCreateInfo));
@@ -25147,7 +25137,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25169,9 +25159,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkValidationCacheEXT*)&validationCache =
-                    (VkValidationCacheEXT)(VkValidationCacheEXT)((
-                        VkValidationCacheEXT)(*&cgen_var_1));
+                *(VkValidationCacheEXT*)&validationCache = (VkValidationCacheEXT)(
+                    VkValidationCacheEXT)((VkValidationCacheEXT)(*&cgen_var_1));
                 boxed_validationCache_preserve = validationCache;
                 validationCache = unbox_VkValidationCacheEXT(validationCache);
                 // WARNING PTR CHECK
@@ -25207,7 +25196,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkValidationCacheEXT(boxed_validationCache_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25274,7 +25263,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25363,7 +25352,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25412,7 +25401,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25469,7 +25458,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25529,7 +25518,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25571,9 +25560,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkAccelerationStructureNV*)pAccelerationStructure =
-                    (VkAccelerationStructureNV)(VkAccelerationStructureNV)((
-                        VkAccelerationStructureNV)(*&cgen_var_2));
+                *(VkAccelerationStructureNV*)pAccelerationStructure = (VkAccelerationStructureNV)(
+                    VkAccelerationStructureNV)((VkAccelerationStructureNV)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkAccelerationStructureCreateInfoNV(
                         m_state, (VkAccelerationStructureCreateInfoNV*)(pCreateInfo));
@@ -25624,7 +25612,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25646,9 +25634,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkAccelerationStructureNV*)&accelerationStructure =
-                    (VkAccelerationStructureNV)(VkAccelerationStructureNV)((
-                        VkAccelerationStructureNV)(*&cgen_var_1));
+                *(VkAccelerationStructureNV*)&accelerationStructure = (VkAccelerationStructureNV)(
+                    VkAccelerationStructureNV)((VkAccelerationStructureNV)(*&cgen_var_1));
                 boxed_accelerationStructure_preserve = accelerationStructure;
                 accelerationStructure = unbox_VkAccelerationStructureNV(accelerationStructure);
                 // WARNING PTR CHECK
@@ -25686,7 +25673,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkAccelerationStructureNV(boxed_accelerationStructure_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25749,7 +25736,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25813,7 +25800,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25895,7 +25882,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -25948,7 +25935,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26067,7 +26054,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26172,7 +26159,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26240,7 +26227,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26308,7 +26295,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26372,7 +26359,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26443,7 +26430,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26490,7 +26477,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26580,7 +26567,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26634,7 +26621,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26726,7 +26713,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26803,7 +26790,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26860,7 +26847,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26911,7 +26898,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -26972,7 +26959,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27035,7 +27022,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27080,7 +27067,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27177,7 +27164,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27231,7 +27218,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27261,7 +27248,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27313,7 +27300,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27367,7 +27354,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27421,7 +27408,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27488,7 +27475,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27536,7 +27523,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27584,7 +27571,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27647,7 +27634,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27692,7 +27679,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27775,7 +27762,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27857,7 +27844,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -27970,7 +27957,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28089,7 +28076,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28213,7 +28200,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28318,7 +28305,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28365,7 +28352,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28412,7 +28399,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28488,7 +28475,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28570,7 +28557,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28614,7 +28601,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28663,7 +28650,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28702,7 +28689,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28737,7 +28724,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28774,7 +28761,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28823,7 +28810,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28871,7 +28858,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -28964,7 +28951,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29000,7 +28987,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29036,7 +29023,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29072,7 +29059,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29109,7 +29096,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29145,7 +29132,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29199,7 +29186,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29268,7 +29255,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29313,7 +29300,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29363,7 +29350,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29412,7 +29399,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29453,8 +29440,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
                 *(VkIndirectCommandsLayoutNV*)pIndirectCommandsLayout =
-                    (VkIndirectCommandsLayoutNV)(VkIndirectCommandsLayoutNV)((
-                        VkIndirectCommandsLayoutNV)(*&cgen_var_2));
+                    (VkIndirectCommandsLayoutNV)(VkIndirectCommandsLayoutNV)(
+                        (VkIndirectCommandsLayoutNV)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkIndirectCommandsLayoutCreateInfoNV(
                         m_state, (VkIndirectCommandsLayoutCreateInfoNV*)(pCreateInfo));
@@ -29506,7 +29493,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29529,8 +29516,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkIndirectCommandsLayoutNV*)&indirectCommandsLayout =
-                    (VkIndirectCommandsLayoutNV)(VkIndirectCommandsLayoutNV)((
-                        VkIndirectCommandsLayoutNV)(*&cgen_var_1));
+                    (VkIndirectCommandsLayoutNV)(VkIndirectCommandsLayoutNV)(
+                        (VkIndirectCommandsLayoutNV)(*&cgen_var_1));
                 boxed_indirectCommandsLayout_preserve = indirectCommandsLayout;
                 indirectCommandsLayout = unbox_VkIndirectCommandsLayoutNV(indirectCommandsLayout);
                 // WARNING PTR CHECK
@@ -29568,7 +29555,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkIndirectCommandsLayoutNV(boxed_indirectCommandsLayout_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29629,7 +29616,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29689,7 +29676,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29774,7 +29761,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29826,7 +29813,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29882,7 +29869,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29936,7 +29923,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -29988,7 +29975,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30051,7 +30038,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30107,7 +30094,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30189,7 +30176,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30243,7 +30230,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30332,7 +30319,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30399,7 +30386,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30475,7 +30462,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30533,7 +30520,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30597,7 +30584,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30677,7 +30664,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30737,7 +30724,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30798,7 +30785,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30851,7 +30838,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30920,7 +30907,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -30990,7 +30977,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31021,7 +31008,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31066,7 +31053,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31129,7 +31116,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31168,7 +31155,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31206,7 +31193,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31242,7 +31229,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31276,7 +31263,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31314,7 +31301,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31396,7 +31383,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31449,7 +31436,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31496,7 +31483,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31548,7 +31535,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31598,7 +31585,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31664,7 +31651,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31826,7 +31813,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31866,7 +31853,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31894,7 +31881,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31927,7 +31914,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -31965,7 +31952,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32066,7 +32053,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32167,7 +32154,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32270,7 +32257,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32335,7 +32322,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkDeviceMemory(boxed_memory_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32370,7 +32357,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32421,7 +32408,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32448,7 +32435,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32502,7 +32489,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32552,7 +32539,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32608,7 +32595,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32642,7 +32629,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                         (unsigned long long)dataSize, (unsigned long long)pData);
                 }
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 m_state->on_vkQueueFlushCommandsGOOGLE(&m_pool, queue, commandBuffer, dataSize,
                                                        pData, context);
                 vkStream->unsetHandleMapping();
@@ -32776,7 +32763,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32842,7 +32829,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32902,7 +32889,59 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
+                android::base::endTrace();
+                break;
+            }
+            case OP_vkQueueFlushCommandsFromAuxMemoryGOOGLE: {
+                android::base::beginTrace("vkQueueFlushCommandsFromAuxMemoryGOOGLE decode");
+                VkQueue queue;
+                VkCommandBuffer commandBuffer;
+                VkDeviceMemory deviceMemory;
+                VkDeviceSize dataOffset;
+                VkDeviceSize dataSize;
+                // Begin global wrapped dispatchable handle unboxing for queue;
+                uint64_t cgen_var_0;
+                memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
+                *readStreamPtrPtr += 1 * 8;
+                *(VkQueue*)&queue = (VkQueue)(VkQueue)((VkQueue)(*&cgen_var_0));
+                // No unbox for commandBuffer
+                uint64_t cgen_var_1;
+                memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
+                *readStreamPtrPtr += 1 * 8;
+                *(VkCommandBuffer*)&commandBuffer =
+                    (VkCommandBuffer)(VkCommandBuffer)((VkCommandBuffer)(*&cgen_var_1));
+                uint64_t cgen_var_2;
+                memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 1 * 8);
+                *readStreamPtrPtr += 1 * 8;
+                *(VkDeviceMemory*)&deviceMemory =
+                    (VkDeviceMemory)unbox_VkDeviceMemory((VkDeviceMemory)(*&cgen_var_2));
+                memcpy((VkDeviceSize*)&dataOffset, *readStreamPtrPtr, sizeof(VkDeviceSize));
+                *readStreamPtrPtr += sizeof(VkDeviceSize);
+                memcpy((VkDeviceSize*)&dataSize, *readStreamPtrPtr, sizeof(VkDeviceSize));
+                *readStreamPtrPtr += sizeof(VkDeviceSize);
+                if (m_logCalls) {
+                    fprintf(stderr,
+                            "stream %p: call vkQueueFlushCommandsFromAuxMemoryGOOGLE 0x%llx 0x%llx "
+                            "0x%llx 0x%llx 0x%llx \n",
+                            ioStream, (unsigned long long)queue, (unsigned long long)commandBuffer,
+                            (unsigned long long)deviceMemory, (unsigned long long)dataOffset,
+                            (unsigned long long)dataSize);
+                }
+                m_state->on_vkQueueFlushCommandsFromAuxMemoryGOOGLE(
+                    &m_pool, queue, commandBuffer, deviceMemory, dataOffset, dataSize, context);
+                vkStream->unsetHandleMapping();
+                vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
+                                         (uintptr_t)snapshotTraceBegin);
+                size_t snapshotTraceBytes = vkReadStream->endTrace();
+                if (m_state->snapshotsEnabled()) {
+                    m_state->snapshot()->vkQueueFlushCommandsFromAuxMemoryGOOGLE(
+                        snapshotTraceBegin, snapshotTraceBytes, &m_pool, queue, commandBuffer,
+                        deviceMemory, dataOffset, dataSize);
+                }
+                vkReadStream->clearPool();
+                if (queueSubmitWithCommandsEnabled)
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -32976,7 +33015,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33056,7 +33095,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33103,7 +33142,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33145,9 +33184,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkAccelerationStructureKHR*)pAccelerationStructure =
-                    (VkAccelerationStructureKHR)(VkAccelerationStructureKHR)((
-                        VkAccelerationStructureKHR)(*&cgen_var_2));
+                *(VkAccelerationStructureKHR*)pAccelerationStructure = (VkAccelerationStructureKHR)(
+                    VkAccelerationStructureKHR)((VkAccelerationStructureKHR)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkAccelerationStructureCreateInfoKHR(
                         m_state, (VkAccelerationStructureCreateInfoKHR*)(pCreateInfo));
@@ -33199,7 +33237,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33221,9 +33259,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkAccelerationStructureKHR*)&accelerationStructure =
-                    (VkAccelerationStructureKHR)(VkAccelerationStructureKHR)((
-                        VkAccelerationStructureKHR)(*&cgen_var_1));
+                *(VkAccelerationStructureKHR*)&accelerationStructure = (VkAccelerationStructureKHR)(
+                    VkAccelerationStructureKHR)((VkAccelerationStructureKHR)(*&cgen_var_1));
                 boxed_accelerationStructure_preserve = accelerationStructure;
                 accelerationStructure = unbox_VkAccelerationStructureKHR(accelerationStructure);
                 // WARNING PTR CHECK
@@ -33261,7 +33298,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 delete_VkAccelerationStructureKHR(boxed_accelerationStructure_preserve);
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33319,7 +33356,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33392,7 +33429,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33463,7 +33500,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33520,7 +33557,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33580,7 +33617,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33640,7 +33677,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33727,7 +33764,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33769,7 +33806,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33812,7 +33849,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33855,7 +33892,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33905,7 +33942,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -33976,7 +34013,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -34033,7 +34070,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -34115,7 +34152,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -34211,7 +34248,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -34322,7 +34359,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -34394,7 +34431,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -34482,7 +34519,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -34536,7 +34573,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }
@@ -34575,7 +34612,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
-                    __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST);
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 android::base::endTrace();
                 break;
             }

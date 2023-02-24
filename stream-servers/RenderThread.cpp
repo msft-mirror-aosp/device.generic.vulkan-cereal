@@ -423,21 +423,23 @@ intptr_t RenderThread::main() {
         bool progress;
 
         do {
-            std::unique_ptr<std::unordered_map<std::string, std::string>> renderThreadData =
-                std::make_unique<std::unordered_map<std::string, std::string>>();
+            std::unique_ptr<EventHangMetadata::HangAnnotations> renderThreadData =
+                std::make_unique<EventHangMetadata::HangAnnotations>();
             const char* processName = nullptr;
-            if (tInfo.m_processName) {
-                renderThreadData->insert(
-                    {{"renderthread_guest_process", tInfo.m_processName.value()}});
-                processName = tInfo.m_processName.value().c_str();
+            auto* healthMonitor = FrameBuffer::getFB()->getHealthMonitor();
+            if (healthMonitor) {
+                if (tInfo.m_processName) {
+                    renderThreadData->insert(
+                        {{"renderthread_guest_process", tInfo.m_processName.value()}});
+                    processName = tInfo.m_processName.value().c_str();
+                }
+                if (readBuf.validData() >= 4) {
+                    renderThreadData->insert(
+                        {{"first_opcode", std::to_string(*(uint32_t*)readBuf.buf())},
+                         {"buffer_length", std::to_string(readBuf.validData())}});
+                }
             }
-            if (readBuf.validData() >= 4) {
-                renderThreadData->insert(
-                    {{"first_opcode", std::to_string(*(uint32_t*)readBuf.buf())},
-                    {"buffer_length", std::to_string(readBuf.validData())}});
-            }
-            auto watchdog = WATCHDOG_BUILDER(FrameBuffer::getFB()->getHealthMonitor(),
-                                             "RenderThread decode operation")
+            auto watchdog = WATCHDOG_BUILDER(healthMonitor, "RenderThread decode operation")
                                 .setHangType(EventHangMetadata::HangType::kRenderThread)
                                 .setAnnotations(std::move(renderThreadData))
                                 .build();
@@ -459,15 +461,11 @@ intptr_t RenderThread::main() {
                 VkDecoderContext context = {
                     .processName = processName,
                     .gfxApiLogger = &gfxLogger,
-                    .healthMonitor = &FrameBuffer::getFB()->getHealthMonitor(),
+                    .healthMonitor = FrameBuffer::getFB()->getHealthMonitor(),
                     .metricsLogger = &metricsLogger,
                 };
-                uint32_t* seqno = nullptr;
-                if (processResources) {
-                    seqno = processResources->getSequenceNumberPtr();
-                }
                 last = tInfo.m_vkInfo->m_vkDec.decode(readBuf.buf(), readBuf.validData(), ioStream,
-                                                      seqno, context);
+                                                      processResources, context);
                 if (last > 0) {
                     if (!processResources) {
                         ERR("Processed some Vulkan packets without process resources created. "

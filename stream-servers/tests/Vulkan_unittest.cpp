@@ -27,6 +27,7 @@
 #include "host-common/GraphicsAgentFactory.h"
 #include "host-common/opengl/misc.h"
 #include "host-common/testing/MockGraphicsAgentFactory.h"
+#include "tests/VkTestUtils.h"
 
 #include "Standalone.h"
 
@@ -48,66 +49,13 @@ using android::base::TestSystem;
 
 namespace emugl {
 
-static std::string libDir() {
-    return
-        pj({android::base::getProgramDirectory(),
-#ifdef _WIN32
-           // Windows uses mock Vulkan ICD.
-           "testlib64"
-#else
-           "lib64", "vulkan"
-#endif
-        });
-}
-
-static std::string testIcdFilename() {
-    return pj(libDir(),
-#ifdef _WIN32
-        // Windows uses mock Vulkan ICD.
-        "VkICD_mock_icd.json"
-#else
-        "vk_swiftshader_icd.json"
-#endif
-    );
-}
+static constexpr const HandleType kArbitraryColorBufferHandle = 5;
 
 #ifdef _WIN32
 #define SKIP_TEST_IF_WIN32() GTEST_SKIP()
 #else
 #define SKIP_TEST_IF_WIN32()
 #endif
-
-static void* dlOpenFuncForTesting() {
-#ifdef _WIN32
-    const Win32UnicodeString name("vulkan-1.dll");
-    return LoadLibraryW(name.c_str());
-#else
-
-#ifdef __APPLE__
-    constexpr char suffix[] = ".dylib";
-#else
-    constexpr char suffix[] = ".so";
-#endif
-
-    std::string libName =
-        std::string("libvulkan") + suffix;
-
-    auto res = dlopen(pj(libDir(), libName).c_str(), RTLD_NOW);
-    if (!res) {
-        libName = std::string("libvulkan") + suffix + ".1";
-    }
-    res = dlopen(pj(libDir(), libName).c_str(), RTLD_NOW);
-    return res;
-#endif
-}
-
-static void* dlSymFuncForTesting(void* lib, const char* sym) {
-#ifdef _WIN32
-    return (void*)GetProcAddress((HMODULE)lib, sym);
-#else
-    return dlsym(lib, sym);
-#endif
-}
 
 static std::string deviceTypeToString(VkPhysicalDeviceType type) {
 #define DO_ENUM_RETURN_STRING(e) \
@@ -449,18 +397,12 @@ protected:
     static void TearDownTestSuite() { }
 
     void SetUp() override {
-        android::base::setEnvironmentVariable(
-            "VK_ICD_FILENAMES",
-            testIcdFilename());
-
-        goldfish_vk::init_vulkan_dispatch_from_system_loader(
-                dlOpenFuncForTesting,
-                dlSymFuncForTesting,
-                &mVk);
+        auto dispatch = emugl::vkDispatch(false);
+        ASSERT_NE(dispatch, nullptr);
+        mVk = *dispatch;
 
         testInstanceCreation(&mVk, &mInstance);
-        testDeviceCreation(
-            &mVk, mInstance, &mPhysicalDevice, &mDevice);
+        testDeviceCreation(&mVk, mInstance, &mPhysicalDevice, &mDevice);
     }
 
     void TearDown() override {
@@ -500,7 +442,6 @@ protected:
         feature_set_enabled_override(kFeature_Vulkan, true);
         feature_set_enabled_override(kFeature_VulkanIgnoredHandles, true);
 
-        android::base::setEnvironmentVariable("ANDROID_EMU_VK_ICD", "swiftshader");
         VulkanTest::SetUp();
 
         emugl::setGLObjectCounter(android::base::GLObjectCounter::get());
@@ -533,15 +474,12 @@ protected:
 
 TEST_F(VulkanFrameBufferTest, VkColorBufferWithoutMemoryProperties) {
     // Create a color buffer without any memory properties restriction.
-    HandleType colorBuffer = mFb->createColorBuffer(
-            mWidth, mHeight, GL_RGBA, FRAMEWORK_FORMAT_GL_COMPATIBLE);
-    ASSERT_NE(colorBuffer, 0u);
-    EXPECT_TRUE(goldfish_vk::setupVkColorBuffer(colorBuffer,
-                                                true, /* vulkanOnly */
-                                                0     /* memoryProperty */
+    EXPECT_TRUE(goldfish_vk::setupVkColorBuffer(mWidth, mHeight, GL_RGBA,
+                                                FRAMEWORK_FORMAT_GL_COMPATIBLE,
+                                                kArbitraryColorBufferHandle, true, /* vulkanOnly */
+                                                0 /* memoryProperty */
                                                 ));
-    EXPECT_TRUE(goldfish_vk::teardownVkColorBuffer(colorBuffer));
-    mFb->closeColorBuffer(colorBuffer);
+    EXPECT_TRUE(goldfish_vk::teardownVkColorBuffer(kArbitraryColorBufferHandle));
 }
 
 TEST_F(VulkanFrameBufferTest, VkColorBufferWithMemoryPropertyFlags) {
@@ -602,19 +540,22 @@ TEST_F(VulkanFrameBufferTest, VkColorBufferWithMemoryPropertyFlags) {
     }
 
     // Create a color buffer with the target memory property flags.
+    EXPECT_TRUE(goldfish_vk::setupVkColorBuffer(mWidth, mHeight, GL_RGBA,
+                                                FRAMEWORK_FORMAT_GL_COMPATIBLE,
+                                                kArbitraryColorBufferHandle, true, /* vulkanOnly */
+                                                static_cast<uint32_t>(kTargetMemoryPropertyFlags)));
+
     uint32_t allocatedTypeIndex = 0u;
-    HandleType colorBuffer = mFb->createColorBuffer(
-            mWidth, mHeight, GL_RGBA, FRAMEWORK_FORMAT_GL_COMPATIBLE);
-    ASSERT_NE(colorBuffer, 0u);
-    EXPECT_TRUE(goldfish_vk::setupVkColorBuffer(
-            colorBuffer, true, /* vulkanOnly */
-            static_cast<uint32_t>(kTargetMemoryPropertyFlags), nullptr, nullptr,
-            &allocatedTypeIndex));
+    EXPECT_TRUE(goldfish_vk::getColorBufferAllocationInfo(kArbitraryColorBufferHandle, nullptr,
+                                                          &allocatedTypeIndex, nullptr, nullptr));
+
     EXPECT_TRUE(vkEmulation->deviceInfo.memProps.memoryTypes[allocatedTypeIndex]
                         .propertyFlags &
                 kTargetMemoryPropertyFlags);
-    EXPECT_TRUE(goldfish_vk::teardownVkColorBuffer(colorBuffer));
-    mFb->closeColorBuffer(colorBuffer);
+
+    EXPECT_TRUE(goldfish_vk::teardownVkColorBuffer(kArbitraryColorBufferHandle));
 }
+
 #endif // !_WIN32
+
 } // namespace emugl

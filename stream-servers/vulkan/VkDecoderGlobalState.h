@@ -65,9 +65,12 @@ class VkDecoderGlobalState {
     VkDecoderGlobalState();
     ~VkDecoderGlobalState();
 
-    // There should only be one instance of VkDecoderGlobalState
-    // per process
+    // There should only be one instance of VkDecoderGlobalState per process
+    // Note: currently not thread-safe
     static VkDecoderGlobalState* get();
+
+    // For testing only - destroys the global instance of VkDecoderGlobalState.
+    static void reset();
 
     // Snapshot save/load
     bool snapshotsEnabled() const;
@@ -78,7 +81,7 @@ class VkDecoderGlobalState {
 
     void save(android::base::Stream* stream);
     void load(android::base::Stream* stream, emugl::GfxApiLogger& gfxLogger,
-              emugl::HealthMonitor<>& healthMonitor);
+              emugl::HealthMonitor<>* healthMonitor);
 
     // Lock/unlock of global state to serve as a global lock
     void lock();
@@ -186,6 +189,9 @@ class VkDecoderGlobalState {
     void on_vkGetDeviceQueue(android::base::BumpPool* pool, VkDevice device,
                              uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue* pQueue);
 
+    void on_vkGetDeviceQueue2(android::base::BumpPool* pool, VkDevice device,
+                              const VkDeviceQueueInfo2* pQueueInfo, VkQueue* pQueue);
+
     void on_vkDestroyDevice(android::base::BumpPool* pool, VkDevice device,
                             const VkAllocationCallbacks* pAllocator);
 
@@ -214,6 +220,11 @@ class VkDecoderGlobalState {
 
     VkResult on_vkBindImageMemory(android::base::BumpPool* pool, VkDevice device, VkImage image,
                                   VkDeviceMemory memory, VkDeviceSize memoryOffset);
+    VkResult on_vkBindImageMemory2(android::base::BumpPool* pool, VkDevice device,
+                                   uint32_t bindInfoCount, const VkBindImageMemoryInfo* pBindInfos);
+    VkResult on_vkBindImageMemory2KHR(android::base::BumpPool* pool, VkDevice device,
+                                      uint32_t bindInfoCount,
+                                      const VkBindImageMemoryInfo* pBindInfos);
 
     VkResult on_vkCreateImageView(android::base::BumpPool* pool, VkDevice device,
                                   const VkImageViewCreateInfo* pCreateInfo,
@@ -582,6 +593,11 @@ class VkDecoderGlobalState {
     void on_vkQueueFlushCommandsGOOGLE(android::base::BumpPool* pool, VkQueue queue,
                                        VkCommandBuffer commandBuffer, VkDeviceSize dataSize,
                                        const void* pData, const VkDecoderContext& context);
+    void on_vkQueueFlushCommandsFromAuxMemoryGOOGLE(android::base::BumpPool* pool, VkQueue queue,
+                                                    VkCommandBuffer commandBuffer,
+                                                    VkDeviceMemory deviceMemory,
+                                                    VkDeviceSize dataOffset, VkDeviceSize dataSize,
+                                                    const VkDecoderContext& context);
     void on_vkQueueCommitDescriptorSetUpdatesGOOGLE(
         android::base::BumpPool* pool, VkQueue queue, uint32_t descriptorPoolCount,
         const VkDescriptorPool* pDescriptorPools, uint32_t descriptorSetCount,
