@@ -144,12 +144,12 @@ void ColorBuffer::readToBytes(int x, int y, int width, int height, GLenum pixels
                               GLenum pixelsType, void* outPixels) {
     touch();
 
-    if (mColorBufferVk) {
-        goldfish_vk::readColorBufferToBytes(mHandle, x, y, width, height, outPixels);
-        return;
-    }
     if (mColorBufferGl) {
         mColorBufferGl->readPixels(x, y, width, height, pixelsFormat, pixelsType, outPixels);
+        return;
+    }
+    if (mColorBufferVk) {
+        goldfish_vk::readColorBufferToBytes(mHandle, x, y, width, height, outPixels);
         return;
     }
 
@@ -174,12 +174,12 @@ void ColorBuffer::readYuvToBytes(int x, int y, int width, int height, void* outP
                                  uint32_t pixelsSize) {
     touch();
 
-    if (mColorBufferVk) {
-        goldfish_vk::readColorBufferToBytes(mHandle, x, y, width, height, outPixels);
-        return;
-    }
     if (mColorBufferGl) {
         mColorBufferGl->readPixelsYUVCached(x, y, width, height, outPixels, pixelsSize);
+        return;
+    }
+    if (mColorBufferVk) {
+        goldfish_vk::readColorBufferToBytes(mHandle, x, y, width, height, outPixels);
         return;
     }
 
@@ -191,13 +191,13 @@ bool ColorBuffer::updateFromBytes(int x, int y, int width, int height,
                                   GLenum pixelsType, const void* pixels) {
     touch();
 
-    if (mColorBufferVk) {
-        return goldfish_vk::updateColorBufferFromBytes(mHandle, x, y, width, height, pixels);
-    }
     if (mColorBufferGl) {
         mColorBufferGl->subUpdateFromFrameworkFormat(x, y, width, height, frameworkFormat,
                                                      pixelsFormat, pixelsType, pixels);
         return true;
+    }
+    if (mColorBufferVk) {
+        return goldfish_vk::updateColorBufferFromBytes(mHandle, x, y, width, height, pixels);
     }
 
     GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "No ColorBuffer impl?";
@@ -208,11 +208,11 @@ bool ColorBuffer::updateFromBytes(int x, int y, int width, int height, GLenum pi
                                   GLenum pixelsType, const void* pixels) {
     touch();
 
-    if (mColorBufferVk) {
-        return goldfish_vk::updateColorBufferFromBytes(mHandle, x, y, width, height, pixels);
-    }
     if (mColorBufferGl) {
         return mColorBufferGl->subUpdate(x, y, width, height, pixelsFormat, pixelsType, pixels);
+    }
+    if (mColorBufferVk) {
+        return goldfish_vk::updateColorBufferFromBytes(mHandle, x, y, width, height, pixels);
     }
 
     GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "No ColorBuffer impl?";
