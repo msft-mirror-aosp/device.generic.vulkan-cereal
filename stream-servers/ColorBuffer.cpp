@@ -15,6 +15,8 @@
 #include "ColorBuffer.h"
 
 #include "gl/EmulationGl.h"
+#include "host-common/GfxstreamFatalError.h"
+#include "host-common/logging.h"
 #include "vulkan/ColorBufferVk.h"
 #include "vulkan/VkCommonOperations.h"
 
@@ -149,7 +151,7 @@ void ColorBuffer::readToBytes(int x, int y, int width, int height, GLenum pixels
         return;
     }
     if (mColorBufferVk) {
-        goldfish_vk::readColorBufferToBytes(mHandle, x, y, width, height, outPixels);
+        mColorBufferVk->readToBytes(x, y, width, height, outPixels);
         return;
     }
 
@@ -179,7 +181,7 @@ void ColorBuffer::readYuvToBytes(int x, int y, int width, int height, void* outP
         return;
     }
     if (mColorBufferVk) {
-        goldfish_vk::readColorBufferToBytes(mHandle, x, y, width, height, outPixels);
+        mColorBufferVk->readToBytes(x, y, width, height, outPixels);
         return;
     }
 
@@ -197,7 +199,7 @@ bool ColorBuffer::updateFromBytes(int x, int y, int width, int height,
         return true;
     }
     if (mColorBufferVk) {
-        return goldfish_vk::updateColorBufferFromBytes(mHandle, x, y, width, height, pixels);
+        return mColorBufferVk->updateFromBytes(x, y, width, height, pixels);
     }
 
     GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "No ColorBuffer impl?";
@@ -212,7 +214,7 @@ bool ColorBuffer::updateFromBytes(int x, int y, int width, int height, GLenum pi
         return mColorBufferGl->subUpdate(x, y, width, height, pixelsFormat, pixelsType, pixels);
     }
     if (mColorBufferVk) {
-        return goldfish_vk::updateColorBufferFromBytes(mHandle, x, y, width, height, pixels);
+        return mColorBufferVk->updateFromBytes(x, y, width, height, pixels);
     }
 
     GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "No ColorBuffer impl?";
@@ -267,55 +269,108 @@ std::unique_ptr<BorrowedImageInfo> ColorBuffer::borrowForDisplay(UsedApi api) {
     return nullptr;
 }
 
-void ColorBuffer::updateFromGl() {
+bool ColorBuffer::flushFromGl() {
     if (!(mColorBufferGl && mColorBufferVk)) {
-        return;
+        return true;
     }
 
     if (mGlAndVkAreSharingExternalMemory) {
-        return;
+        return true;
+    }
+
+    // ColorBufferGl is currently considered the "main" backing. If this changes,
+    // the "main"  should be updated from the current contents of the GL backing.
+    return true;
+}
+
+bool ColorBuffer::flushFromVk() {
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
+    }
+
+    std::vector<uint8_t> contents;
+    if (!goldfish_vk::readColorBufferToBytes(mHandle, &contents)) {
+        ERR("Failed to get VK contents for ColorBuffer:%d", mHandle);
+        return false;
+    }
+
+    if (contents.empty()) {
+        return false;
+    }
+
+    if (!mColorBufferGl->replaceContents(contents.data(), contents.size())) {
+        ERR("Failed to set GL contents for ColorBuffer:%d", mHandle);
+        return false;
+    }
+
+    return true;
+}
+
+bool ColorBuffer::flushFromVkBytes(const void* bytes, size_t bytesSize) {
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
+    }
+
+    if (mColorBufferGl) {
+        if (mColorBufferGl->replaceContents(bytes, bytesSize)) {
+            ERR("Failed to update ColorBuffer:%d GL backing from VK bytes.", mHandle);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool ColorBuffer::invalidateForGl() {
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
+    }
+
+    // ColorBufferGl is currently considered the "main" backing. If this changes,
+    // the GL backing should be updated from the "main" backing.
+    return true;
+}
+
+bool ColorBuffer::invalidateForVk() {
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
     }
 
     std::size_t contentsSize = 0;
     if (!mColorBufferGl->readContents(&contentsSize, nullptr)) {
         ERR("Failed to get GL contents size for ColorBuffer:%d", mHandle);
-        return;
+        return false;
     }
 
     std::vector<uint8_t> contents(contentsSize, 0);
 
     if (!mColorBufferGl->readContents(&contentsSize, contents.data())) {
         ERR("Failed to get GL contents for ColorBuffer:%d", mHandle);
-        return;
+        return false;
     }
 
-    if (!goldfish_vk::updateColorBufferFromBytes(mHandle, contents)) {
+    if (!mColorBufferVk->updateFromBytes(contents)) {
         ERR("Failed to set VK contents for ColorBuffer:%d", mHandle);
-        return;
-    }
-}
-
-void ColorBuffer::updateFromVk() {
-    if (!(mColorBufferGl && mColorBufferVk)) {
-        return;
+        return false;
     }
 
-    if (mGlAndVkAreSharingExternalMemory) {
-        return;
-    }
-
-    std::vector<uint8_t> contents;
-    if (!goldfish_vk::readColorBufferToBytes(mHandle, &contents)) {
-        ERR("Failed to get VK contents for ColorBuffer:%d", mHandle);
-        return;
-    }
-
-    if (contents.empty()) return;
-
-    if (!mColorBufferGl->replaceContents(contents.data(), contents.size())) {
-        ERR("Failed to set GL contents for ColorBuffer:%d", mHandle);
-        return;
-    }
+    return true;
 }
 
 bool ColorBuffer::glOpBlitFromCurrentReadBuffer() {
@@ -414,7 +469,7 @@ void ColorBuffer::glOpSwapYuvTexturesAndUpdate(GLenum format, GLenum type,
     // YUVConverter::drawConvert() with the updated YUV textures.
     mColorBufferGl->subUpdate(0, 0, mWidth, mHeight, format, type, nullptr);
 
-    updateFromGl();
+    flushFromGl();
 }
 
 bool ColorBuffer::glOpReadContents(size_t* outNumBytes, void* outContents) {
@@ -423,13 +478,6 @@ bool ColorBuffer::glOpReadContents(size_t* outNumBytes, void* outContents) {
     }
 
     return mColorBufferGl->readContents(outNumBytes, outContents);
-}
-
-bool ColorBuffer::glOpReplaceContents(size_t numBytes, const void* contents) {
-    if (mColorBufferGl) {
-        return mColorBufferGl->replaceContents(contents, numBytes);
-    }
-    return false;
 }
 
 bool ColorBuffer::glOpIsFastBlitSupported() const {
