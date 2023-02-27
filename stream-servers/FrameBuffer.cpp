@@ -50,6 +50,7 @@
 #include "host-common/misc.h"
 #include "host-common/opengl/misc.h"
 #include "host-common/vm_operations.h"
+#include "render-utils/MediaNative.h"
 #include "vulkan/DisplayVk.h"
 #include "vulkan/VkCommonOperations.h"
 #include "vulkan/VkDecoderGlobalState.h"
@@ -1777,22 +1778,15 @@ void FrameBuffer::markOpened(ColorBufferRef* cbRef) {
 bool FrameBuffer::flushEmulatedEglWindowSurfaceColorBuffer(HandleType p_surface) {
     AutoLock mutex(m_lock);
 
-    EmulatedEglWindowSurfaceMap::iterator w(m_windows.find(p_surface));
-    if (w == m_windows.end()) {
+    auto it = m_windows.find(p_surface);
+    if (it == m_windows.end()) {
         ERR("FB::flushEmulatedEglWindowSurfaceColorBuffer: window handle %#x not found",
             p_surface);
         // bad surface handle
         return false;
     }
 
-    GLenum resetStatus = s_gles2.glGetGraphicsResetStatusEXT();
-    if (resetStatus != GL_NO_ERROR) {
-        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) <<
-                "Stream server aborting due to graphics reset. ResetStatus: " <<
-                std::hex << resetStatus;
-    }
-
-    EmulatedEglWindowSurface* surface = (*w).second.first.get();
+    EmulatedEglWindowSurface* surface = it->second.first.get();
     surface->flushColorBuffer();
 
     return true;
@@ -1932,12 +1926,6 @@ void FrameBuffer::destroyYUVTextures(uint32_t type,
     }
 }
 
-extern "C" {
-typedef void (*yuv_updater_t)(void* privData,
-                              uint32_t type,
-                              uint32_t* textures);
-}
-
 void FrameBuffer::updateYUVTextures(uint32_t type,
                                     uint32_t* textures,
                                     void* privData,
@@ -1957,7 +1945,18 @@ void FrameBuffer::updateYUVTextures(uint32_t type,
         gtextures[2] = s_gles2.glGetGlobalTexName(textures[2]);
     }
 
-    updater(privData, type, gtextures);
+#ifdef __APPLE__
+    EGLContext prevContext = s_egl.eglGetCurrentContext();
+    void* nativecontext = getDisplay()->getLowLevelContext(prevContext);
+    struct MediaNativeCallerData callerdata;
+    callerdata.ctx = nativecontext;
+    callerdata.converter = nsConvertVideoFrameToNV12Textures;
+    void* pcallerdata = &callerdata;
+#else
+    void* pcallerdata = nullptr;
+#endif
+
+    updater(privData, type, gtextures, pcallerdata);
 }
 
 void FrameBuffer::swapTexturesAndUpdateColorBuffer(uint32_t p_colorbuffer,
@@ -2042,19 +2041,6 @@ bool FrameBuffer::updateColorBufferFromFrameworkFormat(HandleType p_colorbuffer,
 
     (*c).second.cb->updateFromBytes(x, y, width, height, fwkFormat, format, type, pixels);
     return true;
-}
-
-bool FrameBuffer::replaceColorBufferContents(
-    HandleType p_colorbuffer, const void* pixels, size_t numBytes) {
-    AutoLock mutex(m_lock);
-
-    ColorBufferPtr colorBuffer = findColorBuffer(p_colorbuffer);
-    if (!colorBuffer) {
-        // bad colorbuffer handle
-        return false;
-    }
-
-    return colorBuffer->glOpReplaceContents(numBytes, pixels);
 }
 
 bool FrameBuffer::readColorBufferContents(
@@ -2371,7 +2357,7 @@ void FrameBuffer::destroySharedTrivialContext(EGLContext context,
 
 bool FrameBuffer::post(HandleType p_colorbuffer, bool needLockAndBind) {
     if (m_guestUsesAngle) {
-        updateColorBufferFromGlLocked(p_colorbuffer);
+        flushColorBufferFromGl(p_colorbuffer);
     }
 
     auto res = postImplSync(p_colorbuffer, needLockAndBind);
@@ -2382,7 +2368,7 @@ bool FrameBuffer::post(HandleType p_colorbuffer, bool needLockAndBind) {
 void FrameBuffer::postWithCallback(HandleType p_colorbuffer, Post::CompletionCallback callback,
                                    bool needLockAndBind) {
     if (m_guestUsesAngle) {
-        updateColorBufferFromGl(p_colorbuffer);
+        flushColorBufferFromGl(p_colorbuffer);
     }
 
     AsyncResult res = postImpl(p_colorbuffer, callback, needLockAndBind);
@@ -3497,6 +3483,12 @@ std::unique_ptr<BorrowedImageInfo> FrameBuffer::borrowColorBufferForComposition(
         return nullptr;
     }
 
+    if (m_useVulkanComposition) {
+        invalidateColorBufferForVk(colorBufferHandle);
+    } else {
+        invalidateColorBufferForGl(colorBufferHandle);
+    }
+
     const auto api = m_useVulkanComposition ? ColorBuffer::UsedApi::kVk : ColorBuffer::UsedApi::kGl;
     return colorBufferPtr->borrowForComposition(api, colorBufferIsTarget);
 }
@@ -3508,6 +3500,13 @@ std::unique_ptr<BorrowedImageInfo> FrameBuffer::borrowColorBufferForDisplay(
         ERR("Failed to get borrowed image info for ColorBuffer:%d", colorBufferHandle);
         return nullptr;
     }
+
+    if (m_useVulkanComposition) {
+        invalidateColorBufferForVk(colorBufferHandle);
+    } else {
+        invalidateColorBufferForGl(colorBufferHandle);
+    }
+
     const auto api = m_useVulkanComposition ? ColorBuffer::UsedApi::kVk : ColorBuffer::UsedApi::kGl;
     return colorBufferPtr->borrowForDisplay(api);
 }
@@ -3714,27 +3713,60 @@ const int FrameBuffer::getDisplayActiveConfig() {
     return mDisplayActiveConfigId >= 0 ? mDisplayActiveConfigId : -1;
 }
 
-void FrameBuffer::updateColorBufferFromGl(HandleType colorBufferHandle) {
+bool FrameBuffer::flushColorBufferFromGl(HandleType colorBufferHandle) {
     AutoLock mutex(m_lock);
-    updateColorBufferFromGlLocked(colorBufferHandle);
+    return flushColorBufferFromGlLocked(colorBufferHandle);
 }
 
-void FrameBuffer::updateColorBufferFromGlLocked(HandleType colorBufferHandle) {
+bool FrameBuffer::flushColorBufferFromGlLocked(HandleType colorBufferHandle) {
     auto colorBuffer = findColorBuffer(colorBufferHandle);
     if (!colorBuffer) {
         ERR("Failed to find ColorBuffer:%d", colorBufferHandle);
-        return;
+        return false;
     }
-    colorBuffer->updateFromGl();
+    return colorBuffer->flushFromGl();
 }
 
-void FrameBuffer::updateColorBufferFromVk(HandleType colorBufferHandle) {
+bool FrameBuffer::flushColorBufferFromVk(HandleType colorBufferHandle) {
     AutoLock mutex(m_lock);
 
     auto colorBuffer = findColorBuffer(colorBufferHandle);
     if (!colorBuffer) {
         ERR("Failed to find ColorBuffer:%d", colorBufferHandle);
-        return;
+        return false;
     }
-    colorBuffer->updateFromVk();
+    return colorBuffer->flushFromVk();
+}
+
+bool FrameBuffer::flushColorBufferFromVkBytes(HandleType colorBufferHandle, const void* bytes, size_t bytesSize) {
+    AutoLock mutex(m_lock);
+
+    auto colorBuffer = findColorBuffer(colorBufferHandle);
+    if (!colorBuffer) {
+        ERR("Failed to find ColorBuffer:%d", colorBufferHandle);
+        return false;
+    }
+    return colorBuffer->flushFromVkBytes(bytes, bytesSize);
+}
+
+bool FrameBuffer::invalidateColorBufferForGl(HandleType colorBufferHandle) {
+    AutoLock mutex(m_lock);
+
+    auto colorBuffer = findColorBuffer(colorBufferHandle);
+    if (!colorBuffer) {
+        ERR("Failed to find ColorBuffer:%d", colorBufferHandle);
+        return false;
+    }
+    return colorBuffer->invalidateForGl();
+}
+
+bool FrameBuffer::invalidateColorBufferForVk(HandleType colorBufferHandle) {
+    AutoLock mutex(m_lock);
+
+    auto colorBuffer = findColorBuffer(colorBufferHandle);
+    if (!colorBuffer) {
+        ERR("Failed to find ColorBuffer:%d", colorBufferHandle);
+        return false;
+    }
+    return colorBuffer->invalidateForVk();
 }
