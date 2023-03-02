@@ -85,11 +85,13 @@ class ProcessResources {
     DISALLOW_COPY_ASSIGN_AND_MOVE(ProcessResources);
 
     ~ProcessResources() = default;
-    uint32_t* getSequenceNumberPtr() const { return &mSequenceNumber; }
+    std::atomic<uint32_t>* getSequenceNumberPtr() const {
+        return &mSequenceNumber;
+    }
 
    private:
     ProcessResources() : mSequenceNumber(0) {}
-    mutable uint32_t mSequenceNumber;
+    mutable std::atomic<uint32_t> mSequenceNumber;
 };
 
 typedef std::unordered_map<uint64_t, gfxstream::EmulatedEglWindowSurfaceSet>
@@ -410,11 +412,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     bool updateColorBufferFromFrameworkFormat(HandleType p_colorbuffer, int x, int y, int width,
                                               int height, FrameworkFormat fwkFormat, GLenum format,
                                               GLenum type, void* pixels);
-    // Replaces contents completely using the color buffer's current format,
-    // with row length equal to width of a row in bytes.
-    // The number of bytes is passed as a check.
-    bool replaceColorBufferContents(HandleType p_colorbuffer,
-                                    const void* pixels, size_t numBytes);
+
     // Reads back the raw color buffer to |pixels|
     // if |pixels| is not null.
     // Always returns in |numBytes| how many bytes were
@@ -557,10 +555,6 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
 
     bool isVulkanInteropSupported() const { return m_vulkanInteropSupported; }
     bool isVulkanEnabled() const { return m_vulkanEnabled; }
-    bool importMemoryToColorBuffer(android::base::ManagedDescriptor descriptor, uint64_t size,
-                                   bool dedicated, bool vulkanOnly, uint32_t colorBufferHandle,
-                                   VkImage, const VkImageCreateInfo&);
-    void setColorBufferInUse(uint32_t colorBufferHandle, bool inUse);
 
     // Fill GLES usage protobuf
     void fillGLESUsages(android_studio::EmulatorGLESUsages*);
@@ -662,6 +656,13 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     const int getDisplayConfigsParam(int configId, EGLint param);
     const int getDisplayActiveConfig();
 
+    bool flushColorBufferFromGl(HandleType colorBufferHandle);
+    bool flushColorBufferFromGlLocked(HandleType colorBufferHandle);
+    bool flushColorBufferFromVk(HandleType colorBufferHandle);
+    bool flushColorBufferFromVkBytes(HandleType colorBufferHandle, const void* bytes, size_t bytesSize);
+    bool invalidateColorBufferForGl(HandleType colorBufferHandle);
+    bool invalidateColorBufferForVk(HandleType colorBufferHandle);
+
    private:
     FrameBuffer(int p_width, int p_height, bool useSubWindow);
     // Requires the caller to hold the m_colorBufferMapLock until the new handle is inserted into of
@@ -678,6 +679,9 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     bool closeColorBufferLocked(HandleType p_colorbuffer, bool forced = false);
     // Returns true if this was the last ref and we need to destroy stuff.
     bool decColorBufferRefCountLocked(HandleType p_colorbuffer);
+    // Decrease refcount but not destroy the object.
+    // Mainly used in post thread, when we need to destroy the object but cannot in post thread.
+    void decColorBufferRefCountNoDestroy(HandleType p_colorbuffer);
     // Close all expired color buffers for real.
     // Treat all delayed color buffers as expired if forced=true
     void performDelayedColorBufferCloseLocked(bool forced = false);
@@ -693,7 +697,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     HandleType createColorBufferWithHandleLocked(int p_width, int p_height, GLenum p_internalFormat,
                                                  FrameworkFormat p_frameworkFormat,
                                                  HandleType handle);
-    HandleType createBufferWithHandleLocked(int p_size, HandleType handle);
+    HandleType createBufferWithHandleLocked(int p_size, HandleType handle, uint32_t memoryProperty);
 
     void recomputeLayout();
     void setDisplayPoseInSkinUI(int totalHeight);
@@ -792,7 +796,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
         }
     };
     std::map<uint32_t, onPost> m_onPost;
-    gfxstream::ReadbackWorker* m_readbackWorker;
+    gfxstream::ReadbackWorker* m_readbackWorker = nullptr;
     android::base::WorkerThread<Readback> m_readbackThread;
     std::atomic_bool m_readbackThreadStarted = false;
 
@@ -851,6 +855,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     Compositor* m_compositor = nullptr;
     bool m_useVulkanComposition = false;
 
+    goldfish_vk::VkEmulation* m_emulationVk = nullptr;
     // The implementation for Vulkan native swapchain. Only initialized when useVulkan is set when
     // calling FrameBuffer::initialize(). DisplayVk is actually owned by VkEmulation.
     DisplayVk *m_displayVk = nullptr;
