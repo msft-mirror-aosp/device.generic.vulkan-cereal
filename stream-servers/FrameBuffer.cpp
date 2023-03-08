@@ -42,6 +42,7 @@
 #include "aemu/base/system/System.h"
 #include "aemu/base/Tracing.h"
 #include "gl/YUVConverter.h"
+#include "gl/glestranslator/EGL/EglGlobalInfo.h"
 #include "gl/gles2_dec/gles2_dec.h"
 #include "host-common/GfxstreamFatalError.h"
 #include "host-common/crash_reporter.h"
@@ -50,6 +51,7 @@
 #include "host-common/misc.h"
 #include "host-common/opengl/misc.h"
 #include "host-common/vm_operations.h"
+#include "render-utils/MediaNative.h"
 #include "vulkan/DisplayVk.h"
 #include "vulkan/VkCommonOperations.h"
 #include "vulkan/VkDecoderGlobalState.h"
@@ -244,6 +246,9 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow, bool egl2
             GL_LOG("Doesn't support id properties, no vulkan device UUID");
             fprintf(stderr, "%s: Doesn't support id properties, no vulkan device UUID\n", __func__);
         }
+        INFO("Gfxstream initialized VK emulation.");
+    } else {
+        INFO("Gfxstream skipping VK emulation.");
     }
 
     // Use ANGLE's EGL null backend to prevent from accidentally calling into EGL.
@@ -262,6 +267,9 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow, bool egl2
             ERR("Failed to initialize GL emulation.");
             return false;
         }
+        INFO("Gfxstream initialized GL emulation.");
+    } else {
+        INFO("Gfxstream skipping GL emulation.");
     }
 
     fb->m_guestUsesAngle =
@@ -952,11 +960,6 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
         }
     }
 
-    if (m_emulationGl && success && redrawSubwindow) {
-        RecursiveScopedContextBind bind(getPbufferSurfaceContextHelper());
-        assert(bind.isOk());
-        s_gles2.glViewport(0, 0, fbw * dpr, fbh * dpr);
-    }
     mutex.unlock();
 
     // Nobody ever checks for the return code, so there will be no retries or
@@ -1126,17 +1129,14 @@ HandleType FrameBuffer::createBufferWithHandleLocked(int p_size, HandleType hand
             << "Buffer already exists with handle " << handle;
     }
 
-    BufferPtr buffer(Buffer::create(p_size, handle, getPbufferSurfaceContextHelper()));
+    gfxstream::BufferPtr buffer(
+        gfxstream::Buffer::create(m_emulationGl.get(), m_emulationVk, p_size, handle));
     if (!buffer) {
         ERR("Create buffer failed.\n");
         return 0;
     }
 
     m_buffers[handle] = {std::move(buffer)};
-
-    if (m_displayVk || m_guestUsesAngle) {
-        goldfish_vk::setupVkBuffer(handle, /* vulkanOnly */ true, memoryProperty);
-    }
 
     return handle;
 }
@@ -1508,13 +1508,13 @@ void FrameBuffer::closeColorBuffer(HandleType p_colorbuffer) {
 void FrameBuffer::closeBuffer(HandleType p_buffer) {
     AutoLock mutex(m_lock);
 
-    if (m_buffers.find(p_buffer) == m_buffers.end()) {
-        ERR("closeColorBuffer: cannot find buffer %u",
-            static_cast<uint32_t>(p_buffer));
-    } else {
-        goldfish_vk::teardownVkBuffer(p_buffer);
-        m_buffers.erase(p_buffer);
+    auto it = m_buffers.find(p_buffer);
+    if (it == m_buffers.end()) {
+        ERR("Failed to find Buffer:%d", p_buffer);
+        return;
     }
+
+    m_buffers.erase(it);
 }
 
 bool FrameBuffer::closeColorBufferLocked(HandleType p_colorbuffer,
@@ -1777,22 +1777,15 @@ void FrameBuffer::markOpened(ColorBufferRef* cbRef) {
 bool FrameBuffer::flushEmulatedEglWindowSurfaceColorBuffer(HandleType p_surface) {
     AutoLock mutex(m_lock);
 
-    EmulatedEglWindowSurfaceMap::iterator w(m_windows.find(p_surface));
-    if (w == m_windows.end()) {
+    auto it = m_windows.find(p_surface);
+    if (it == m_windows.end()) {
         ERR("FB::flushEmulatedEglWindowSurfaceColorBuffer: window handle %#x not found",
             p_surface);
         // bad surface handle
         return false;
     }
 
-    GLenum resetStatus = s_gles2.glGetGraphicsResetStatusEXT();
-    if (resetStatus != GL_NO_ERROR) {
-        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) <<
-                "Stream server aborting due to graphics reset. ResetStatus: " <<
-                std::hex << resetStatus;
-    }
-
-    EmulatedEglWindowSurface* surface = (*w).second.first.get();
+    EmulatedEglWindowSurface* surface = it->second.first.get();
     surface->flushColorBuffer();
 
     return true;
@@ -1853,20 +1846,15 @@ bool FrameBuffer::setEmulatedEglWindowSurfaceColorBuffer(HandleType p_surface,
 }
 
 void FrameBuffer::readBuffer(HandleType handle, uint64_t offset, uint64_t size, void* bytes) {
-    if (m_guestUsesAngle) {
-        goldfish_vk::readBufferToBytes(handle, offset, size, bytes);
-        return;
-    }
-
     AutoLock mutex(m_lock);
 
-    BufferPtr buffer = findBuffer(handle);
+    gfxstream::BufferPtr buffer = findBuffer(handle);
     if (!buffer) {
         ERR("Failed to read buffer: buffer %d not found.", handle);
         return;
     }
 
-    buffer->read(offset, size, bytes);
+    buffer->readToBytes(offset, size, bytes);
 }
 
 void FrameBuffer::readColorBuffer(HandleType p_colorbuffer, int x, int y, int width, int height,
@@ -1932,12 +1920,6 @@ void FrameBuffer::destroyYUVTextures(uint32_t type,
     }
 }
 
-extern "C" {
-typedef void (*yuv_updater_t)(void* privData,
-                              uint32_t type,
-                              uint32_t* textures);
-}
-
 void FrameBuffer::updateYUVTextures(uint32_t type,
                                     uint32_t* textures,
                                     void* privData,
@@ -1957,7 +1939,19 @@ void FrameBuffer::updateYUVTextures(uint32_t type,
         gtextures[2] = s_gles2.glGetGlobalTexName(textures[2]);
     }
 
-    updater(privData, type, gtextures);
+#ifdef __APPLE__
+    EGLContext prevContext = s_egl.eglGetCurrentContext();
+    auto mydisp = EglGlobalInfo::getInstance()->getDisplay(EGL_DEFAULT_DISPLAY);
+    void* nativecontext = mydisp->getLowLevelContext(prevContext);
+    struct MediaNativeCallerData callerdata;
+    callerdata.ctx = nativecontext;
+    callerdata.converter = nsConvertVideoFrameToNV12Textures;
+    void* pcallerdata = &callerdata;
+#else
+    void* pcallerdata = nullptr;
+#endif
+
+    updater(privData, type, gtextures, pcallerdata);
 }
 
 void FrameBuffer::swapTexturesAndUpdateColorBuffer(uint32_t p_colorbuffer,
@@ -1982,21 +1976,15 @@ void FrameBuffer::swapTexturesAndUpdateColorBuffer(uint32_t p_colorbuffer,
 }
 
 bool FrameBuffer::updateBuffer(HandleType p_buffer, uint64_t offset, uint64_t size, void* bytes) {
-    if (m_guestUsesAngle) {
-        return goldfish_vk::updateBufferFromBytes(p_buffer, offset, size, bytes);
-    }
-
     AutoLock mutex(m_lock);
 
-    BufferPtr buffer = findBuffer(p_buffer);
+    gfxstream::BufferPtr buffer = findBuffer(p_buffer);
     if (!buffer) {
         ERR("Failed to update buffer: buffer %d not found.", p_buffer);
         return false;
     }
 
-    buffer->subUpdate(offset, size, bytes);
-
-    return true;
+    return buffer->updateFromBytes(offset, size, bytes);
 }
 
 bool FrameBuffer::updateColorBuffer(HandleType p_colorbuffer,
@@ -3242,7 +3230,7 @@ ColorBufferPtr FrameBuffer::findColorBuffer(HandleType p_colorbuffer) {
     }
 }
 
-BufferPtr FrameBuffer::findBuffer(HandleType p_buffer) {
+gfxstream::BufferPtr FrameBuffer::findBuffer(HandleType p_buffer) {
     AutoLock colorBufferMapLock(m_colorBufferMapLock);
     BufferMap::iterator b(m_buffers.find(p_buffer));
     if (b == m_buffers.end()) {
