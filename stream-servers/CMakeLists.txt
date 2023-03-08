@@ -13,6 +13,8 @@ add_subdirectory(renderControl_dec)
 
 # Stream server core
 set(stream-server-core-sources
+    Buffer.cpp
+    ColorBuffer.cpp
     GfxStreamAgents.cpp
     VirtioGpuTimelines.cpp
     VsyncThread.cpp
@@ -71,11 +73,12 @@ target_include_directories(
         ${GFXSTREAM_REPO_ROOT}/stream-servers
         ${GFXSTREAM_REPO_ROOT}/stream-servers/apigen-codec-common
         ${GFXSTREAM_REPO_ROOT}/stream-servers/gl
+        ${GFXSTREAM_REPO_ROOT}/stream-servers/gl/glestranslator/include
         ${GFXSTREAM_REPO_ROOT}/stream-servers/vulkan
         ${GFXSTREAM_REPO_ROOT}/third-party/glm/include)
 
 if (APPLE)
-    target_link_libraries(gfxstream_backend_static PUBLIC "-framework AppKit -framework QuartzCore")
+    target_link_libraries(gfxstream_backend_static PUBLIC "-framework AppKit -framework QuartzCore -framework IOSurface")
 endif()
 if (WIN32)
     target_link_libraries(gfxstream_backend_static PRIVATE D3d9.lib)

@@ -48,13 +48,16 @@ using gfxstream::GLESApi;
 using gfxstream::GLESApi_CM;
 using gfxstream::EmulatedEglFenceSync;
 
+#define DEBUG 0
 #define DEBUG_GRALLOC_SYNC 0
 #define DEBUG_EGL_SYNC 0
 
-#define RENDERCONTROL_DPRINT(...) do { \
-    if (!VERBOSE_CHECK(gles)) { VERBOSE_ENABLE(gles); } \
-    VERBOSE_TID_FUNCTION_DPRINT(gles, __VA_ARGS__); \
-} while(0)
+#define RENDERCONTROL_DPRINT(...)         \
+    do {                                  \
+        if (DEBUG) {                      \
+            fprintf(stderr, __VA_ARGS__); \
+        }                                 \
+    } while (0)
 
 #if DEBUG_GRALLOC_SYNC
 #define GRSYNC_DPRINT RENDERCONTROL_DPRINT
@@ -670,8 +673,9 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
         if (hasNativeAstc || hasAstcDecompressor) {
             glStr += "GL_KHR_texture_compression_astc_ldr ";
         } else {
-            INFO("rcGetGLString: ASTC not supported. CPU decompressor? %d. GL extensions: %s",
-                 hasAstcDecompressor, glExtensions.c_str());
+            RENDERCONTROL_DPRINT(
+                "rcGetGLString: ASTC not supported. CPU decompressor? %d. GL extensions: %s",
+                hasAstcDecompressor, glExtensions.c_str());
         }
 
         // Host side tracing support.
@@ -767,36 +771,7 @@ static EGLint rcGetFBParam(EGLint param)
     if (!fb) {
         return 0;
     }
-
-    EGLint ret = 0;
-
-    switch(param) {
-        case FB_WIDTH:
-            ret = fb->getWidth();
-            break;
-        case FB_HEIGHT:
-            ret = fb->getHeight();
-            break;
-        case FB_XDPI:
-            ret = 72; // XXX: should be implemented
-            break;
-        case FB_YDPI:
-            ret = 72; // XXX: should be implemented
-            break;
-        case FB_FPS:
-            ret = 60;
-            break;
-        case FB_MIN_SWAP_INTERVAL:
-            ret = 1; // XXX: should be implemented
-            break;
-        case FB_MAX_SWAP_INTERVAL:
-            ret = 1; // XXX: should be implemented
-            break;
-        default:
-            break;
-    }
-
-    return ret;
+    return fb->getDisplayConfigsParam(0, param);
 }
 
 static uint32_t rcCreateContext(uint32_t config,
@@ -902,18 +877,15 @@ static int rcFlushWindowColorBuffer(uint32_t windowSurface)
         return -1;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(
-        fb->getEmulatedEglWindowSurfaceColorBufferHandle(windowSurface));
+    HandleType colorBufferHandle = fb->getEmulatedEglWindowSurfaceColorBufferHandle(windowSurface);
 
     if (!fb->flushEmulatedEglWindowSurfaceColorBuffer(windowSurface)) {
         GRSYNC_DPRINT("unlock gralloc cb lock }");
         return -1;
     }
 
-    // Update to Vulkan if necessary
-    goldfish_vk::updateColorBufferFromGl(
-        fb->getEmulatedEglWindowSurfaceColorBufferHandle(windowSurface));
+    // Make the GL updates visible to other backings if necessary.
+    fb->flushColorBufferFromGl(colorBufferHandle);
 
     GRSYNC_DPRINT("unlock gralloc cb lock }");
 
@@ -978,9 +950,6 @@ static void rcFBPost(uint32_t colorBuffer)
         return;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(colorBuffer);
-
     fb->post(colorBuffer);
 }
 
@@ -996,8 +965,8 @@ static void rcBindTexture(uint32_t colorBuffer)
         return;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(colorBuffer);
+    // Update for GL use if necessary.
+    fb->invalidateColorBufferForGl(colorBuffer);
 
     fb->bindColorBufferToTexture(colorBuffer);
 }
@@ -1009,8 +978,8 @@ static void rcBindRenderbuffer(uint32_t colorBuffer)
         return;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(colorBuffer);
+    // Update for GL use if necessary.
+    fb->invalidateColorBufferForGl(colorBuffer);
 
     fb->bindColorBufferToRenderbuffer(colorBuffer);
 }
@@ -1035,9 +1004,6 @@ static void rcReadColorBuffer(uint32_t colorBuffer,
         return;
     }
 
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(colorBuffer);
-
     fb->readColorBuffer(colorBuffer, x, y, width, height, format, type, pixels);
 }
 
@@ -1054,17 +1020,10 @@ static int rcUpdateColorBuffer(uint32_t colorBuffer,
         return -1;
     }
 
-    // Since this is a modify operation, also read the current contents
-    // of the VkImage, if any.
-    goldfish_vk::readColorBufferToGl(colorBuffer);
-
     fb->updateColorBuffer(colorBuffer, x, y, width, height, format, type, pixels);
 
     GRSYNC_DPRINT("unlock gralloc cb lock");
     sGrallocSync()->unlockColorBufferPrepare();
-
-    // Update to Vulkan if necessary
-    goldfish_vk::updateColorBufferFromGl(colorBuffer);
 
     return 0;
 }
@@ -1083,18 +1042,11 @@ static int rcUpdateColorBufferDMA(uint32_t colorBuffer,
         return -1;
     }
 
-    // Since this is a modify operation, also read the current contents
-    // of the VkImage, if any.
-    goldfish_vk::readColorBufferToGl(colorBuffer);
-
     fb->updateColorBuffer(colorBuffer, x, y, width, height,
                           format, type, pixels);
 
     GRSYNC_DPRINT("unlock gralloc cb lock");
     sGrallocSync()->unlockColorBufferPrepare();
-
-    // Update to Vulkan if necessary
-    goldfish_vk::updateColorBufferFromGl(colorBuffer);
 
     return 0;
 }
@@ -1448,27 +1400,11 @@ static void rcCloseBuffer(uint32_t buffer) {
     fb->closeBuffer(buffer);
 }
 
-static int rcSetColorBufferVulkanMode2(uint32_t colorBuffer,
-                                       uint32_t mode,
+static int rcSetColorBufferVulkanMode2(uint32_t colorBuffer, uint32_t mode,
                                        uint32_t memoryProperty) {
-    if (!goldfish_vk::isColorBufferVulkanCompatible(colorBuffer)) {
-        fprintf(stderr,
-                "%s: error: colorBuffer 0x%x is not Vulkan compatible\n",
-                __func__, colorBuffer);
-        return -1;
-    }
-
 #define VULKAN_MODE_VULKAN_ONLY 1
 
     bool modeIsVulkanOnly = mode == VULKAN_MODE_VULKAN_ONLY;
-
-    if (!goldfish_vk::setupVkColorBuffer(colorBuffer, modeIsVulkanOnly,
-                                         memoryProperty)) {
-        fprintf(stderr,
-                "%s: error: failed to create VkImage for colorBuffer 0x%x\n",
-                __func__, colorBuffer);
-        return -1;
-    }
 
     if (!goldfish_vk::setColorBufferVulkanMode(colorBuffer, mode)) {
         fprintf(stderr,
@@ -1566,9 +1502,6 @@ static int rcReadColorBufferDMA(uint32_t colorBuffer,
     if (!fb) {
         return -1;
     }
-
-    // Update from Vulkan if necessary
-    goldfish_vk::readColorBufferToGl(colorBuffer);
 
     fb->readColorBuffer(colorBuffer, x, y, width, height, format, type, pixels);
     return 0;

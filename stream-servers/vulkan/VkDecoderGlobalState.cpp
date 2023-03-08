@@ -1639,6 +1639,41 @@ class VkDecoderGlobalState::Impl {
         return cmpInfo.bindCompressedMipmapsMemory(vk, memory, memoryOffset);
     }
 
+    VkResult on_vkBindImageMemory2(android::base::BumpPool* pool, VkDevice boxed_device,
+                                   uint32_t bindInfoCount,
+                                   const VkBindImageMemoryInfo* pBindInfos) {
+        auto device = unbox_VkDevice(boxed_device);
+        auto vk = dispatch_VkDevice(boxed_device);
+        bool needEmulation = false;
+
+        auto* deviceInfo = android::base::find(mDeviceInfo, device);
+        if (!deviceInfo) return VK_ERROR_UNKNOWN;
+
+        for (uint32_t i = 0; i < bindInfoCount; i++) {
+            auto* imageInfo = android::base::find(mImageInfo, pBindInfos[i].image);
+            if (!imageInfo) return VK_ERROR_UNKNOWN;
+
+            if (deviceInfo->needEmulatedDecompression(imageInfo->cmpInfo)) {
+                needEmulation = true;
+                break;
+            }
+        }
+
+        if (needEmulation) {
+            VkResult result;
+            for (uint32_t i = 0; i < bindInfoCount; i++) {
+                result = on_vkBindImageMemory(pool, boxed_device, pBindInfos[i].image,
+                                              pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+
+                if (result != VK_SUCCESS) return result;
+            }
+
+            return VK_SUCCESS;
+        }
+
+        return vk->vkBindImageMemory2(device, bindInfoCount, pBindInfos);
+    }
+
     VkResult on_vkCreateImageView(android::base::BumpPool* pool, VkDevice boxed_device,
                                   const VkImageViewCreateInfo* pCreateInfo,
                                   const VkAllocationCallbacks* pAllocator, VkImageView* pView) {
@@ -2909,8 +2944,19 @@ class VkDecoderGlobalState::Impl {
 
         if (dedicatedAllocInfoPtr) {
             localDedicatedAllocInfo = vk_make_orphan_copy(*dedicatedAllocInfoPtr);
-            vk_append_struct(&structChainIter, &localDedicatedAllocInfo);
         }
+        // Note for AHardwareBuffers, the Vulkan spec states:
+        //
+        //     Android hardware buffers have intrinsic width, height, format, and usage
+        //     properties, so Vulkan images bound to memory imported from an Android
+        //     hardware buffer must use dedicated allocations
+        //
+        // so any allocation requests with a VkImportAndroidHardwareBufferInfoANDROID
+        // will necessarily have a VkMemoryDedicatedAllocateInfo. However, the host
+        // may or may not actually use a dedicated allocations during Buffer/ColorBuffer
+        // setup. Below checks if the underlying Buffer/ColorBuffer backing memory was
+        // originally created with a dedicated allocation.
+        bool shouldUseDedicatedAllocInfo = dedicatedAllocInfoPtr != nullptr;
 
         const VkImportPhysicalAddressGOOGLE* importPhysAddrInfoPtr =
             vk_find_struct<VkImportPhysicalAddressGOOGLE>(pAllocateInfo);
@@ -2982,18 +3028,23 @@ class VkDecoderGlobalState::Impl {
         if (importCbInfoPtr) {
             bool vulkanOnly = mGuestUsesAngle;
 
-            // Ensure color buffer has Vulkan backing.
-            if (!setupVkColorBuffer(
-                    importCbInfoPtr->colorBuffer, vulkanOnly, memoryPropertyFlags, nullptr,
-                    // Modify the allocation size and type index
-                    // to suit the resulting image memory size.
-                    &localAllocInfo.allocationSize, &localAllocInfo.memoryTypeIndex, &mappedPtr)) {
+            bool colorBufferMemoryUsesDedicatedAlloc = false;
+            if (!getColorBufferAllocationInfo(importCbInfoPtr->colorBuffer,
+                                              &localAllocInfo.allocationSize,
+                                              &localAllocInfo.memoryTypeIndex,
+                                              &colorBufferMemoryUsesDedicatedAlloc, &mappedPtr)) {
                 GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-                    << "Failed to set up vk color buffer.";
+                    << "Failed to get allocation info for ColorBuffer:"
+                    << importCbInfoPtr->colorBuffer;
             }
 
+            shouldUseDedicatedAllocInfo &= colorBufferMemoryUsesDedicatedAlloc;
+
             if (!vulkanOnly) {
-                updateColorBufferFromGl(importCbInfoPtr->colorBuffer);
+                auto fb = FrameBuffer::getFB();
+                if (fb) {
+                    fb->invalidateColorBufferForVk(importCbInfoPtr->colorBuffer);
+                }
             }
 
             if (m_emu->instanceSupportsExternalMemoryCapabilities) {
@@ -3020,12 +3071,15 @@ class VkDecoderGlobalState::Impl {
         }
 
         if (importBufferInfoPtr) {
-            // Ensure buffer has Vulkan backing.
-            setupVkBuffer(importBufferInfoPtr->buffer, true /* Buffers are Vulkan only */,
-                          memoryPropertyFlags, nullptr,
-                          // Modify the allocation size and type index
-                          // to suit the resulting image memory size.
-                          &localAllocInfo.allocationSize, &localAllocInfo.memoryTypeIndex);
+            bool bufferMemoryUsesDedicatedAlloc = false;
+            if (!getBufferAllocationInfo(
+                    importBufferInfoPtr->buffer, &localAllocInfo.allocationSize,
+                    &localAllocInfo.memoryTypeIndex, &bufferMemoryUsesDedicatedAlloc)) {
+                ERR("Failed to get Buffer:%d allocation info.", importBufferInfoPtr->buffer);
+                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            }
+
+            shouldUseDedicatedAllocInfo &= bufferMemoryUsesDedicatedAlloc;
 
             if (m_emu->instanceSupportsExternalMemoryCapabilities) {
                 VK_EXT_MEMORY_HANDLE bufferExtMemoryHandle =
@@ -3049,6 +3103,10 @@ class VkDecoderGlobalState::Impl {
 #endif
                 vk_append_struct(&structChainIter, &importInfo);
             }
+        }
+
+        if (shouldUseDedicatedAllocInfo) {
+            vk_append_struct(&structChainIter, &localDedicatedAllocInfo);
         }
 
         VkExportMemoryAllocateInfo exportAllocate = {
@@ -3593,22 +3651,18 @@ class VkDecoderGlobalState::Impl {
         return VK_SUCCESS;
     }
 
-    VkResult on_vkRegisterImageColorBufferGOOGLE(android::base::BumpPool* pool, VkDevice device,
-                                                 VkImage image, uint32_t colorBuffer) {
-        (void)image;
-
-        bool success = setupVkColorBuffer(colorBuffer);
-
-        return success ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    VkResult on_vkRegisterImageColorBufferGOOGLE(android::base::BumpPool*, VkDevice, VkImage,
+                                                 uint32_t) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+            << "Unimplemented deprecated vkRegisterImageColorBufferGOOGLE() called.";
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
 
-    VkResult on_vkRegisterBufferColorBufferGOOGLE(android::base::BumpPool* pool, VkDevice device,
-                                                  VkBuffer buffer, uint32_t colorBuffer) {
-        (void)buffer;
-
-        bool success = setupVkColorBuffer(colorBuffer);
-
-        return success ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    VkResult on_vkRegisterBufferColorBufferGOOGLE(android::base::BumpPool* pool, VkDevice, VkBuffer,
+                                                  uint32_t) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+            << "Unimplemented deprecated on_vkRegisterBufferColorBufferGOOGLE() called.";
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
 
     VkResult on_vkAllocateCommandBuffers(android::base::BumpPool* pool, VkDevice boxed_device,
@@ -6367,6 +6421,18 @@ VkResult VkDecoderGlobalState::on_vkBindImageMemory(android::base::BumpPool* poo
                                                     VkImage image, VkDeviceMemory memory,
                                                     VkDeviceSize memoryOffset) {
     return mImpl->on_vkBindImageMemory(pool, device, image, memory, memoryOffset);
+}
+
+VkResult VkDecoderGlobalState::on_vkBindImageMemory2(android::base::BumpPool* pool, VkDevice device,
+                                                     uint32_t bindInfoCount,
+                                                     const VkBindImageMemoryInfo* pBindInfos) {
+    return mImpl->on_vkBindImageMemory2(pool, device, bindInfoCount, pBindInfos);
+}
+
+VkResult VkDecoderGlobalState::on_vkBindImageMemory2KHR(android::base::BumpPool* pool,
+                                                        VkDevice device, uint32_t bindInfoCount,
+                                                        const VkBindImageMemoryInfo* pBindInfos) {
+    return mImpl->on_vkBindImageMemory2(pool, device, bindInfoCount, pBindInfos);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateImageView(android::base::BumpPool* pool, VkDevice device,
