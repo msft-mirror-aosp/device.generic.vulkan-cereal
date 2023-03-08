@@ -15,6 +15,8 @@
 #include "ColorBuffer.h"
 
 #include "gl/EmulationGl.h"
+#include "host-common/GfxstreamFatalError.h"
+#include "host-common/logging.h"
 #include "vulkan/ColorBufferVk.h"
 #include "vulkan/VkCommonOperations.h"
 
@@ -30,7 +32,9 @@ namespace {
 // memory should not be shared between the VK YUV image and the GL RGBA
 // texture.
 bool shouldAttemptExternalMemorySharing(FrameworkFormat format) {
-    return format == FrameworkFormat::FRAMEWORK_FORMAT_GL_COMPATIBLE;
+    // TODO(b/271030190): this doesn't work on certain Intel GPU
+    //return format == FrameworkFormat::FRAMEWORK_FORMAT_GL_COMPATIBLE;
+    return false;
 }
 
 }  // namespace
@@ -149,7 +153,7 @@ void ColorBuffer::readToBytes(int x, int y, int width, int height, GLenum pixels
         return;
     }
     if (mColorBufferVk) {
-        goldfish_vk::readColorBufferToBytes(mHandle, x, y, width, height, outPixels);
+        mColorBufferVk->readToBytes(x, y, width, height, outPixels);
         return;
     }
 
@@ -179,7 +183,7 @@ void ColorBuffer::readYuvToBytes(int x, int y, int width, int height, void* outP
         return;
     }
     if (mColorBufferVk) {
-        goldfish_vk::readColorBufferToBytes(mHandle, x, y, width, height, outPixels);
+        mColorBufferVk->readToBytes(x, y, width, height, outPixels);
         return;
     }
 
@@ -197,7 +201,7 @@ bool ColorBuffer::updateFromBytes(int x, int y, int width, int height,
         return true;
     }
     if (mColorBufferVk) {
-        return goldfish_vk::updateColorBufferFromBytes(mHandle, x, y, width, height, pixels);
+        return mColorBufferVk->updateFromBytes(x, y, width, height, pixels);
     }
 
     GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "No ColorBuffer impl?";
@@ -212,7 +216,7 @@ bool ColorBuffer::updateFromBytes(int x, int y, int width, int height, GLenum pi
         return mColorBufferGl->subUpdate(x, y, width, height, pixelsFormat, pixelsType, pixels);
     }
     if (mColorBufferVk) {
-        return goldfish_vk::updateColorBufferFromBytes(mHandle, x, y, width, height, pixels);
+        return mColorBufferVk->updateFromBytes(x, y, width, height, pixels);
     }
 
     GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "No ColorBuffer impl?";
@@ -318,7 +322,7 @@ bool ColorBuffer::flushFromVkBytes(const void* bytes, size_t bytesSize) {
     }
 
     if (mColorBufferGl) {
-        if (mColorBufferGl->replaceContents(bytes, bytesSize)) {
+        if (!mColorBufferGl->replaceContents(bytes, bytesSize)) {
             ERR("Failed to update ColorBuffer:%d GL backing from VK bytes.", mHandle);
             return false;
         }
@@ -363,7 +367,7 @@ bool ColorBuffer::invalidateForVk() {
         return false;
     }
 
-    if (!goldfish_vk::updateColorBufferFromBytes(mHandle, contents)) {
+    if (!mColorBufferVk->updateFromBytes(contents)) {
         ERR("Failed to set VK contents for ColorBuffer:%d", mHandle);
         return false;
     }
