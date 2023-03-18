@@ -2644,17 +2644,58 @@ class VkDecoderGlobalState::Impl {
             vk->vkGetImageMemoryRequirements2KHR(device, pInfo, pMemoryRequirements);
         } else {
             if (pInfo->pNext) {
-                fprintf(stderr,
-                        "%s: Warning: Trying to use extension struct in "
-                        "VkMemoryRequirements2 without having enabled "
-                        "the extension!!!!11111\n",
-                        __func__);
+                ERR("Warning: trying to use extension struct in VkMemoryRequirements2 without "
+                    "having enabled the extension!");
             }
 
             vk->vkGetImageMemoryRequirements(device, pInfo->image,
                                              &pMemoryRequirements->memoryRequirements);
         }
         updateImageMemorySizeLocked(device, pInfo->image, &pMemoryRequirements->memoryRequirements);
+    }
+
+    void on_vkGetBufferMemoryRequirements(android::base::BumpPool* pool, VkDevice boxed_device,
+                                          VkBuffer buffer,
+                                          VkMemoryRequirements* pMemoryRequirements) {
+        auto device = unbox_VkDevice(boxed_device);
+        auto vk = dispatch_VkDevice(boxed_device);
+        vk->vkGetBufferMemoryRequirements(device, buffer, pMemoryRequirements);
+    }
+
+    void on_vkGetBufferMemoryRequirements2(android::base::BumpPool* pool, VkDevice boxed_device,
+                                           const VkBufferMemoryRequirementsInfo2* pInfo,
+                                           VkMemoryRequirements2* pMemoryRequirements) {
+        auto device = unbox_VkDevice(boxed_device);
+        auto vk = dispatch_VkDevice(boxed_device);
+
+        std::lock_guard<std::recursive_mutex> lock(mLock);
+
+        auto* physicalDevice = android::base::find(mDeviceToPhysicalDevice, device);
+        if (!physicalDevice) {
+            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+                << "No physical device available for " << device;
+        }
+
+        auto* physicalDeviceInfo = android::base::find(mPhysdevInfo, *physicalDevice);
+        if (!physicalDeviceInfo) {
+            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+                << "No physical device info available for " << *physicalDevice;
+        }
+
+        if ((physicalDeviceInfo->props.apiVersion >= VK_MAKE_VERSION(1, 1, 0)) &&
+            vk->vkGetBufferMemoryRequirements2) {
+            vk->vkGetBufferMemoryRequirements2(device, pInfo, pMemoryRequirements);
+        } else if (hasDeviceExtension(device, VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME)) {
+            vk->vkGetBufferMemoryRequirements2KHR(device, pInfo, pMemoryRequirements);
+        } else {
+            if (pInfo->pNext) {
+                ERR("Warning: trying to use extension struct in VkMemoryRequirements2 without "
+                    "having enabled the extension!");
+            }
+
+            vk->vkGetBufferMemoryRequirements(device, pInfo->buffer,
+                                              &pMemoryRequirements->memoryRequirements);
+        }
     }
 
     void on_vkCmdCopyBufferToImage(android::base::BumpPool* pool,
@@ -2808,6 +2849,8 @@ class VkDecoderGlobalState::Impl {
 
         if (needRebind && cmdBufferInfo->computePipeline) {
             // Recover pipeline bindings
+            // TODO(gregschlom): instead of doing this here again and again after each image we
+            // decompress, could we do it once before calling vkCmdDispatch?
             vk->vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                   cmdBufferInfo->computePipeline);
             if (!cmdBufferInfo->descriptorSets.empty()) {
@@ -3634,10 +3677,6 @@ class VkDecoderGlobalState::Impl {
 
             info->virtioGpuMapped = true;
             info->hostmemId = id;
-
-            fprintf(stderr, "%s: hva, size, sizeToPage: %p 0x%llx 0x%llx id 0x%llx\n", __func__,
-                    info->ptr, (unsigned long long)(info->size), (unsigned long long)(alignedSize),
-                    (unsigned long long)(*pHostmemId));
         }
 
         return VK_SUCCESS;
@@ -4168,9 +4207,7 @@ class VkDecoderGlobalState::Impl {
             std::lock_guard<std::recursive_mutex> lock(mLock);
             auto* cmdBufferInfo = android::base::find(mCmdBufferInfo, commandBuffer);
             if (cmdBufferInfo) {
-                if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
-                    cmdBufferInfo->computePipeline = pipeline;
-                }
+                cmdBufferInfo->computePipeline = pipeline;
             }
         }
     }
@@ -5617,20 +5654,22 @@ class VkDecoderGlobalState::Impl {
     struct CommandBufferInfo {
         std::vector<PreprocessFunc> preprocessFuncs = {};
         std::vector<VkCommandBuffer> subCmds = {};
-        VkDevice device = 0;
-        VkCommandPool cmdPool = nullptr;
-        VkCommandBuffer boxed = nullptr;
-        VkPipeline computePipeline = 0;
+        VkDevice device = VK_NULL_HANDLE;
+        VkCommandPool cmdPool = VK_NULL_HANDLE;
+        VkCommandBuffer boxed = VK_NULL_HANDLE;
+
+        // Most recently bound compute pipeline and descriptor sets. We save it here so that we can
+        // restore it after doing emulated texture decompression.
+        VkPipeline computePipeline = VK_NULL_HANDLE;
         uint32_t firstSet = 0;
-        VkPipelineLayout descriptorLayout = 0;
+        VkPipelineLayout descriptorLayout = VK_NULL_HANDLE;
         std::vector<VkDescriptorSet> descriptorSets;
         std::vector<uint32_t> dynamicOffsets;
-        uint32_t sequenceNumber = 0;
     };
 
     struct CommandPoolInfo {
-        VkDevice device = 0;
-        VkCommandPool boxed = 0;
+        VkDevice device = VK_NULL_HANDLE;
+        VkCommandPool boxed = VK_NULL_HANDLE;
         std::unordered_set<VkCommandBuffer> cmdBuffers = {};
     };
 
@@ -6648,6 +6687,24 @@ void VkDecoderGlobalState::on_vkGetImageMemoryRequirements2KHR(
     android::base::BumpPool* pool, VkDevice device, const VkImageMemoryRequirementsInfo2* pInfo,
     VkMemoryRequirements2* pMemoryRequirements) {
     mImpl->on_vkGetImageMemoryRequirements2(pool, device, pInfo, pMemoryRequirements);
+}
+
+void VkDecoderGlobalState::on_vkGetBufferMemoryRequirements(
+    android::base::BumpPool* pool, VkDevice device, VkBuffer buffer,
+    VkMemoryRequirements* pMemoryRequirements) {
+    mImpl->on_vkGetBufferMemoryRequirements(pool, device, buffer, pMemoryRequirements);
+}
+
+void VkDecoderGlobalState::on_vkGetBufferMemoryRequirements2(
+    android::base::BumpPool* pool, VkDevice device, const VkBufferMemoryRequirementsInfo2* pInfo,
+    VkMemoryRequirements2* pMemoryRequirements) {
+    mImpl->on_vkGetBufferMemoryRequirements2(pool, device, pInfo, pMemoryRequirements);
+}
+
+void VkDecoderGlobalState::on_vkGetBufferMemoryRequirements2KHR(
+    android::base::BumpPool* pool, VkDevice device, const VkBufferMemoryRequirementsInfo2* pInfo,
+    VkMemoryRequirements2* pMemoryRequirements) {
+    mImpl->on_vkGetBufferMemoryRequirements2(pool, device, pInfo, pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkCmdPipelineBarrier(
