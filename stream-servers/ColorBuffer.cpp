@@ -32,9 +32,7 @@ namespace {
 // memory should not be shared between the VK YUV image and the GL RGBA
 // texture.
 bool shouldAttemptExternalMemorySharing(FrameworkFormat format) {
-    // TODO(b/271030190): this doesn't work on certain Intel GPU
-    //return format == FrameworkFormat::FRAMEWORK_FORMAT_GL_COMPATIBLE;
-    return false;
+    return format == FrameworkFormat::FRAMEWORK_FORMAT_GL_COMPATIBLE;
 }
 
 }  // namespace
@@ -82,8 +80,10 @@ std::shared_ptr<ColorBuffer> ColorBuffer::create(gfxstream::EmulationGl* emulati
         }
     }
 
+    bool b271028352Workaround = emulationGl && strstr(emulationGl->getGlesRenderer().c_str(), "Intel");
+
     if (colorBuffer->mColorBufferGl && colorBuffer->mColorBufferVk &&
-        shouldAttemptExternalMemorySharing(frameworkFormat)) {
+        !b271028352Workaround && shouldAttemptExternalMemorySharing(frameworkFormat)) {
         auto memoryExport = goldfish_vk::exportColorBufferMemory(handle);
         if (memoryExport) {
             if (colorBuffer->mColorBufferGl->importMemory(
