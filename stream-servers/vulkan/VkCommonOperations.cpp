@@ -1743,7 +1743,7 @@ bool setupVkColorBuffer(uint32_t width, uint32_t height, GLenum internalFormat,
                         FrameworkFormat frameworkFormat, uint32_t colorBufferHandle,
                         bool vulkanOnly, uint32_t memoryProperty) {
     if (!isFormatVulkanCompatible(internalFormat)) {
-        VK_COMMON_ERROR("Failed to create Vk ColorBuffer: format:%d not compatible.",
+        VK_COMMON_VERBOSE("Failed to create Vk ColorBuffer: format:%d not compatible.",
                         internalFormat);
         return false;
     }
@@ -1793,6 +1793,10 @@ bool setupVkColorBuffer(uint32_t width, uint32_t height, GLenum internalFormat,
     std::unique_ptr<VkImageCreateInfo> imageCi =
         generateColorBufferVkImageCreateInfo_locked(vkFormat, width, height, tiling);
     // pNext will be filled later.
+    if (imageCi == nullptr) {
+        // it can happen if the format is not supported
+        return false;
+    }
     imageCi->sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageCi->queueFamilyIndexCount = 0;
     imageCi->pQueueFamilyIndices = nullptr;

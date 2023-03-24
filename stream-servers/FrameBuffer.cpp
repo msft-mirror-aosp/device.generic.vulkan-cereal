@@ -389,7 +389,7 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow, bool egl2
     vkEmulationFeatures->glInteropSupported = fb->m_vulkanInteropSupported;
     if (feature_is_enabled(kFeature_Vulkan)) {
         goldfish_vk::initVkEmulationFeatures(std::move(vkEmulationFeatures));
-        if (vkEmu->displayVk) {
+        if (vkEmu && vkEmu->displayVk) {
             fb->m_displayVk = vkEmu->displayVk.get();
             fb->m_displaySurfaceUsers.push_back(fb->m_displayVk);
         }
@@ -842,9 +842,11 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
         m_windowWidth = ww;
         m_windowHeight = wh;
 
-        m_subWin = ::createSubWindow(p_window, m_x, m_y, m_windowWidth,
-                                     m_windowHeight, dpr, subWindowRepaint, this,
-                                     hideWindow);
+        if (!hideWindow) {
+            m_subWin = ::createSubWindow(p_window, m_x, m_y, m_windowWidth,
+                                         m_windowHeight, dpr, subWindowRepaint, this,
+                                         hideWindow);
+        }
         if (m_subWin) {
             m_nativeWindow = p_window;
 
