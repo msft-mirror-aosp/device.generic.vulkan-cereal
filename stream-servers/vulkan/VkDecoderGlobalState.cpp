@@ -142,6 +142,8 @@ static constexpr uint32_t kMinVersion = VK_MAKE_VERSION(1, 0, 0);
 static constexpr uint64_t kPageSizeforBlob = 4096;
 static constexpr uint64_t kPageMaskForBlob = ~(0xfff);
 
+static uint64_t hostBlobId = 0;
+
 #define DEFINE_BOXED_HANDLE_TYPE_TAG(type) Tag_##type,
 
 enum BoxedHandleTypeTag {
@@ -3001,17 +3003,6 @@ class VkDecoderGlobalState::Impl {
         // originally created with a dedicated allocation.
         bool shouldUseDedicatedAllocInfo = dedicatedAllocInfoPtr != nullptr;
 
-        const VkImportPhysicalAddressGOOGLE* importPhysAddrInfoPtr =
-            vk_find_struct<VkImportPhysicalAddressGOOGLE>(pAllocateInfo);
-
-        if (importPhysAddrInfoPtr) {
-            // TODO: Implement what happens on importing a physical address:
-            // 1 - perform action of vkMapMemoryIntoAddressSpaceGOOGLE if
-            //     host visible
-            // 2 - create color buffer, setup Vk for it,
-            //     and associate it with the physical address
-        }
-
         const VkImportColorBufferGOOGLE* importCbInfoPtr =
             vk_find_struct<VkImportColorBufferGOOGLE>(pAllocateInfo);
         const VkImportBufferGOOGLE* importBufferInfoPtr =
@@ -3588,13 +3579,15 @@ class VkDecoderGlobalState::Impl {
         auto* info = android::base::find(mMemoryInfo, memory);
         if (!info) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
+        hostBlobId++;
         if (feature_is_enabled(kFeature_SystemBlob) && info->sharedMemory.has_value()) {
             uint32_t handleType = STREAM_MEM_HANDLE_TYPE_SHM;
             // We transfer ownership of the shared memory handle to the descriptor info.
             // The memory itself is destroyed only when all processes unmap / release their
             // handles.
-            *pHostmemId = HostmemIdMapping::get()->addDescriptorInfo(
+            HostmemIdMapping::get()->addDescriptorInfo(hostBlobId,
                 info->sharedMemory->releaseHandle(), handleType, info->caching, std::nullopt);
+            *pHostmemId = hostBlobId;
             *pSize = info->size;
             *pAddress = 0;
         } else if (feature_is_enabled(kFeature_ExternalBlob)) {
@@ -3652,9 +3645,10 @@ class VkDecoderGlobalState::Impl {
 #endif
 
             ManagedDescriptor managedHandle(handle);
-            *pHostmemId = HostmemIdMapping::get()->addDescriptorInfo(
+            HostmemIdMapping::get()->addDescriptorInfo(hostBlobId,
                 std::move(managedHandle), handleType, info->caching,
                 std::optional<VulkanInfo>(vulkanInfo));
+            *pHostmemId = hostBlobId;
             *pSize = info->size;
             *pAddress = 0;
         } else {
@@ -3688,20 +3682,6 @@ class VkDecoderGlobalState::Impl {
         on_vkFreeMemory(pool, boxed_device, memory, pAllocator);
 
         return VK_SUCCESS;
-    }
-
-    VkResult on_vkRegisterImageColorBufferGOOGLE(android::base::BumpPool*, VkDevice, VkImage,
-                                                 uint32_t) {
-        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-            << "Unimplemented deprecated vkRegisterImageColorBufferGOOGLE() called.";
-        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    }
-
-    VkResult on_vkRegisterBufferColorBufferGOOGLE(android::base::BumpPool* pool, VkDevice, VkBuffer,
-                                                  uint32_t) {
-        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-            << "Unimplemented deprecated on_vkRegisterBufferColorBufferGOOGLE() called.";
-        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
 
     VkResult on_vkAllocateCommandBuffers(android::base::BumpPool* pool, VkDevice boxed_device,
@@ -6810,20 +6790,6 @@ VkResult VkDecoderGlobalState::on_vkFreeMemorySyncGOOGLE(android::base::BumpPool
                                                          VkDevice device, VkDeviceMemory memory,
                                                          const VkAllocationCallbacks* pAllocator) {
     return mImpl->on_vkFreeMemorySyncGOOGLE(pool, device, memory, pAllocator);
-}
-
-// VK_GOOGLE_color_buffer
-VkResult VkDecoderGlobalState::on_vkRegisterImageColorBufferGOOGLE(android::base::BumpPool* pool,
-                                                                   VkDevice device, VkImage image,
-                                                                   uint32_t colorBuffer) {
-    return mImpl->on_vkRegisterImageColorBufferGOOGLE(pool, device, image, colorBuffer);
-}
-
-VkResult VkDecoderGlobalState::on_vkRegisterBufferColorBufferGOOGLE(android::base::BumpPool* pool,
-                                                                    VkDevice device,
-                                                                    VkBuffer buffer,
-                                                                    uint32_t colorBuffer) {
-    return mImpl->on_vkRegisterBufferColorBufferGOOGLE(pool, device, buffer, colorBuffer);
 }
 
 VkResult VkDecoderGlobalState::on_vkAllocateCommandBuffers(
