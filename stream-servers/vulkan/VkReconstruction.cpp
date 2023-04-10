@@ -17,9 +17,13 @@
 
 #include <unordered_map>
 
+#include "FrameBuffer.h"
 #include "IOStream.h"
 #include "VkDecoder.h"
 #include "aemu/base/containers/EntityManager.h"
+
+namespace gfxstream {
+namespace vk {
 
 #define DEBUG_RECONSTRUCTION 0
 
@@ -250,13 +254,13 @@ void VkReconstruction::load(android::base::Stream* stream, emugl::GfxApiLogger& 
     DEBUG_RECON("start decoding trace");
 
     // TODO: This needs to be the puid seqno ptr
-    uint32_t seqno;
+    auto resources = ProcessResources::create();
     VkDecoderContext context = {
         .processName = nullptr,
         .gfxApiLogger = &gfxLogger,
         .healthMonitor = healthMonitor,
     };
-    decoderForLoading.decode(mLoadedTrace.data(), mLoadedTrace.size(), &trivialStream, &seqno,
+    decoderForLoading.decode(mLoadedTrace.data(), mLoadedTrace.size(), &trivialStream, resources.get(),
                              context);
 
     DEBUG_RECON("finished decoding trace");
@@ -298,7 +302,7 @@ void VkReconstruction::dump() {
     mApiTrace.forEachLiveEntry_const(
         [&traceBytesTotal](bool live, uint64_t handle, const ApiInfo& info) {
             fprintf(stderr, "VkReconstruction::%s: api handle 0x%llx: %s\n", __func__,
-                    (unsigned long long)handle, goldfish_vk::api_opcode_to_string(info.opCode));
+                    (unsigned long long)handle, api_opcode_to_string(info.opCode));
             traceBytesTotal += info.traceBytes;
         });
 
@@ -309,8 +313,7 @@ void VkReconstruction::dump() {
                     (unsigned long long)entityHandle);
             for (auto apiHandle : reconstruction.apiRefs) {
                 auto apiInfo = mApiTrace.get(apiHandle);
-                const char* apiName =
-                    apiInfo ? goldfish_vk::api_opcode_to_string(apiInfo->opCode) : "unalloced";
+                const char* apiName = apiInfo ? api_opcode_to_string(apiInfo->opCode) : "unalloced";
                 fprintf(stderr, "VkReconstruction::%s:     0x%llx: %s\n", __func__,
                         (unsigned long long)apiHandle, apiName);
                 for (auto createdHandle : apiInfo->createdHandles) {
@@ -327,8 +330,7 @@ void VkReconstruction::dump() {
                 (unsigned long long)entityHandle);
         for (auto apiHandle : modification.apiRefs) {
             auto apiInfo = mApiTrace.get(apiHandle);
-            const char* apiName =
-                apiInfo ? goldfish_vk::api_opcode_to_string(apiInfo->opCode) : "unalloced";
+            const char* apiName = apiInfo ? api_opcode_to_string(apiInfo->opCode) : "unalloced";
             fprintf(stderr, "VkReconstruction::%s: mod:     0x%llx: %s\n", __func__,
                     (unsigned long long)apiHandle, apiName);
         }
@@ -472,3 +474,6 @@ std::vector<uint64_t> VkReconstruction::getOrderedUniqueModifyApis() const {
 
     return orderedUniqueModifyApis;
 }
+
+}  // namespace vk
+}  // namespace gfxstream

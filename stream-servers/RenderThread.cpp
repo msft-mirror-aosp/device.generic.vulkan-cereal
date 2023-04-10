@@ -17,14 +17,10 @@
 
 #include "ChannelStream.h"
 #include "FrameBuffer.h"
-#include "OpenGLESDispatch/EGLDispatch.h"
-#include "OpenGLESDispatch/GLESv1Dispatch.h"
-#include "OpenGLESDispatch/GLESv2Dispatch.h"
 #include "ReadBuffer.h"
 #include "RenderChannelImpl.h"
 #include "RenderControl.h"
 #include "RenderThreadInfo.h"
-#include "RendererImpl.h"
 #include "RingStream.h"
 #include "VkDecoderContext.h"
 #include "apigen-codec-common/ChecksumCalculatorThreadInfo.h"
@@ -34,13 +30,11 @@
 #include "aemu/base/Metrics.h"
 #include "aemu/base/files/StreamSerializing.h"
 #include "aemu/base/system/System.h"
-#include "aemu/base/Tracing.h"
 #include "host-common/feature_control.h"
 #include "host-common/logging.h"
 #include "vulkan/VkCommonOperations.h"
 
 #define EMUGL_DEBUG_LEVEL 0
-#include "host-common/crash_reporter.h"
 #include "host-common/debug.h"
 
 #ifndef _WIN32
@@ -52,11 +46,13 @@
 
 #include <unordered_map>
 
+namespace gfxstream {
+
 using android::base::AutoLock;
 using android::base::EventHangMetadata;
 using android::base::MessageChannel;
-
-namespace emugl {
+using emugl::GfxApiLogger;
+using vk::VkDecoderContext;
 
 struct RenderThread::SnapshotObjects {
     RenderThreadInfo* threadInfo;
@@ -298,9 +294,11 @@ intptr_t RenderThread::main() {
     // Framebuffer initialization is asynchronous, so we need to make sure
     // it's completely initialized before running any GL commands.
     FrameBuffer::waitUntilInitialized();
-    if (goldfish_vk::getGlobalVkEmulation()) {
+    if (vk::getGlobalVkEmulation()) {
         tInfo.m_vkInfo.emplace();
     }
+
+    tInfo.m_magmaInfo.emplace();
 
     // This is the only place where we try loading from snapshot.
     // But the context bind / restoration will be delayed after receiving
@@ -464,12 +462,8 @@ intptr_t RenderThread::main() {
                     .healthMonitor = FrameBuffer::getFB()->getHealthMonitor(),
                     .metricsLogger = &metricsLogger,
                 };
-                uint32_t* seqno = nullptr;
-                if (processResources) {
-                    seqno = processResources->getSequenceNumberPtr();
-                }
                 last = tInfo.m_vkInfo->m_vkDec.decode(readBuf.buf(), readBuf.validData(), ioStream,
-                                                      seqno, context);
+                                                      processResources, context);
                 if (last > 0) {
                     if (!processResources) {
                         ERR("Processed some Vulkan packets without process resources created. "
@@ -541,6 +535,20 @@ intptr_t RenderThread::main() {
                 }
             }
 
+            //
+            // try to process some of the command buffer using the Magma
+            // decoder
+            //
+            if (tInfo.m_magmaInfo && tInfo.m_magmaInfo->m_magmaDec)
+            {
+                last = tInfo.m_magmaInfo->m_magmaDec->decode(readBuf.buf(), readBuf.validData(),
+                                            ioStream, &checksumCalc);
+                if (last > 0) {
+                    readBuf.consume(last);
+                    progress = true;
+                }
+            }
+
             if (mRunInLimitedMode) {
                 sThreadRunLimiter.unlock();
             }
@@ -562,4 +570,4 @@ intptr_t RenderThread::main() {
     return 0;
 }
 
-}  // namespace emugl
+}  // namespace gfxstream

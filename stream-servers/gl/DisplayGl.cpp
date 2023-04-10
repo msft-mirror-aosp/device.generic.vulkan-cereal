@@ -20,6 +20,8 @@
 #include "TextureDraw.h"
 #include "host-common/logging.h"
 
+namespace gfxstream {
+namespace gl {
 namespace {
 
 std::shared_future<void> getCompletedFuture() {
@@ -53,17 +55,14 @@ std::shared_future<void> DisplayGl::post(const Post& post) {
                 mTextureDraw->prepareForDrawLayer();
                 hasDrawLayer = true;
             }
-            layer.colorBuffer->postLayer(*layer.layerOptions,
-                                         post.frameWidth,
-                                         post.frameHeight);
+            layer.colorBuffer->glOpPostLayer(*layer.layerOptions, post.frameWidth,
+                                             post.frameHeight);
         } else if (layer.overlayOptions) {
             if (hasDrawLayer) {
                 ERR("Cannot mix colorBuffer.postLayer with postWithOverlay!");
             }
-            layer.colorBuffer->postWithOverlay(layer.colorBuffer->getViewportScaledTexture(),
-                                               layer.overlayOptions->rotation,
-                                               layer.overlayOptions->dx,
-                                               layer.overlayOptions->dy);
+            layer.colorBuffer->glOpPostViewportScaledWithOverlay(
+                layer.overlayOptions->rotation, layer.overlayOptions->dx, layer.overlayOptions->dy);
         }
     }
     if (hasDrawLayer) {
@@ -116,3 +115,6 @@ void DisplayGl::clear() {
     s_egl.eglSwapBuffers(surfaceGl->mDisplay, surfaceGl->mSurface);
 #endif
 }
+
+}  // namespace gl
+}  // namespace gfxstream

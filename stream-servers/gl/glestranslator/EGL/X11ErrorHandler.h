@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2021 The Android Open Source Project
+* Copyright (C) 2023 The Android Open Source Project
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,18 +15,21 @@
 */
 #pragma once
 
-#include <string>
+#include "aemu/base/synchronization/Lock.h"
 
-std::string formatString(const char* format, ...);
+#include "apigen-codec-common/X11Support.h"
 
-class ScopedDebugGroup {
-  public:
-    ScopedDebugGroup(const std::string& message);
-    ~ScopedDebugGroup();
+#include <EGL/egl.h>
+
+class X11ErrorHandler {
+public:
+    X11ErrorHandler(EGLNativeDisplayType dpy);
+    ~X11ErrorHandler();
+    int getLastError() const { return s_lastErrorCode; }
+
+private:
+    static int s_lastErrorCode;
+    int (*m_oldErrorHandler)(Display *, XErrorEvent *) = nullptr;
+    static android::base::Lock s_lock;
+    static int errorHandlerProc(EGLNativeDisplayType dpy,XErrorEvent* event);
 };
-
-#ifdef ENABLE_GL_LOG
-#define GL_SCOPED_DEBUG_GROUP(...) ScopedDebugGroup sdg_ ## __LINE__(formatString(__VA_ARGS__))
-#else
-#define GL_SCOPED_DEBUG_GROUP(...) (void(0))
-#endif

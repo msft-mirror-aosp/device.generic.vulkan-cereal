@@ -15,13 +15,15 @@
 #include "CompositorGl.h"
 
 #include "BorrowedImageGl.h"
-#include "Debug.h"
+#include "DebugGl.h"
 #include "DisplaySurfaceGl.h"
 #include "OpenGLESDispatch/DispatchTables.h"
 #include "TextureDraw.h"
 #include "host-common/GfxstreamFatalError.h"
 #include "host-common/misc.h"
 
+namespace gfxstream {
+namespace gl {
 namespace {
 
 const BorrowedImageInfoGl* getInfoOrAbort(const std::unique_ptr<BorrowedImageInfo>& info) {
@@ -141,3 +143,6 @@ Compositor::CompositionFinishedWaitable CompositorGl::compose(
     // passes along a GL fence or VK fence.
     return getCompletedFuture();
 }
+
+}  // namespace gl
+}  // namespace gfxstream

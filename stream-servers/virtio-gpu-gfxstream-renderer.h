@@ -52,8 +52,8 @@ VG_EXPORT int pipe_virgl_renderer_transfer_write_iov(uint32_t handle, uint32_t c
                                                      uint32_t stride, uint32_t layer_stride,
                                                      struct virgl_box* box, uint64_t offset,
                                                      struct iovec* iovec, unsigned int iovec_cnt);
-VG_EXPORT void pipe_virgl_renderer_get_cap_set(uint32_t, uint32_t*, uint32_t*);
-VG_EXPORT void pipe_virgl_renderer_fill_caps(uint32_t, uint32_t, void* caps);
+VG_EXPORT void pipe_virgl_renderer_get_cap_set(uint32_t set, uint32_t* max_ver, uint32_t* max_size);
+VG_EXPORT void pipe_virgl_renderer_fill_caps(uint32_t set, uint32_t version, void* caps);
 
 VG_EXPORT int pipe_virgl_renderer_resource_attach_iov(int res_handle, struct iovec* iov,
                                                       int num_iovs);
@@ -236,6 +236,9 @@ static_assert(offsetof(stream_renderer_param_host_visible_memory_mask, entries) 
               "stream_renderer_param_host_visible_memory_mask.entries must be at offset 0");
 static_assert(offsetof(stream_renderer_param_host_visible_memory_mask, num_entries) == 8,
               "stream_renderer_param_host_visible_memory_mask.num_entries must be at offset 8");
+
+// Enables the host to control which GPU is used for rendering.
+#define STREAM_RENDERER_PARAM_RENDERING_GPU 9
 
 // External callbacks for tracking metrics.
 // Separating each function to a parameter allows new functions to be added later.

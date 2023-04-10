@@ -14,12 +14,14 @@
 
 #include "VulkanTestHelper.h"
 
-#include "host-common/feature_control.h"
 #include "host-common/emugl_vm_operations.h"
-#include "host-common/vm_operations.h"
+#include "host-common/feature_control.h"
 #include "host-common/logging.h"
+#include "host-common/vm_operations.h"
 
-namespace goldfish_vk::testing {
+namespace gfxstream {
+namespace vk {
+namespace testing {
 namespace {
 
 using ::android::base::BumpPool;
@@ -31,7 +33,7 @@ VKAPI_ATTR VkBool32 VKAPI_CALL validationCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT type,
     const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData) {
     if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        ERR("%s", pCallbackData->pMessage);
+        ERR("Validation Layer: \"%s\"", pCallbackData->pMessage);
         validationErrorsFound = true;
     }
     return VK_FALSE;
@@ -43,7 +45,7 @@ std::mutex VulkanTestHelper::mMutex;
 
 VulkanTestHelper::VulkanTestHelper()
     : mLock(mMutex),
-      mVk(emugl::vkDispatch(/*forTesting=*/true)),
+      mVk(vkDispatch(/*forTesting=*/true)),
       mLogger(),
       mMetricsLogger(android::base::CreateMetricsLogger()),
       mHealthMonitor(*mMetricsLogger),
@@ -65,7 +67,7 @@ VulkanTestHelper::VulkanTestHelper()
     validationErrorsFound = false;
 }
 
-VulkanTestHelper::~VulkanTestHelper() {
+void VulkanTestHelper::destroy() {
     if (mDevice) {
         vk().vkDeviceWaitIdle(mDevice);
         if (mCommandPool) vk().vkDestroyCommandPool(mDevice, mCommandPool, nullptr);
@@ -77,9 +79,18 @@ VulkanTestHelper::~VulkanTestHelper() {
         }
         vk().vkDestroyInstance(mInstance, nullptr);
     }
+
+    mCommandPool = VK_NULL_HANDLE;
+    mDevice = VK_NULL_HANDLE;
+    mInstance = VK_NULL_HANDLE;
+    mDebugMessenger = VK_NULL_HANDLE;
+
     VkDecoderGlobalState::reset();
     teardownGlobalVkEmulation();
+}
 
+VulkanTestHelper::~VulkanTestHelper() {
+    destroy();
     if (mFailOnValidationErrors && validationErrorsFound) {
         FATAL() << "Validation errors found. Aborting.";
     }
@@ -187,6 +198,8 @@ void VulkanTestHelper::initialize(const InitializationOptions& options) {
     VK_CHECK(vk().vkCreateCommandPool(mDevice, &poolInfo, nullptr, &mCommandPool));
 }
 
+bool VulkanTestHelper::hasValidationErrors() const { return validationErrorsFound; }
+
 VkCommandBuffer VulkanTestHelper::beginCommandBuffer() {
     VkCommandBufferAllocateInfo allocInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -272,4 +285,63 @@ void VulkanTestHelper::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     vk().vkBindBufferMemory(mDevice, buffer, bufferMemory, 0);
 }
 
-}  // namespace goldfish_vk::testing
+void VulkanTestHelper::transitionImageLayout(VkCommandBuffer cmdBuf, VkImage image,
+                                             VkImageLayout oldLayout, VkImageLayout newLayout) {
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = oldLayout,
+        .newLayout = newLayout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = unbox_VkImage(image),
+        .subresourceRange =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+    };
+
+    switch (oldLayout) {
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+            barrier.srcAccessMask = 0;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            break;
+        default:
+            FATAL() << "Unsupported layout transition!";
+    }
+
+    switch (newLayout) {
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            if (barrier.srcAccessMask == 0) {
+                barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            }
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            break;
+        default:
+            FATAL() << "Unsupported layout transition!";
+    }
+    vk().vkCmdPipelineBarrier(cmdBuf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                              &barrier);
+}
+
+}  // namespace testing
+}  // namespace vk
+}  // namespace gfxstream

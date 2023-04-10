@@ -24,6 +24,7 @@
 #include "OpenGLESDispatch/DispatchTables.h"
 #include "OpenGLESDispatch/EGLDispatch.h"
 #include "OpenGLESDispatch/GLESv2Dispatch.h"
+#include "OpenGLESDispatch/OpenGLDispatchLoader.h"
 #include "RenderThreadInfoGl.h"
 #include "aemu/base/misc/StringUtils.h"
 #include "host-common/GfxstreamFatalError.h"
@@ -32,6 +33,7 @@
 #include "host-common/opengl/misc.h"
 
 namespace gfxstream {
+namespace gl {
 namespace {
 
 static void EGLAPIENTRY EglDebugCallback(EGLenum error,
@@ -202,7 +204,25 @@ static std::optional<EGLConfig> getEmulationEglConfig(EGLDisplay display, bool a
 }  // namespace
 
 std::unique_ptr<EmulationGl> EmulationGl::create(uint32_t width, uint32_t height,
-                                                 bool allowWindowSurface) {
+                                                 bool allowWindowSurface, bool egl2egl) {
+    // Loads the glestranslator function pointers.
+    if (!LazyLoadedEGLDispatch::get()) {
+        ERR("Failed to load EGL dispatch.");
+        return nullptr;
+    }
+    if (!LazyLoadedGLESv1Dispatch::get()) {
+        ERR("Failed to load GLESv1 dispatch.");
+        return nullptr;
+    }
+    if (!LazyLoadedGLESv2Dispatch::get()) {
+        ERR("Failed to load GLESv2 dispatch.");
+        return nullptr;
+    }
+
+    if (s_egl.eglUseOsEglApi) {
+        s_egl.eglUseOsEglApi(egl2egl, EGL_FALSE);
+    }
+
     std::unique_ptr<EmulationGl> emulationGl(new EmulationGl());
 
     emulationGl->mEglDisplay = s_egl.eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -489,13 +509,16 @@ EmulationGl::~EmulationGl() {
     }
 
     if (mPbufferSurface) {
-        const auto* displaySurfaceGl =
-            reinterpret_cast<const DisplaySurfaceGl*>(mPbufferSurface->getImpl());
-
-        RecursiveScopedContextBind contextBind(displaySurfaceGl->getContextHelper());
-        if (!contextBind.isOk()) {
-            mTextureDraw.reset();
-        }
+        // TODO(b/267349580): remove after Mac issue fixed.
+        mTextureDraw.release();
+        // const auto* displaySurfaceGl =
+        //    reinterpret_cast<const DisplaySurfaceGl*>(mPbufferSurface->getImpl());
+        // RecursiveScopedContextBind contextBind(displaySurfaceGl->getContextHelper());
+        // if (contextBind.isOk()) {
+        //     mTextureDraw.reset();
+        // } else {
+        //     ERR("Failed to bind context for destroying TextureDraw.");
+        // }
     }
 
     if (mEglDisplay != EGL_NO_DISPLAY) {
@@ -525,6 +548,14 @@ EmulationGl::~EmulationGl() {
     }
 }
 
+const EGLDispatch* EmulationGl::getEglDispatch() {
+    return &s_egl;
+}
+
+const GLESv2Dispatch* EmulationGl::getGles2Dispatch() {
+    return &s_gles2;
+}
+
 GLESDispatchMaxVersion EmulationGl::getGlesMaxDispatchVersion() const {
     return mGlesDispatchMaxVersion;
 }
@@ -550,6 +581,8 @@ void EmulationGl::getGlesVersion(GLint* major, GLint* minor) const {
         *minor = mGlesVersionMinor;
     }
 }
+
+bool EmulationGl::isMesa() const { return mGlesVersion.find("Mesa") != std::string::npos; }
 
 bool EmulationGl::isFastBlitSupported() const {
     return mFastBlitSupported;
@@ -589,6 +622,37 @@ void EmulationGl::setUseBoundSurfaceContextForDisplay(bool use) {
     if (mCompositorGl) {
         mCompositorGl->setUseBoundSurfaceContext(use);
     }
+}
+
+ContextHelper* EmulationGl::getColorBufferContextHelper() {
+    if (!mPbufferSurface) {
+        return nullptr;
+    }
+
+    const auto* surfaceGl = static_cast<const DisplaySurfaceGl*>(mPbufferSurface->getImpl());
+    return surfaceGl->getContextHelper();
+}
+
+std::unique_ptr<BufferGl> EmulationGl::createBuffer(uint64_t size, HandleType handle) {
+    return BufferGl::create(size, handle, getColorBufferContextHelper());
+}
+
+std::unique_ptr<BufferGl> EmulationGl::loadBuffer(android::base::Stream* stream) {
+    return BufferGl::onLoad(stream, getColorBufferContextHelper());
+}
+
+std::unique_ptr<ColorBufferGl> EmulationGl::createColorBuffer(uint32_t width, uint32_t height,
+                                                              GLenum internalFormat,
+                                                              FrameworkFormat frameworkFormat,
+                                                              HandleType handle) {
+    return ColorBufferGl::create(mEglDisplay, width, height, internalFormat, frameworkFormat,
+                                 handle, getColorBufferContextHelper(), mTextureDraw.get(),
+                                 isFastBlitSupported());
+}
+
+std::unique_ptr<ColorBufferGl> EmulationGl::loadColorBuffer(android::base::Stream* stream) {
+    return ColorBufferGl::onLoad(stream, mEglDisplay, getColorBufferContextHelper(),
+                                 mTextureDraw.get(), isFastBlitSupported());
 }
 
 std::unique_ptr<EmulatedEglContext> EmulationGl::createEmulatedEglContext(
@@ -664,4 +728,5 @@ std::unique_ptr<EmulatedEglWindowSurface> EmulationGl::loadEmulatedEglWindowSurf
     return EmulatedEglWindowSurface::onLoad(stream, mEglDisplay, colorBuffers, contexts);
 }
 
+}  // namespace gl
 }  // namespace gfxstream

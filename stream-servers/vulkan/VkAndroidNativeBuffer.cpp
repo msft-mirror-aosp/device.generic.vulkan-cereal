@@ -27,6 +27,9 @@
 #include "stream-servers/FrameBuffer.h"
 #include "vulkan/vk_enum_string_helper.h"
 
+namespace gfxstream {
+namespace vk {
+
 #define VK_ANB_ERR(fmt, ...) fprintf(stderr, "%s:%d " fmt "\n", __func__, __LINE__, ##__VA_ARGS__);
 
 #define ENABLE_VK_ANB_DEBUG 0
@@ -45,8 +48,6 @@ using android::base::AutoLock;
 using android::base::Lock;
 using emugl::ABORT_REASON_OTHER;
 using emugl::FatalError;
-
-namespace goldfish_vk {
 
 AndroidNativeBufferInfo::QsriWaitFencePool::QsriWaitFencePool(VulkanDispatch* vk, VkDevice device)
     : mVk(vk), mDevice(device) {}
@@ -134,7 +135,6 @@ VkResult prepareAndroidNativeBufferImage(VulkanDispatch* vk, VkDevice device,
     out->stride = nativeBufferANDROID->stride;
     out->colorBufferHandle = *(nativeBufferANDROID->handle);
 
-    bool colorBufferVulkanCompatible = isColorBufferVulkanCompatible(out->colorBufferHandle);
     bool externalMemoryCompatible = false;
 
     auto emu = getGlobalVkEmulation();
@@ -144,14 +144,12 @@ VkResult prepareAndroidNativeBufferImage(VulkanDispatch* vk, VkDevice device,
     }
 
     bool colorBufferExportedToGl = false;
-    if (colorBufferVulkanCompatible && externalMemoryCompatible) {
-        if (!setupVkColorBuffer(out->colorBufferHandle, emu->guestUsesAngle,
-                                0u /* memoryProperty */, &colorBufferExportedToGl)) {
-            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-                << "Failed to create vk color buffer. format:" << pCreateInfo->format
-                << " width:" << out->extent.width << " height:" << out->extent.height
-                << " depth:" << out->extent.depth;
-        }
+    if (!isColorBufferExportedToGl(out->colorBufferHandle, &colorBufferExportedToGl)) {
+        VK_ANB_ERR("Failed to query if ColorBuffer:%d exported to GL.", out->colorBufferHandle);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    if (externalMemoryCompatible) {
         releaseColorBufferForGuestUse(out->colorBufferHandle);
         out->externallyBacked = true;
     }
@@ -195,14 +193,24 @@ VkResult prepareAndroidNativeBufferImage(VulkanDispatch* vk, VkDevice device,
 
         vk->vkGetImageMemoryRequirements(device, out->image, &out->memReqs);
 
-        if (out->memReqs.size < memInfo.actualSize) {
-            out->memReqs.size = memInfo.actualSize;
+        if (out->memReqs.size < memInfo.size) {
+            out->memReqs.size = memInfo.size;
         }
 
-        if (!importExternalMemory(vk, device, &memInfo, &out->imageMemory)) {
-            fprintf(stderr, "%s: Failed to import external memory\n", __func__);
-            return VK_ERROR_INITIALIZATION_FAILED;
+        if (memInfo.dedicatedAllocation) {
+            if (!importExternalMemoryDedicatedImage(vk, device, &memInfo, out->image,
+                                                    &out->imageMemory)) {
+                VK_ANB_ERR(
+                    "VK_ANDROID_native_buffer: Failed to import external memory (dedicated)");
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+        } else {
+            if (!importExternalMemory(vk, device, &memInfo, &out->imageMemory)) {
+                VK_ANB_ERR("VK_ANDROID_native_buffer: Failed to import external memory");
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
         }
+
         bindOffset = memInfo.bindOffset;
     } else {
         // delete the info struct and pass to vkCreateImage, and also add
@@ -514,8 +522,6 @@ VkResult setAndroidNativeImageSemaphoreSignaled(VulkanDispatch* vk, VkDevice dev
         // If we used the Vulkan image without copying it back
         // to the CPU, reset the layout to PRESENT.
         if (anbInfo->useVulkanNativeImage) {
-            fb->setColorBufferInUse(anbInfo->colorBufferHandle, true);
-
             VkCommandBufferBeginInfo beginInfo = {
                 VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                 0,
@@ -741,7 +747,7 @@ VkResult syncImageToColorBuffer(VulkanDispatch* vk, uint32_t queueFamilyIndex, V
     // TODO(kaiyili): initiate ownership transfer to DisplayVk here.
     VkFence qsriFence = anbInfo->qsriWaitFencePool->getFenceFromPool();
     AutoLock qLock(*queueLock);
-    vk->vkQueueSubmit(queueState.queue, 1, &submitInfo, qsriFence);
+    VK_CHECK(vk->vkQueueSubmit(queueState.queue, 1, &submitInfo, qsriFence));
     auto waitForQsriFenceTask = [anbInfoPtr, anbInfo, vk, device = anbInfo->device, qsriFence] {
         (void)anbInfoPtr;
         VK_ANB_DEBUG_OBJ(anbInfoPtr, "wait callback: enter");
@@ -764,7 +770,6 @@ VkResult syncImageToColorBuffer(VulkanDispatch* vk, uint32_t queueFamilyIndex, V
 
     if (anbInfo->useVulkanNativeImage) {
         VK_ANB_DEBUG_OBJ(anbInfoPtr, "using native image, so use sync thread to wait");
-        fb->setColorBufferInUse(anbInfo->colorBufferHandle, false);
         // Queue wait to sync thread with completion callback
         // Pass anbInfo by value to get a ref
         SyncThread::get()->triggerGeneral(
@@ -801,7 +806,7 @@ VkResult syncImageToColorBuffer(VulkanDispatch* vk, uint32_t queueFamilyIndex, V
                 break;
         }
 
-        FrameBuffer::getFB()->replaceColorBufferContents(
+        FrameBuffer::getFB()->flushColorBufferFromVkBytes(
             colorBufferHandle, anbInfo->mappedStagingPtr,
             bpp * anbInfo->extent.width * anbInfo->extent.height);
         anbInfo->qsriTimeline->signalNextPresentAndPoll();
@@ -810,4 +815,5 @@ VkResult syncImageToColorBuffer(VulkanDispatch* vk, uint32_t queueFamilyIndex, V
     return VK_SUCCESS;
 }
 
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream

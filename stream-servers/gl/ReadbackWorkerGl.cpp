@@ -17,6 +17,7 @@
 
 #include <string.h>
 
+#include "ColorBuffer.h"
 #include "ContextHelper.h"
 #include "OpenGLESDispatch/DispatchTables.h"
 #include "OpenGLESDispatch/EGLDispatch.h"
@@ -26,6 +27,7 @@
 #include "host-common/misc.h"
 
 namespace gfxstream {
+namespace gl {
 
 ReadbackWorkerGl::TrackedDisplay::TrackedDisplay(uint32_t displayId, uint32_t w, uint32_t h)
     : mBufferSize(4 * w * h /* RGBA8 (4 bpp) */),
@@ -165,7 +167,7 @@ ReadbackWorkerGl::doNextReadback(uint32_t displayId,
         r.m_readbackCount++;
         r.mPrevReadPixelsIndex = readAt;
 
-        cb->readbackAsync(r.mBuffers[readAt], readbackBgra);
+        cb->glOpReadbackAsync(r.mBuffers[readAt], readbackBgra);
 
         // It's possible to post callback before any of the async readbacks
         // have written any data yet, which results in a black frame.  Safer
@@ -242,4 +244,5 @@ void ReadbackWorkerGl::getPixels(uint32_t displayId, void* buf, uint32_t bytes) 
     lock.unlock();
 }
 
+}  // namespace gl
 }  // namespace gfxstream

@@ -14,45 +14,54 @@
 
 #pragma once
 
-#include <array>
-#include <memory>
-#include <string>
-#include <optional>
-#include <unordered_set>
-
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES/gl.h>
 #include <GLES3/gl3.h>
 
-#include "ContextHelper.h"
+#include <array>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_set>
+
+#include "BufferGl.h"
+#include "ColorBufferGl.h"
 #include "Compositor.h"
 #include "CompositorGl.h"
+#include "ContextHelper.h"
 #include "Display.h"
 #include "DisplayGl.h"
 #include "DisplaySurface.h"
-#include "EmulatedEglContext.h"
 #include "EmulatedEglConfig.h"
 #include "EmulatedEglContext.h"
 #include "EmulatedEglFenceSync.h"
 #include "EmulatedEglImage.h"
 #include "EmulatedEglWindowSurface.h"
+#include "OpenGLESDispatch/EGLDispatch.h"
 #include "OpenGLESDispatch/GLESv2Dispatch.h"
 #include "ReadbackWorkerGl.h"
 #include "TextureDraw.h"
+#include "aemu/base/files/Stream.h"
 
 #define EGL_NO_CONFIG ((EGLConfig)0)
 
+namespace gfxstream {
 class FrameBuffer;
+}  // namespace gfxstream
 
 namespace gfxstream {
+namespace gl {
 
 class EmulationGl {
    public:
     static std::unique_ptr<EmulationGl> create(uint32_t width, uint32_t height,
-                                               bool allowWindowSurface);
+                                               bool allowWindowSurface, bool egl2egl);
 
     ~EmulationGl();
+
+    const EGLDispatch* getEglDispatch();
+    const GLESv2Dispatch* getGles2Dispatch();
 
     GLESDispatchMaxVersion getGlesMaxDispatchVersion() const;
 
@@ -67,6 +76,8 @@ class EmulationGl {
     const std::string& getGlesVersionString() const { return mGlesVersion; }
     const std::string& getGlesExtensionsString() const { return mGlesExtensions; }
     bool isGlesVulkanInteropSupported() const { return mGlesVulkanInteropSupported; }
+
+    bool isMesa() const;
 
     bool isFastBlitSupported() const;
     void disableFastBlitForTesting();
@@ -85,13 +96,21 @@ class EmulationGl {
 
     ReadbackWorkerGl* getReadbackWorker() { return mReadbackWorkerGl.get(); }
 
-    // TODO(b/233939967): Remove after adding ColorBufferGl and EmulationGl::createColorBuffer().
-    TextureDraw* getTextureDraw() const { return mTextureDraw.get(); }
-
     using GlesUuid = std::array<uint8_t, GL_UUID_SIZE_EXT>;
     const std::optional<GlesUuid> getGlesDeviceUuid() const { return mGlesDeviceUuid; }
 
     void setUseBoundSurfaceContextForDisplay(bool use);
+
+    std::unique_ptr<BufferGl> createBuffer(uint64_t size, HandleType handle);
+
+    std::unique_ptr<BufferGl> loadBuffer(android::base::Stream* stream);
+
+    std::unique_ptr<ColorBufferGl> createColorBuffer(uint32_t width, uint32_t height,
+                                                     GLenum internalFormat,
+                                                     FrameworkFormat frameworkFormat,
+                                                     HandleType handle);
+
+    std::unique_ptr<ColorBufferGl> loadColorBuffer(android::base::Stream* stream);
 
     std::unique_ptr<EmulatedEglContext> createEmulatedEglContext(
         uint32_t emulatedEglConfigIndex,
@@ -124,46 +143,49 @@ class EmulationGl {
 
   private:
     // TODO(b/233939967): Remove this after fully transitioning to EmulationGl.
-    friend class ::FrameBuffer;
+   friend class gfxstream::FrameBuffer;
 
-    EmulationGl() = default;
+   EmulationGl() = default;
 
-    EGLDisplay mEglDisplay = EGL_NO_DISPLAY;
-    EGLint mEglVersionMajor = 0;
-    EGLint mEglVersionMinor = 0;
-    std::string mEglVendor;
-    std::unordered_set<std::string> mEglExtensions;
-    EGLConfig mEglConfig = EGL_NO_CONFIG;
+   ContextHelper* getColorBufferContextHelper();
 
-    // The "global" context that all other contexts are shared with.
-    EGLContext mEglContext = EGL_NO_CONTEXT;
+   EGLDisplay mEglDisplay = EGL_NO_DISPLAY;
+   EGLint mEglVersionMajor = 0;
+   EGLint mEglVersionMinor = 0;
+   std::string mEglVendor;
+   std::unordered_set<std::string> mEglExtensions;
+   EGLConfig mEglConfig = EGL_NO_CONFIG;
 
-    // Used for ColorBuffer ops.
-    std::unique_ptr<gfxstream::DisplaySurface> mPbufferSurface;
+   // The "global" context that all other contexts are shared with.
+   EGLContext mEglContext = EGL_NO_CONTEXT;
 
-    // Used for Composition and Display ops.
-    std::unique_ptr<gfxstream::DisplaySurface> mWindowSurface;
-    std::unique_ptr<gfxstream::DisplaySurface> mFakeWindowSurface;
+   // Used for ColorBuffer ops.
+   std::unique_ptr<gfxstream::DisplaySurface> mPbufferSurface;
 
-    GLint mGlesVersionMajor = 0;
-    GLint mGlesVersionMinor = 0;
-    GLESDispatchMaxVersion mGlesDispatchMaxVersion = GLES_DISPATCH_MAX_VERSION_2;
-    std::string mGlesVendor;
-    std::string mGlesRenderer;
-    std::string mGlesVersion;
-    std::string mGlesExtensions;
-    std::optional<GlesUuid> mGlesDeviceUuid;
-    bool mGlesVulkanInteropSupported = false;
+   // Used for Composition and Display ops.
+   std::unique_ptr<gfxstream::DisplaySurface> mWindowSurface;
+   std::unique_ptr<gfxstream::DisplaySurface> mFakeWindowSurface;
 
-    std::unique_ptr<EmulatedEglConfigList> mEmulatedEglConfigs;
+   GLint mGlesVersionMajor = 0;
+   GLint mGlesVersionMinor = 0;
+   GLESDispatchMaxVersion mGlesDispatchMaxVersion = GLES_DISPATCH_MAX_VERSION_2;
+   std::string mGlesVendor;
+   std::string mGlesRenderer;
+   std::string mGlesVersion;
+   std::string mGlesExtensions;
+   std::optional<GlesUuid> mGlesDeviceUuid;
+   bool mGlesVulkanInteropSupported = false;
 
-    bool mFastBlitSupported = false;
+   std::unique_ptr<EmulatedEglConfigList> mEmulatedEglConfigs;
 
-    std::unique_ptr<CompositorGl> mCompositorGl;
-    std::unique_ptr<DisplayGl> mDisplayGl;
-    std::unique_ptr<ReadbackWorkerGl> mReadbackWorkerGl;
+   bool mFastBlitSupported = false;
 
-    std::unique_ptr<TextureDraw> mTextureDraw;
+   std::unique_ptr<CompositorGl> mCompositorGl;
+   std::unique_ptr<DisplayGl> mDisplayGl;
+   std::unique_ptr<ReadbackWorkerGl> mReadbackWorkerGl;
+
+   std::unique_ptr<TextureDraw> mTextureDraw;
 };
 
+}  // namespace gl
 }  // namespace gfxstream

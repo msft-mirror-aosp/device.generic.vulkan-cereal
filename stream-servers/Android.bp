@@ -34,6 +34,8 @@ cc_library_shared {
         "gfxstream_gles1_dec",
         "gfxstream_gles2_dec",
         "gfxstream_glsnapshot",
+        "gfxstream_magma_dec",
+        "gfxstream_magma_server",
         "gfxstream_translator_glcommon",
         "gfxstream_translator_egl",
         "gfxstream_translator_glescm",
@@ -50,14 +52,16 @@ cc_library_shared {
         "gfxstream_base",
         "gfxstream_gles2_dec",
         "gfxstream_glsnapshot",
+        "gfxstream_magma_server",
         "gfxstream_vulkan_cereal_host",
     ],
     shared_libs: [
         "liblog", // gfxstream_base uses this via perfetto-libperfettobase
     ],
     srcs: [
+        "Buffer.cpp",
         "ChannelStream.cpp",
-        "Debug.cpp",
+        "ColorBuffer.cpp",
         "DisplaySurface.cpp",
         "DisplaySurfaceUser.cpp",
         "Hwc2.cpp",
@@ -68,6 +72,7 @@ cc_library_shared {
         "RenderThread.cpp",
         "RenderThreadInfo.cpp",
         "RenderThreadInfoGl.cpp",
+        "RenderThreadInfoMagma.cpp",
         "RingStream.cpp",
         "SyncThread.cpp",
         "RenderControl.cpp",
@@ -187,6 +192,9 @@ cc_test_host {
         // Disabled by default as requires Vulkan.
         unit_test: false,
     },
+    test_suites: [
+        "general-tests",
+    ],
 }
 
 // Run with `atest --host gfxstream_framebuffer_tests`
@@ -217,4 +225,7 @@ cc_test_host {
         // Disabled by default as requires Vulkan.
         unit_test: false,
     },
+    test_suites: [
+        "general-tests",
+    ],
 }

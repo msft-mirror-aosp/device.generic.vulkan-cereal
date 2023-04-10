@@ -25,6 +25,9 @@
 #include <cstring>
 #include <vector>
 
+namespace gfxstream {
+namespace gl {
+
 enum class YUVPlane {
     Y = 0,
     U = 1,
@@ -71,7 +74,7 @@ public:
     // if size mismatches, will read nothing.
     void readPixels(uint8_t* pixels, uint32_t pixels_size);
 
-    void swapTextures(uint32_t type, uint32_t* textures);
+    void swapTextures(FrameworkFormat type, GLuint* textures);
 
     // public so other classes can call
     static void createYUVGLTex(GLenum textureUnit,
@@ -133,3 +136,6 @@ private:
     GLint mCurrVbo = 0;
     GLint mCurrIbo = 0;
 };
+
+}  // namespace gl
+}  // namespace gfxstream

@@ -29,6 +29,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "Buffer.h"
 #include "Compositor.h"
 #include "Display.h"
 #include "DisplaySurface.h"
@@ -65,11 +66,17 @@
 #include "utils/RenderDoc.h"
 #include "vulkan/vk_util.h"
 
+namespace gfxstream {
+namespace vk {
+class DisplayVk;
+}  // namespace vk
+}  // namespace gfxstream
+
+namespace gfxstream {
+
 using android::base::CreateMetricsLogger;
 using emugl::HealthMonitor;
 using emugl::MetricsLogger;
-
-class DisplayVk;
 
 struct BufferRef {
     BufferPtr buffer;
@@ -85,18 +92,19 @@ class ProcessResources {
     DISALLOW_COPY_ASSIGN_AND_MOVE(ProcessResources);
 
     ~ProcessResources() = default;
-    uint32_t* getSequenceNumberPtr() const { return &mSequenceNumber; }
+    std::atomic<uint32_t>* getSequenceNumberPtr() const {
+        return &mSequenceNumber;
+    }
 
    private:
     ProcessResources() : mSequenceNumber(0) {}
-    mutable uint32_t mSequenceNumber;
+    mutable std::atomic<uint32_t> mSequenceNumber;
 };
 
-typedef std::unordered_map<uint64_t, gfxstream::EmulatedEglWindowSurfaceSet>
+typedef std::unordered_map<uint64_t, gl::EmulatedEglWindowSurfaceSet>
     ProcOwnedEmulatedEglWindowSurfaces;
 
-typedef std::unordered_map<uint64_t, gfxstream::EmulatedEglContextSet>
-    ProcOwnedEmulatedEglContexts;
+typedef std::unordered_map<uint64_t, gl::EmulatedEglContextSet> ProcOwnedEmulatedEglContexts;
 
 typedef std::unordered_map<uint64_t, ColorBufferSet> ProcOwnedColorBuffers;
 
@@ -104,8 +112,7 @@ typedef std::unordered_map<HandleType, BufferRef> BufferMap;
 typedef std::unordered_multiset<HandleType> BufferSet;
 typedef std::unordered_map<uint64_t, BufferSet> ProcOwnedBuffers;
 
-typedef std::unordered_map<uint64_t, gfxstream::EmulatedEglImageSet>
-    ProcOwnedEmulatedEGLImages;
+typedef std::unordered_map<uint64_t, gl::EmulatedEglImageSet> ProcOwnedEmulatedEGLImages;
 
 typedef std::unordered_map<void*, std::function<void()>> CallbackMap;
 typedef std::unordered_map<uint64_t, CallbackMap> ProcOwnedCleanupCallbacks;
@@ -117,7 +124,7 @@ typedef std::unordered_map<uint64_t, CallbackMap> ProcOwnedCleanupCallbacks;
 // There is only one global instance, that can be retrieved with getFB(),
 // and which must be previously setup by calling initialize().
 //
-class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameBufferChangeEvent> {
+class FrameBuffer : public android::base::EventNotificationSupport<FrameBufferChangeEvent> {
    public:
     // Initialize the global instance.
     // |width| and |height| are the dimensions of the emulator GPU display
@@ -128,6 +135,9 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     // Returns true on success, false otherwise.
     static bool initialize(int width, int height, bool useSubWindow,
                            bool egl2egl);
+
+    // Finalize the instance.
+    static void finalize();
 
     // Setup a sub-window to display the content of the emulated GPU
     // on-top of an existing UI window. |p_window| is the platform-specific
@@ -155,9 +165,6 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     // Return true on success, false otherwise.
     bool removeSubWindow();
 
-    // Finalize the instance.
-    void finalize();
-
     // Return a pointer to the global instance. initialize() must be called
     // previously, or this will return NULL.
     static FrameBuffer* getFB() { return s_theFrameBuffer; }
@@ -174,13 +181,12 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     int getHeight() const { return m_framebufferHeight; }
 
     // Return the list of configs available from this display.
-    const EmulatedEglConfigList* getConfigs() const;
+    const gl::EmulatedEglConfigList* getConfigs() const;
 
     // Set a callback that will be called each time the emulated GPU content
     // is updated. This can be relatively slow with host-based GPU emulation,
     // so only do this when you need to.
-    void setPostCallback(emugl::Renderer::OnPostCallback onPost,
-                         void* onPostContext, uint32_t displayId,
+    void setPostCallback(Renderer::OnPostCallback onPost, void* onPostContext, uint32_t displayId,
                          bool useBgraReadback = false);
 
     // Retrieve the GL strings of the underlying EGL/GLES implementation.
@@ -199,7 +205,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     // |version| specifies the GLES version as a GLESApi enum.
     // Return a new handle value, which will be 0 in case of error.
     HandleType createEmulatedEglContext(int p_config, HandleType p_share,
-                                        gfxstream::GLESApi version = gfxstream::GLESApi_CM);
+                                        gl::GLESApi version = gl::GLESApi_CM);
 
     // Destroy a given EmulatedEglContext instance. |p_context| is its handle
     // value as returned by createEmulatedEglContext().
@@ -301,10 +307,10 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
                      HandleType p_readSurface);
 
     // Return a render context pointer from its handle
-    gfxstream::EmulatedEglContextPtr getContext_locked(HandleType p_context);
+    gl::EmulatedEglContextPtr getContext_locked(HandleType p_context);
 
     // Return a color buffer pointer from its handle
-    gfxstream::EmulatedEglWindowSurfacePtr getWindowSurface_locked(HandleType p_windowsurface);
+    gl::EmulatedEglWindowSurfacePtr getWindowSurface_locked(HandleType p_windowsurface);
 
     // Attach a ColorBuffer to a EmulatedEglWindowSurface instance.
     // See the documentation for EmulatedEglWindowSurface::setColorBuffer().
@@ -410,11 +416,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     bool updateColorBufferFromFrameworkFormat(HandleType p_colorbuffer, int x, int y, int width,
                                               int height, FrameworkFormat fwkFormat, GLenum format,
                                               GLenum type, void* pixels);
-    // Replaces contents completely using the color buffer's current format,
-    // with row length equal to width of a row in bytes.
-    // The number of bytes is passed as a check.
-    bool replaceColorBufferContents(HandleType p_colorbuffer,
-                                    const void* pixels, size_t numBytes);
+
     // Reads back the raw color buffer to |pixels|
     // if |pixels| is not null.
     // Always returns in |numBytes| how many bytes were
@@ -453,15 +455,15 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     void ensureReadbackWorker();
 
     bool asyncReadbackSupported();
-    emugl::Renderer::ReadPixelsCallback getReadPixelsCallback();
-    emugl::Renderer::FlushReadPixelPipeline getFlushReadPixelPipeline();
+    Renderer::ReadPixelsCallback getReadPixelsCallback();
+    Renderer::FlushReadPixelPipeline getFlushReadPixelPipeline();
 
     // Re-post the last ColorBuffer that was displayed through post().
     // This is useful if you detect that the sub-window content needs to
     // be re-displayed for any reason.
     bool repost(bool needLockAndBind = true);
 
-    gfxstream::EmulationGl& getEmulationGl();
+    gl::EmulationGl& getEmulationGl();
     bool hasEmulationGl() const { return m_emulationGl != nullptr; }
 
     // Return the host EGLDisplay used by this instance.
@@ -498,7 +500,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
 
     // Return a TextureDraw instance that can be used with this surfaces
     // and windows created by this instance.
-    TextureDraw* getTextureDraw() const;
+    gl::TextureDraw* getTextureDraw() const;
 
     // Create an eglImage and return its handle.  Reference:
     // https://www.khronos.org/registry/egl/extensions/KHR/EGL_KHR_image_base.txt
@@ -543,7 +545,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     void lock();
     void unlock();
 
-    GLESDispatchMaxVersion getMaxGLESVersion();
+    gl::GLESDispatchMaxVersion getMaxGLESVersion();
 
     float getDpr() const { return m_dpr; }
     int windowWidth() const { return m_windowWidth; }
@@ -557,10 +559,6 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
 
     bool isVulkanInteropSupported() const { return m_vulkanInteropSupported; }
     bool isVulkanEnabled() const { return m_vulkanEnabled; }
-    bool importMemoryToColorBuffer(android::base::ManagedDescriptor descriptor, uint64_t size,
-                                   bool dedicated, bool vulkanOnly, uint32_t colorBufferHandle,
-                                   VkImage, const VkImageCreateInfo&);
-    void setColorBufferInUse(uint32_t colorBufferHandle, bool inUse);
 
     // Fill GLES usage protobuf
     void fillGLESUsages(android_studio::EmulatorGLESUsages*);
@@ -586,7 +584,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     // desiredWidth and desiredHeight.
     int getScreenshot(unsigned int nChannels, unsigned int* width, unsigned int* height,
                       uint8_t* pixels, size_t* cPixels, int displayId, int desiredWidth,
-                      int desiredHeight, int desiredRotation, emugl::Rect rect = {{0, 0}, {0, 0}});
+                      int desiredHeight, int desiredRotation, Rect rect = {{0, 0}, {0, 0}});
 
     void onLastColorBufferRef(uint32_t handle);
     ColorBufferPtr findColorBuffer(HandleType p_colorbuffer);
@@ -655,6 +653,23 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
                               std::optional<uint64_t> allocationSize = std::nullopt);
 
     void setVsyncHz(int vsyncHz);
+    void scheduleVsyncTask(VsyncThread::VsyncTask task);
+    void setDisplayConfigs(int configId, int w, int h, int dpiX, int dpiY);
+    void setDisplayActiveConfig(int configId);
+    const int getDisplayConfigsCount();
+    const int getDisplayConfigsParam(int configId, EGLint param);
+    const int getDisplayActiveConfig();
+
+    bool flushColorBufferFromGl(HandleType colorBufferHandle);
+    bool flushColorBufferFromGlLocked(HandleType colorBufferHandle);
+    bool flushColorBufferFromVk(HandleType colorBufferHandle);
+    bool flushColorBufferFromVkBytes(HandleType colorBufferHandle, const void* bytes, size_t bytesSize);
+    bool invalidateColorBufferForGl(HandleType colorBufferHandle);
+    bool invalidateColorBufferForVk(HandleType colorBufferHandle);
+
+    const gl::EGLDispatch* getEglDispatch();
+    const gl::GLESv2Dispatch* getGles2Dispatch();
+
    private:
     FrameBuffer(int p_width, int p_height, bool useSubWindow);
     // Requires the caller to hold the m_colorBufferMapLock until the new handle is inserted into of
@@ -671,6 +686,9 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     bool closeColorBufferLocked(HandleType p_colorbuffer, bool forced = false);
     // Returns true if this was the last ref and we need to destroy stuff.
     bool decColorBufferRefCountLocked(HandleType p_colorbuffer);
+    // Decrease refcount but not destroy the object.
+    // Mainly used in post thread, when we need to destroy the object but cannot in post thread.
+    void decColorBufferRefCountNoDestroy(HandleType p_colorbuffer);
     // Close all expired color buffers for real.
     // Treat all delayed color buffers as expired if forced=true
     void performDelayedColorBufferCloseLocked(bool forced = false);
@@ -681,12 +699,12 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     bool postImplSync(HandleType p_colorbuffer, bool needLockAndBind = true, bool repaint = false);
     void setGuestPostedAFrame() {
         m_guestPostedAFrame = true;
-        fireEvent({emugl::FrameBufferChange::FrameReady, mFrameNumber++});
+        fireEvent({FrameBufferChange::FrameReady, mFrameNumber++});
     }
     HandleType createColorBufferWithHandleLocked(int p_width, int p_height, GLenum p_internalFormat,
                                                  FrameworkFormat p_frameworkFormat,
                                                  HandleType handle);
-    HandleType createBufferWithHandleLocked(int p_size, HandleType handle);
+    HandleType createBufferWithHandleLocked(int p_size, HandleType handle, uint32_t memoryProperty);
 
     void recomputeLayout();
     void setDisplayPoseInSkinUI(int totalHeight);
@@ -719,9 +737,9 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     android::base::Lock m_colorBufferMapLock;
     uint64_t mFrameNumber;
     FBNativeWindowType m_nativeWindow = 0;
-    gfxstream::EmulatedEglContextMap m_contexts;
-    gfxstream::EmulatedEglImageMap m_images;
-    gfxstream::EmulatedEglWindowSurfaceMap m_windows;
+    gl::EmulatedEglContextMap m_contexts;
+    gl::EmulatedEglImageMap m_images;
+    gl::EmulatedEglWindowSurfaceMap m_windows;
     ColorBufferMap m_colorbuffers;
     BufferMap m_buffers;
     std::unordered_map<HandleType, HandleType> m_EmulatedEglWindowSurfaceToColorBuffer;
@@ -770,7 +788,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     bool m_guestPostedAFrame = false;
 
     struct onPost {
-        emugl::Renderer::OnPostCallback cb;
+        Renderer::OnPostCallback cb;
         void* context;
         uint32_t displayId;
         uint32_t width;
@@ -785,7 +803,7 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
         }
     };
     std::map<uint32_t, onPost> m_onPost;
-    gfxstream::ReadbackWorker* m_readbackWorker;
+    ReadbackWorker* m_readbackWorker = nullptr;
     android::base::WorkerThread<Readback> m_readbackThread;
     std::atomic_bool m_readbackThreadStarted = false;
 
@@ -838,27 +856,27 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
     android::base::MessageChannel<HandleType, 1024>
         mOutstandingColorBufferDestroys;
 
-    std::unique_ptr<gfxstream::EmulationGl> m_emulationGl;
-    DisplayGl* m_displayGl = nullptr;
+    std::unique_ptr<gl::EmulationGl> m_emulationGl;
+    gl::DisplayGl* m_displayGl = nullptr;
 
     Compositor* m_compositor = nullptr;
     bool m_useVulkanComposition = false;
 
+    vk::VkEmulation* m_emulationVk = nullptr;
     // The implementation for Vulkan native swapchain. Only initialized when useVulkan is set when
     // calling FrameBuffer::initialize(). DisplayVk is actually owned by VkEmulation.
-    DisplayVk *m_displayVk = nullptr;
+    vk::DisplayVk* m_displayVk = nullptr;
     VkInstance m_vkInstance = VK_NULL_HANDLE;
     std::unique_ptr<emugl::RenderDoc> m_renderDoc = nullptr;
 
     // TODO(b/233939967): Refactor to create DisplayGl and DisplaySurfaceGl
     // and remove usage of non-generic DisplayVk.
-    gfxstream::Display* m_display;
-    std::unique_ptr<gfxstream::DisplaySurface> m_displaySurface;
+    Display* m_display;
+    std::unique_ptr<DisplaySurface> m_displaySurface;
 
     // CompositorGl.
     // TODO: update RenderDoc to be a DisplaySurfaceUser.
-    std::vector<gfxstream::DisplaySurfaceUser*> m_displaySurfaceUsers;
-
+    std::vector<DisplaySurfaceUser*> m_displaySurfaceUsers;
 
     // UUIDs of physical devices for Vulkan and GLES, respectively.  In most
     // cases, this determines whether we can support zero-copy interop.
@@ -881,5 +899,20 @@ class FrameBuffer : public android::base::EventNotificationSupport<emugl::FrameB
 
     // Vsync thread.
     std::unique_ptr<VsyncThread> m_vsyncThread = {};
+
+    struct DisplayConfig{
+        int w;
+        int h;
+        int dpiX;
+        int dpiY;
+        DisplayConfig() {}
+        DisplayConfig(int w, int h, int x, int y)
+        : w(w), h(h), dpiX(x), dpiY(y) {}
+    };
+    std::map<int, DisplayConfig> mDisplayConfigs;
+    int mDisplayActiveConfigId = -1;
 };
+
+}  // namespace gfxstream
+
 #endif

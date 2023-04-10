@@ -16,18 +16,20 @@
 
 #pragma once
 
-#include <memory>
-#include <unordered_set>
-#include <unordered_map>
-
 #include <EGL/egl.h>
 #include <GLES/gl.h>
 
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
+
+#include "ColorBuffer.h"
 #include "Handle.h"
 #include "gl/ColorBufferGl.h"
 #include "gl/EmulatedEglContext.h"
 
 namespace gfxstream {
+namespace gl {
 
 // A class used to model a guest-side window surface. The implementation
 // uses a host Pbuffer to act as the EGL rendering surface instead.
@@ -125,4 +127,5 @@ typedef std::shared_ptr<EmulatedEglWindowSurface> EmulatedEglWindowSurfacePtr;
 typedef std::unordered_map<HandleType, std::pair<EmulatedEglWindowSurfacePtr, HandleType>> EmulatedEglWindowSurfaceMap;
 typedef std::unordered_set<HandleType> EmulatedEglWindowSurfaceSet;
 
-}
+}  // namespace gl
+}  // namespace gfxstream

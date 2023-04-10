@@ -27,6 +27,7 @@
 #include "aemu/base/synchronization/Lock.h"
 
 namespace gfxstream {
+namespace gl {
 
 // The EmulatedEglFenceSync class wraps actual EGLSyncKHR objects
 // and issues calls to eglCreateSyncKHR, eglClientWaitSyncKHR,
@@ -120,6 +121,14 @@ class EmulatedEglFenceSync {
         return false;
     }
 
+    void setIsCompositionFence(bool isComposition) {
+        mIsCompositionFence = isComposition;
+    }
+
+    bool isCompositionFence() const {
+        return mIsCompositionFence;
+    }
+
     // Tracks current active set of fences. Useful for snapshotting.
     void addToRegistry();
     void removeFromRegistry();
@@ -143,6 +152,10 @@ class EmulatedEglFenceSync {
     EGLDisplay mDisplay;
     EGLSyncKHR mSync;
 
+    // Whether this fence was against composition, in which case
+    // we should make this wait till next vsync.
+    bool mIsCompositionFence = false;
+
     // destroy() wraps eglDestroySyncKHR. This is private, because we need
     // careful control of when eglDestroySyncKHR is actually called.
     void destroy();
@@ -150,4 +163,5 @@ class EmulatedEglFenceSync {
     DISALLOW_COPY_AND_ASSIGN(EmulatedEglFenceSync);
 };
 
+}  // namespace gl
 }  // namespace gfxstream

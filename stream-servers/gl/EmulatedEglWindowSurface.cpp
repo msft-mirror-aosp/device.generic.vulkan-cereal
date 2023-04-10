@@ -16,16 +16,23 @@
 #include "EmulatedEglWindowSurface.h"
 
 #include <assert.h>
+#include <ios>
 #include <stdio.h>
 #include <string.h>
 
 #include <GLES/glext.h>
 
+#include "OpenGLESDispatch/DispatchTables.h"
 #include "OpenGLESDispatch/EGLDispatch.h"
 #include "aemu/base/containers/Lookup.h"
+#include "host-common/GfxstreamFatalError.h"
 #include "host-common/logging.h"
 
+using emugl::ABORT_REASON_OTHER;
+using emugl::FatalError;
+
 namespace gfxstream {
+namespace gl {
 
 EmulatedEglWindowSurface::EmulatedEglWindowSurface(EGLDisplay display,
                                                    EGLConfig config,
@@ -105,6 +112,13 @@ bool EmulatedEglWindowSurface::flushColorBuffer() {
         return false;
     }
 
+    GLenum resetStatus = s_gles2.glGetGraphicsResetStatusEXT();
+    if (resetStatus != GL_NO_ERROR) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) <<
+                "Stream server aborting due to graphics reset. ResetStatus: " <<
+                std::hex << resetStatus;
+    }
+
     // Make the surface current
     EGLContext prevContext = s_egl.eglGetCurrentContext();
     EGLSurface prevReadSurf = s_egl.eglGetCurrentSurface(EGL_READ);
@@ -122,7 +136,7 @@ bool EmulatedEglWindowSurface::flushColorBuffer() {
         }
     }
 
-    mAttachedColorBuffer->blitFromCurrentReadBuffer();
+    mAttachedColorBuffer->glOpBlitFromCurrentReadBuffer();
 
     if (needToSet) {
         // restore current context/surface
@@ -244,4 +258,5 @@ std::unique_ptr<EmulatedEglWindowSurface> EmulatedEglWindowSurface::onLoad(
     return surface;
 }
 
+}  // namespace gl
 }  // namespace gfxstream
