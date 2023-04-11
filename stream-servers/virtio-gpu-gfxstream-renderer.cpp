@@ -602,7 +602,6 @@ class PipeVirglRenderer {
 
     int createContext(VirtioGpuCtxId ctx_id, uint32_t nlen, const char* name,
                       uint32_t context_init) {
-        AutoLock lock(mLock);
 
         std::string contextName(name, nlen);
 
@@ -634,7 +633,6 @@ class PipeVirglRenderer {
     }
 
     int destroyContext(VirtioGpuCtxId handle) {
-        AutoLock lock(mLock);
         VGPLOG("ctxid: %u", handle);
 
         auto it = mContexts.find(handle);
@@ -693,15 +691,15 @@ class PipeVirglRenderer {
     }
 
 #define DECODE(variable, type, input) \
-    struct type variable = {};        \
+    type variable = {};               \
     memcpy(&variable, input, sizeof(type));
 
     void addressSpaceProcessCmd(VirtioGpuCtxId ctxId, uint32_t* dwords, int dwordCount) {
-        DECODE(header, gfxstreamHeader, dwords)
+        DECODE(header, gfxstream::gfxstreamHeader, dwords)
 
         switch (header.opCode) {
             case GFXSTREAM_CONTEXT_CREATE: {
-                DECODE(contextCreate, gfxstreamContextCreate, dwords)
+                DECODE(contextCreate, gfxstream::gfxstreamContextCreate, dwords)
 
                 auto resEntryIt = mResources.find(contextCreate.resourceId);
                 if (resEntryIt == mResources.end()) {
@@ -734,14 +732,11 @@ class PipeVirglRenderer {
                 };
 
                 mAddressSpaceDeviceControlOps->create_instance(createInfo);
-                AutoLock lock(mLock);
                 setContextAddressSpaceHandleLocked(ctxId, handle, contextCreate.resourceId);
                 break;
             }
             case GFXSTREAM_CONTEXT_PING: {
-                DECODE(contextPing, gfxstreamContextPing, dwords)
-
-                AutoLock lock(mLock);
+                DECODE(contextPing, gfxstream::gfxstreamContextPing, dwords)
 
                 struct android::emulation::AddressSpaceDevicePingInfo ping = {0};
                 ping.metadata = ASG_NOTIFY_AVAILABLE;
@@ -772,7 +767,7 @@ class PipeVirglRenderer {
             return -1;
         }
 
-        DECODE(header, gfxstreamHeader, buffer);
+        DECODE(header, gfxstream::gfxstreamHeader, buffer);
         switch (header.opCode) {
             case GFXSTREAM_CONTEXT_CREATE:
             case GFXSTREAM_CONTEXT_PING:
@@ -780,7 +775,7 @@ class PipeVirglRenderer {
                 addressSpaceProcessCmd(ctxId, (uint32_t*)buffer, dwordCount);
                 break;
             case GFXSTREAM_CREATE_EXPORT_SYNC: {
-                DECODE(exportSync, gfxstreamCreateExportSync, buffer)
+                DECODE(exportSync, gfxstream::gfxstreamCreateExportSync, buffer)
 
                 uint64_t sync_handle =
                     convert32to64(exportSync.syncHandleLo, exportSync.syncHandleHi);
@@ -794,7 +789,7 @@ class PipeVirglRenderer {
             }
             case GFXSTREAM_CREATE_EXPORT_SYNC_VK:
             case GFXSTREAM_CREATE_IMPORT_SYNC_VK: {
-                DECODE(exportSyncVK, gfxstreamCreateExportSyncVK, buffer)
+                DECODE(exportSyncVK, gfxstream::gfxstreamCreateExportSyncVK, buffer)
 
                 uint64_t device_handle =
                     convert32to64(exportSyncVK.deviceHandleLo, exportSyncVK.deviceHandleHi);
@@ -819,7 +814,7 @@ class PipeVirglRenderer {
                     .mRingIdx = 0,
                 };
 
-                DECODE(exportQSRI, gfxstreamCreateQSRIExportVK, buffer)
+                DECODE(exportQSRI, gfxstream::gfxstreamCreateQSRIExportVK, buffer)
 
                 uint64_t image_handle =
                     convert32to64(exportQSRI.imageHandleLo, exportQSRI.imageHandleHi);
@@ -830,6 +825,10 @@ class PipeVirglRenderer {
                 mVirtioGpuOps->async_wait_for_gpu_vulkan_qsri_with_cb(image_handle, [this, taskId] {
                     mVirtioGpuTimelines->notifyTaskCompletion(taskId);
                 });
+                break;
+            }
+            case GFXSTREAM_PLACEHOLDER_COMMAND_VK: {
+                // Do nothing, this is a placeholder command
                 break;
             }
             default:
@@ -872,7 +871,6 @@ class PipeVirglRenderer {
             // VIRGL_RENDERER_UNSTABLE_APIS defined.
             return -EINVAL;
         }
-        AutoLock lock(mLock);
         mVirtioGpuTimelines->enqueueFence(ring, fence_id, callback);
 
         return 0;
@@ -987,13 +985,11 @@ class PipeVirglRenderer {
         e.type = resType;
         allocResource(e, iov, num_iovs);
 
-        AutoLock lock(mLock);
         mResources[args->handle] = e;
         return 0;
     }
 
     void unrefResource(uint32_t toUnrefId) {
-        AutoLock lock(mLock);
         VGPLOG("handle: %u", toUnrefId);
 
         auto it = mResources.find(toUnrefId);
@@ -1043,7 +1039,6 @@ class PipeVirglRenderer {
     }
 
     int attachIov(int resId, iovec* iov, int num_iovs) {
-        AutoLock lock(mLock);
 
         VGPLOG("resid: %d numiovs: %d", resId, num_iovs);
 
@@ -1059,7 +1054,6 @@ class PipeVirglRenderer {
     }
 
     void detachIov(int resId, iovec** iov, int* num_iovs) {
-        AutoLock lock(mLock);
 
         auto it = mResources.find(resId);
         if (it == mResources.end()) return;
@@ -1229,7 +1223,6 @@ class PipeVirglRenderer {
 
     int transferReadIov(int resId, uint64_t offset, virgl_box* box, struct iovec* iov,
                         int iovec_cnt) {
-        AutoLock lock(mLock);
 
         VGPLOG("resid: %d offset: 0x%llx. box: %u %u %u %u", resId, (unsigned long long)offset,
                box->x, box->y, box->w, box->h);
@@ -1273,7 +1266,6 @@ class PipeVirglRenderer {
 
     int transferWriteIov(int resId, uint64_t offset, virgl_box* box, struct iovec* iov,
                          int iovec_cnt) {
-        AutoLock lock(mLock);
         VGPLOG("resid: %d offset: 0x%llx", resId, (unsigned long long)offset);
         auto it = mResources.find(resId);
         if (it == mResources.end()) return EINVAL;
@@ -1310,8 +1302,24 @@ class PipeVirglRenderer {
         return ret;
     }
 
+    void getCapset(uint32_t set, uint32_t *max_size) {
+        // Only one capset right not
+        *max_size = sizeof(struct gfxstream::gfxstreamCapset);
+    }
+
+    void fillCaps(uint32_t set, void* caps) {
+        struct gfxstream::gfxstreamCapset *capset =
+            reinterpret_cast<struct gfxstream::gfxstreamCapset*>(caps);
+        if (capset) {
+            memset(capset, 0, sizeof(*capset));
+
+            capset->protocolVersion = 1;
+            capset->ringSize = 12288;
+            capset->bufferSize = 1048576;
+        }
+    }
+
     void attachResource(uint32_t ctxId, uint32_t resId) {
-        AutoLock lock(mLock);
         VGPLOG("ctxid: %u resid: %u", ctxId, resId);
 
         auto resourcesIt = mContextResources.find(ctxId);
@@ -1352,7 +1360,6 @@ class PipeVirglRenderer {
     }
 
     void detachResource(uint32_t ctxId, uint32_t toUnrefId) {
-        AutoLock lock(mLock);
         VGPLOG("ctxid: %u resid: %u", ctxId, toUnrefId);
         detachResourceLocked(ctxId, toUnrefId);
     }
@@ -1361,7 +1368,6 @@ class PipeVirglRenderer {
         VGPLOG("resid: %u", resId);
         if (!info) return EINVAL;
 
-        AutoLock lock(mLock);
         auto it = mResources.find(resId);
         if (it == mResources.end()) return ENOENT;
 
@@ -1466,16 +1472,30 @@ class PipeVirglRenderer {
                 return ret;
             }
         } else if (feature_is_enabled(kFeature_ExternalBlob)) {
-            auto descriptorInfoOpt =
-                HostmemIdMapping::get()->removeDescriptorInfo(create_blob->blob_id);
-            if (descriptorInfoOpt) {
-                e.descriptorInfo =
-                    std::make_shared<ManagedDescriptorInfo>(std::move(*descriptorInfoOpt));
-            } else {
-                return -EINVAL;
-            }
+            if (create_blob->blob_mem == STREAM_BLOB_MEM_GUEST &&
+                (create_blob->blob_flags & STREAM_BLOB_FLAG_CREATE_GUEST_HANDLE)) {
+#if defined(__linux__) || defined(__QNX__)
+                ManagedDescriptor managedHandle(handle->os_handle);
+                HostmemIdMapping::get()->addDescriptorInfo(create_blob->blob_id,
+                                                           std::move(managedHandle),
+                                                           handle->handle_type, 0, std::nullopt);
 
-            e.caching = e.descriptorInfo->caching;
+                e.caching = STREAM_RENDERER_MAP_CACHE_CACHED;
+#else
+                return -EINVAL;
+#endif
+            } else {
+                auto descriptorInfoOpt =
+                    HostmemIdMapping::get()->removeDescriptorInfo(create_blob->blob_id);
+                if (descriptorInfoOpt) {
+                    e.descriptorInfo =
+                        std::make_shared<ManagedDescriptorInfo>(std::move(*descriptorInfoOpt));
+                } else {
+                    return -EINVAL;
+                }
+
+                e.caching = e.descriptorInfo->caching;
+            }
         } else {
             auto entry = HostmemIdMapping::get()->get(create_blob->blob_id);
             e.hva = entry.hva;
@@ -1492,13 +1512,11 @@ class PipeVirglRenderer {
         e.linear = 0;
         e.linearSize = 0;
 
-        AutoLock lock(mLock);
         mResources[res_handle] = e;
         return 0;
     }
 
     int resourceMap(uint32_t res_handle, void** hvaOut, uint64_t* sizeOut) {
-        AutoLock lock(mLock);
 
         if (feature_is_enabled(kFeature_ExternalBlob)) return -EINVAL;
 
@@ -1517,7 +1535,6 @@ class PipeVirglRenderer {
     }
 
     int resourceUnmap(uint32_t res_handle) {
-        AutoLock lock(mLock);
         auto it = mResources.find(res_handle);
         if (it == mResources.end()) {
             return -1;
@@ -1529,7 +1546,6 @@ class PipeVirglRenderer {
     }
 
     int platformImportResource(int res_handle, int res_info, void* resource) {
-        AutoLock lock(mLock);
         auto it = mResources.find(res_handle);
         if (it == mResources.end()) return -1;
         bool success = mVirtioGpuOps->platform_import_resource(res_handle, res_info, resource);
@@ -1537,7 +1553,6 @@ class PipeVirglRenderer {
     }
 
     int platformResourceInfo(int res_handle, int* width, int* height, int* internal_format) {
-        AutoLock lock(mLock);
         auto it = mResources.find(res_handle);
         if (it == mResources.end()) return -1;
         bool success =
@@ -1555,7 +1570,6 @@ class PipeVirglRenderer {
     }
 
     int resourceMapInfo(uint32_t res_handle, uint32_t* map_info) {
-        AutoLock lock(mLock);
         auto it = mResources.find(res_handle);
         if (it == mResources.end()) return -1;
 
@@ -1565,7 +1579,6 @@ class PipeVirglRenderer {
     }
 
     int exportBlob(uint32_t res_handle, struct stream_renderer_handle* handle) {
-        AutoLock lock(mLock);
 
         auto it = mResources.find(res_handle);
         if (it == mResources.end()) {
@@ -1618,7 +1631,6 @@ class PipeVirglRenderer {
     }
 
     int vulkanInfo(uint32_t res_handle, struct stream_renderer_vulkan_info* vulkan_info) {
-        AutoLock lock(mLock);
         auto it = mResources.find(res_handle);
         if (it == mResources.end()) return -EINVAL;
 
@@ -1704,8 +1716,6 @@ class PipeVirglRenderer {
         return mServiceOps;
     }
 
-    Lock mLock;
-
     void* mCookie = nullptr;
     virgl_renderer_callbacks mVirglRendererCallbacks;
     AndroidVirtioGpuOps* mVirtioGpuOps = nullptr;
@@ -1781,9 +1791,15 @@ VG_EXPORT int pipe_virgl_renderer_transfer_write_iov(uint32_t handle, uint32_t c
     return sRenderer()->transferWriteIov(handle, offset, box, iovec, iovec_cnt);
 }
 
-// Not implemented
-VG_EXPORT void pipe_virgl_renderer_get_cap_set(uint32_t, uint32_t*, uint32_t*) {}
-VG_EXPORT void pipe_virgl_renderer_fill_caps(uint32_t, uint32_t, void* caps) {}
+VG_EXPORT void pipe_virgl_renderer_get_cap_set(uint32_t set, uint32_t* max_ver, uint32_t* max_size) {
+    // `max_ver` not useful
+    return sRenderer()->getCapset(set, max_size);
+}
+
+VG_EXPORT void pipe_virgl_renderer_fill_caps(uint32_t set, uint32_t version, void* caps) {
+    // `version` not useful
+    return sRenderer()->fillCaps(set, caps);
+}
 
 VG_EXPORT int pipe_virgl_renderer_resource_attach_iov(int res_handle, struct iovec* iov,
                                                       int num_iovs) {
@@ -2177,27 +2193,28 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
     }
 
     // Set non product-specific callbacks
-    vk_util::setVkCheckCallbacks(
-        std::make_unique<vk_util::VkCheckCallbacks>(vk_util::VkCheckCallbacks{
-            .onVkErrorOutOfMemory =
-                [](VkResult result, const char* function, int line) {
-                    auto fb = FrameBuffer::getFB();
-                    if (!fb) {
-                        ERR("FrameBuffer not yet initialized. Dropping out of memory event");
-                        return;
-                    }
-                    fb->logVulkanOutOfMemory(result, function, line);
-                },
-            .onVkErrorOutOfMemoryOnAllocation =
-                [](VkResult result, const char* function, int line,
-                   std::optional<uint64_t> allocationSize) {
-                    auto fb = FrameBuffer::getFB();
-                    if (!fb) {
-                        ERR("FrameBuffer not yet initialized. Dropping out of memory event");
-                        return;
-                    }
-                    fb->logVulkanOutOfMemory(result, function, line, allocationSize);
-                }}));
+    gfxstream::vk::vk_util::setVkCheckCallbacks(
+        std::make_unique<gfxstream::vk::vk_util::VkCheckCallbacks>(
+            gfxstream::vk::vk_util::VkCheckCallbacks{
+                .onVkErrorOutOfMemory =
+                    [](VkResult result, const char* function, int line) {
+                        auto fb = gfxstream::FrameBuffer::getFB();
+                        if (!fb) {
+                            ERR("FrameBuffer not yet initialized. Dropping out of memory event");
+                            return;
+                        }
+                        fb->logVulkanOutOfMemory(result, function, line);
+                    },
+                .onVkErrorOutOfMemoryOnAllocation =
+                    [](VkResult result, const char* function, int line,
+                       std::optional<uint64_t> allocationSize) {
+                        auto fb = gfxstream::FrameBuffer::getFB();
+                        if (!fb) {
+                            ERR("FrameBuffer not yet initialized. Dropping out of memory event");
+                            return;
+                        }
+                        fb->logVulkanOutOfMemory(result, function, line, allocationSize);
+                    }}));
 
     gfxstream_backend_init_product_override();
     // First we make some agents available.
@@ -2304,7 +2321,7 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
             << "can't enable vulkan native swapchain, Vulkan is disabled";
     }
 
-    emugl::vkDispatch(false /* don't use test ICD */);
+    gfxstream::vk::vkDispatch(false /* don't use test ICD */);
 
     auto androidHw = aemu_get_android_hw();
 
@@ -2330,10 +2347,8 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
     android_prepareOpenglesEmulation();
 
     {
-        static emugl::RenderLibPtr renderLibPtr = initLibrary();
-        void* egldispatch = renderLibPtr->getEGLDispatch();
-        void* glesv2Dispatch = renderLibPtr->getGLESv2Dispatch();
-        android_setOpenglesEmulation(renderLibPtr.get(), egldispatch, glesv2Dispatch);
+        static gfxstream::RenderLibPtr renderLibPtr = gfxstream::initLibrary();
+        android_setOpenglesEmulation(renderLibPtr.get(), nullptr, nullptr);
     }
 
     int maj;
@@ -2364,6 +2379,8 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
     sGetPixelsFunc = android_getReadPixelsFunc();
 
     pipe_virgl_renderer_init(renderer_cookie, renderer_flags, &virglrenderer_callbacks);
+
+    gfxstream::FrameBuffer::waitUntilInitialized();
 
     GFXS_LOG("Started renderer");
 
@@ -2456,7 +2473,7 @@ VG_EXPORT void get_pixels(void* pixels, uint32_t bytes) {
 
 VG_EXPORT void gfxstream_backend_getrender(char* buf, size_t bufSize, size_t* size) {
     const char* render = "";
-    FrameBuffer* pFB = FrameBuffer::getFB();
+    auto* pFB = gfxstream::FrameBuffer::getFB();
     if (pFB) {
         const char* vendor = nullptr;
         const char* version = nullptr;
