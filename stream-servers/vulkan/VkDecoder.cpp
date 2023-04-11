@@ -55,11 +55,11 @@
 
 #define MAX_PACKET_LENGTH (400 * 1024 * 1024)  // 400MB
 
+namespace gfxstream {
+namespace vk {
+
 using android::base::MetricEventBadPacketLength;
 using android::base::MetricEventDuplicateSequenceNum;
-using emugl::vkDispatch;
-
-using namespace goldfish_vk;
 
 class VkDecoder::Impl {
    public:
@@ -6283,8 +6283,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                             (unsigned long long)pBeginInfo);
                 }
                 VkResult vkBeginCommandBuffer_VkResult_return = (VkResult)0;
-                vkBeginCommandBuffer_VkResult_return = m_state->on_vkBeginCommandBuffer(
-                    &m_pool, commandBuffer, pBeginInfo, gfx_logger);
+                vkBeginCommandBuffer_VkResult_return =
+                    m_state->on_vkBeginCommandBuffer(&m_pool, commandBuffer, pBeginInfo, context);
                 if ((vkBeginCommandBuffer_VkResult_return) == VK_ERROR_DEVICE_LOST)
                     m_state->on_DeviceLost();
                 m_state->on_CheckOutOfMemory(vkBeginCommandBuffer_VkResult_return, opcode, context);
@@ -6320,7 +6320,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 }
                 VkResult vkEndCommandBuffer_VkResult_return = (VkResult)0;
                 vkEndCommandBuffer_VkResult_return =
-                    m_state->on_vkEndCommandBuffer(&m_pool, commandBuffer, gfx_logger);
+                    m_state->on_vkEndCommandBuffer(&m_pool, commandBuffer, context);
                 if ((vkEndCommandBuffer_VkResult_return) == VK_ERROR_DEVICE_LOST)
                     m_state->on_DeviceLost();
                 m_state->on_CheckOutOfMemory(vkEndCommandBuffer_VkResult_return, opcode, context);
@@ -31497,106 +31497,6 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
             }
 #endif
 #ifdef VK_GOOGLE_gfxstream
-            case OP_vkRegisterImageColorBufferGOOGLE: {
-                android::base::beginTrace("vkRegisterImageColorBufferGOOGLE decode");
-                VkDevice device;
-                VkImage image;
-                uint32_t colorBuffer;
-                // Begin global wrapped dispatchable handle unboxing for device;
-                uint64_t cgen_var_0;
-                memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
-                *readStreamPtrPtr += 1 * 8;
-                *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
-                uint64_t cgen_var_1;
-                memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
-                *readStreamPtrPtr += 1 * 8;
-                *(VkImage*)&image = (VkImage)unbox_VkImage((VkImage)(*&cgen_var_1));
-                memcpy((uint32_t*)&colorBuffer, *readStreamPtrPtr, sizeof(uint32_t));
-                *readStreamPtrPtr += sizeof(uint32_t);
-                if (m_logCalls) {
-                    fprintf(
-                        stderr,
-                        "stream %p: call vkRegisterImageColorBufferGOOGLE 0x%llx 0x%llx 0x%llx \n",
-                        ioStream, (unsigned long long)device, (unsigned long long)image,
-                        (unsigned long long)colorBuffer);
-                }
-                VkResult vkRegisterImageColorBufferGOOGLE_VkResult_return = (VkResult)0;
-                vkRegisterImageColorBufferGOOGLE_VkResult_return =
-                    m_state->on_vkRegisterImageColorBufferGOOGLE(&m_pool, device, image,
-                                                                 colorBuffer);
-                if ((vkRegisterImageColorBufferGOOGLE_VkResult_return) == VK_ERROR_DEVICE_LOST)
-                    m_state->on_DeviceLost();
-                m_state->on_CheckOutOfMemory(vkRegisterImageColorBufferGOOGLE_VkResult_return,
-                                             opcode, context);
-                vkStream->unsetHandleMapping();
-                vkStream->write(&vkRegisterImageColorBufferGOOGLE_VkResult_return,
-                                sizeof(VkResult));
-                vkStream->commitWrite();
-                vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
-                                         (uintptr_t)snapshotTraceBegin);
-                size_t snapshotTraceBytes = vkReadStream->endTrace();
-                if (m_state->snapshotsEnabled()) {
-                    m_state->snapshot()->vkRegisterImageColorBufferGOOGLE(
-                        snapshotTraceBegin, snapshotTraceBytes, &m_pool,
-                        vkRegisterImageColorBufferGOOGLE_VkResult_return, device, image,
-                        colorBuffer);
-                }
-                vkReadStream->clearPool();
-                if (queueSubmitWithCommandsEnabled)
-                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
-                android::base::endTrace();
-                break;
-            }
-            case OP_vkRegisterBufferColorBufferGOOGLE: {
-                android::base::beginTrace("vkRegisterBufferColorBufferGOOGLE decode");
-                VkDevice device;
-                VkBuffer buffer;
-                uint32_t colorBuffer;
-                // Begin global wrapped dispatchable handle unboxing for device;
-                uint64_t cgen_var_0;
-                memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
-                *readStreamPtrPtr += 1 * 8;
-                *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
-                uint64_t cgen_var_1;
-                memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
-                *readStreamPtrPtr += 1 * 8;
-                *(VkBuffer*)&buffer = (VkBuffer)unbox_VkBuffer((VkBuffer)(*&cgen_var_1));
-                memcpy((uint32_t*)&colorBuffer, *readStreamPtrPtr, sizeof(uint32_t));
-                *readStreamPtrPtr += sizeof(uint32_t);
-                if (m_logCalls) {
-                    fprintf(
-                        stderr,
-                        "stream %p: call vkRegisterBufferColorBufferGOOGLE 0x%llx 0x%llx 0x%llx \n",
-                        ioStream, (unsigned long long)device, (unsigned long long)buffer,
-                        (unsigned long long)colorBuffer);
-                }
-                VkResult vkRegisterBufferColorBufferGOOGLE_VkResult_return = (VkResult)0;
-                vkRegisterBufferColorBufferGOOGLE_VkResult_return =
-                    m_state->on_vkRegisterBufferColorBufferGOOGLE(&m_pool, device, buffer,
-                                                                  colorBuffer);
-                if ((vkRegisterBufferColorBufferGOOGLE_VkResult_return) == VK_ERROR_DEVICE_LOST)
-                    m_state->on_DeviceLost();
-                m_state->on_CheckOutOfMemory(vkRegisterBufferColorBufferGOOGLE_VkResult_return,
-                                             opcode, context);
-                vkStream->unsetHandleMapping();
-                vkStream->write(&vkRegisterBufferColorBufferGOOGLE_VkResult_return,
-                                sizeof(VkResult));
-                vkStream->commitWrite();
-                vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
-                                         (uintptr_t)snapshotTraceBegin);
-                size_t snapshotTraceBytes = vkReadStream->endTrace();
-                if (m_state->snapshotsEnabled()) {
-                    m_state->snapshot()->vkRegisterBufferColorBufferGOOGLE(
-                        snapshotTraceBegin, snapshotTraceBytes, &m_pool,
-                        vkRegisterBufferColorBufferGOOGLE_VkResult_return, device, buffer,
-                        colorBuffer);
-                }
-                vkReadStream->clearPool();
-                if (queueSubmitWithCommandsEnabled)
-                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
-                android::base::endTrace();
-                break;
-            }
             case OP_vkMapMemoryIntoAddressSpaceGOOGLE: {
                 android::base::beginTrace("vkMapMemoryIntoAddressSpaceGOOGLE decode");
                 VkDevice device;
@@ -31850,7 +31750,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                             (unsigned long long)pBeginInfo);
                 }
                 m_state->on_vkBeginCommandBufferAsyncGOOGLE(&m_pool, commandBuffer, pBeginInfo,
-                                                            gfx_logger);
+                                                            context);
                 vkStream->unsetHandleMapping();
                 vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
                                          (uintptr_t)snapshotTraceBegin);
@@ -31878,7 +31778,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                     fprintf(stderr, "stream %p: call vkEndCommandBufferAsyncGOOGLE 0x%llx \n",
                             ioStream, (unsigned long long)commandBuffer);
                 }
-                m_state->on_vkEndCommandBufferAsyncGOOGLE(&m_pool, commandBuffer, gfx_logger);
+                m_state->on_vkEndCommandBufferAsyncGOOGLE(&m_pool, commandBuffer, context);
                 vkStream->unsetHandleMapping();
                 vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
                                          (uintptr_t)snapshotTraceBegin);
@@ -32946,6 +32846,47 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                     m_state->snapshot()->vkQueueFlushCommandsFromAuxMemoryGOOGLE(
                         snapshotTraceBegin, snapshotTraceBytes, &m_pool, queue, commandBuffer,
                         deviceMemory, dataOffset, dataSize);
+                }
+                vkReadStream->clearPool();
+                if (queueSubmitWithCommandsEnabled)
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
+                android::base::endTrace();
+                break;
+            }
+            case OP_vkGetBlobGOOGLE: {
+                android::base::beginTrace("vkGetBlobGOOGLE decode");
+                VkDevice device;
+                VkDeviceMemory memory;
+                // Begin global wrapped dispatchable handle unboxing for device;
+                uint64_t cgen_var_0;
+                memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
+                *readStreamPtrPtr += 1 * 8;
+                *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
+                uint64_t cgen_var_1;
+                memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
+                *readStreamPtrPtr += 1 * 8;
+                *(VkDeviceMemory*)&memory =
+                    (VkDeviceMemory)unbox_VkDeviceMemory((VkDeviceMemory)(*&cgen_var_1));
+                if (m_logCalls) {
+                    fprintf(stderr, "stream %p: call vkGetBlobGOOGLE 0x%llx 0x%llx \n", ioStream,
+                            (unsigned long long)device, (unsigned long long)memory);
+                }
+                VkResult vkGetBlobGOOGLE_VkResult_return = (VkResult)0;
+                vkGetBlobGOOGLE_VkResult_return =
+                    m_state->on_vkGetBlobGOOGLE(&m_pool, device, memory);
+                if ((vkGetBlobGOOGLE_VkResult_return) == VK_ERROR_DEVICE_LOST)
+                    m_state->on_DeviceLost();
+                m_state->on_CheckOutOfMemory(vkGetBlobGOOGLE_VkResult_return, opcode, context);
+                vkStream->unsetHandleMapping();
+                vkStream->write(&vkGetBlobGOOGLE_VkResult_return, sizeof(VkResult));
+                vkStream->commitWrite();
+                vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
+                                         (uintptr_t)snapshotTraceBegin);
+                size_t snapshotTraceBytes = vkReadStream->endTrace();
+                if (m_state->snapshotsEnabled()) {
+                    m_state->snapshot()->vkGetBlobGOOGLE(snapshotTraceBegin, snapshotTraceBytes,
+                                                         &m_pool, vkGetBlobGOOGLE_VkResult_return,
+                                                         device, memory);
                 }
                 vkReadStream->clearPool();
                 if (queueSubmitWithCommandsEnabled)
@@ -34643,3 +34584,6 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
     return ptr - (unsigned char*)buf;
     ;
 }
+
+}  // namespace vk
+}  // namespace gfxstream

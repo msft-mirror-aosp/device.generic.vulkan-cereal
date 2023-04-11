@@ -36,7 +36,9 @@
 #include "vk_android_native_buffer.h"
 #include "vulkan_gfxstream.h"
 
-namespace goldfish_vk {
+namespace gfxstream {
+namespace vk {
+
 class VkDecoderGlobalState;
 #define LIST_TRIVIAL_TRANSFORMED_TYPES(f)      \
     f(VkPhysicalDeviceExternalImageFormatInfo) \
@@ -5776,11 +5778,11 @@ void transform_tohost_VkImportBufferGOOGLE(VkDecoderGlobalState* resourceTracker
 void transform_fromhost_VkImportBufferGOOGLE(VkDecoderGlobalState* resourceTracker,
                                              VkImportBufferGOOGLE* toTransform);
 
-void transform_tohost_VkImportPhysicalAddressGOOGLE(VkDecoderGlobalState* resourceTracker,
-                                                    VkImportPhysicalAddressGOOGLE* toTransform);
+void transform_tohost_VkCreateBlobGOOGLE(VkDecoderGlobalState* resourceTracker,
+                                         VkCreateBlobGOOGLE* toTransform);
 
-void transform_fromhost_VkImportPhysicalAddressGOOGLE(VkDecoderGlobalState* resourceTracker,
-                                                      VkImportPhysicalAddressGOOGLE* toTransform);
+void transform_fromhost_VkCreateBlobGOOGLE(VkDecoderGlobalState* resourceTracker,
+                                           VkCreateBlobGOOGLE* toTransform);
 
 #endif
 #ifdef VK_EXT_global_priority_query
@@ -6038,4 +6040,5 @@ void transform_fromhost_VkPhysicalDeviceRayQueryFeaturesKHR(
 
 #endif
 
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream

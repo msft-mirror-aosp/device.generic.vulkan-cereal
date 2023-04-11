@@ -49,6 +49,10 @@
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
+namespace gfxstream {
+namespace vk {
+namespace {
+
 #define VK_COMMON_ERROR(fmt, ...) \
     fprintf(stderr, "%s:%d " fmt "\n", __func__, __LINE__, ##__VA_ARGS__);
 #define VK_COMMON_LOG(fmt, ...) \
@@ -58,18 +62,13 @@
         fprintf(stderr, "%s:%d " fmt "\n", __func__, __LINE__, ##__VA_ARGS__);
 
 using android::base::AutoLock;
+using android::base::kNullopt;
 using android::base::ManagedDescriptor;
 using android::base::Optional;
 using android::base::StaticLock;
 using android::base::StaticMap;
-
-using android::base::kNullopt;
 using emugl::ABORT_REASON_OTHER;
 using emugl::FatalError;
-
-namespace goldfish_vk {
-
-namespace {
 
 constexpr size_t kPageBits = 12;
 constexpr size_t kPageSize = 1u << kPageBits;
@@ -509,7 +508,7 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
 
     if (sVkEmulation) return sVkEmulation;
 
-    if (!emugl::vkDispatchValid(vk)) {
+    if (!vkDispatchValid(vk)) {
         VK_EMU_INIT_RETURN_OR_ABORT_ON_ERROR(ABORT_REASON_OTHER, "Dispatch is invalid.");
     }
 
@@ -1171,6 +1170,8 @@ VkEmulation* createGlobalVkEmulation(VulkanDispatch* vk) {
     return sVkEmulation;
 }
 
+std::optional<uint32_t> findRepresentativeColorBufferMemoryTypeIndexLocked();
+
 void initVkEmulationFeatures(std::unique_ptr<VkEmulationFeatures> features) {
     if (!sVkEmulation || !sVkEmulation->live) {
         ERR("VkEmulation is either not initialized or destroyed.");
@@ -1218,6 +1219,16 @@ void initVkEmulationFeatures(std::unique_ptr<VkEmulationFeatures> features) {
             *sVkEmulation->ivk, sVkEmulation->physdev, sVkEmulation->queueFamilyIndex,
             sVkEmulation->queueFamilyIndex, sVkEmulation->device, sVkEmulation->queue,
             sVkEmulation->queueLock, sVkEmulation->queue, sVkEmulation->queueLock);
+    }
+
+    sVkEmulation->representativeColorBufferMemoryTypeIndex =
+        findRepresentativeColorBufferMemoryTypeIndexLocked();
+    if (sVkEmulation->representativeColorBufferMemoryTypeIndex) {
+        VK_COMMON_VERBOSE("Emulated ColorBuffer memory type is based on memory type index %d.",
+                          *sVkEmulation->representativeColorBufferMemoryTypeIndex);
+    } else {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+            << "Failed to find memory type for ColorBuffers.";
     }
 }
 
@@ -1595,15 +1606,9 @@ bool isColorBufferExportedToGl(uint32_t colorBufferHandle, bool* exported) {
     return true;
 }
 
-bool getColorBufferAllocationInfo(uint32_t colorBufferHandle, VkDeviceSize* outSize,
-                                  uint32_t* outMemoryTypeIndex, bool* outMemoryIsDedicatedAlloc,
-                                  void** outMappedPtr) {
-    if (!sVkEmulation || !sVkEmulation->live) {
-        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "Vulkan emulation not available.";
-    }
-
-    AutoLock lock(sVkEmulationLock);
-
+bool getColorBufferAllocationInfoLocked(uint32_t colorBufferHandle, VkDeviceSize* outSize,
+                                        uint32_t* outMemoryTypeIndex,
+                                        bool* outMemoryIsDedicatedAlloc, void** outMappedPtr) {
     auto info = android::base::find(sVkEmulation->colorBuffers, colorBufferHandle);
     if (!info) {
         return false;
@@ -1626,6 +1631,18 @@ bool getColorBufferAllocationInfo(uint32_t colorBufferHandle, VkDeviceSize* outS
     }
 
     return true;
+}
+
+bool getColorBufferAllocationInfo(uint32_t colorBufferHandle, VkDeviceSize* outSize,
+                                  uint32_t* outMemoryTypeIndex, bool* outMemoryIsDedicatedAlloc,
+                                  void** outMappedPtr) {
+    if (!sVkEmulation || !sVkEmulation->live) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "Vulkan emulation not available.";
+    }
+
+    AutoLock lock(sVkEmulationLock);
+    return getColorBufferAllocationInfoLocked(colorBufferHandle, outSize, outMemoryTypeIndex,
+                                              outMemoryIsDedicatedAlloc, outMappedPtr);
 }
 
 static uint32_t lastGoodTypeIndex(uint32_t indices) {
@@ -1739,16 +1756,15 @@ std::unique_ptr<VkImageCreateInfo> generateColorBufferVkImageCreateInfo(VkFormat
 // We should make it so the guest can only allocate external images/
 // buffers of one type index for image and one type index for buffer
 // to begin with, via filtering from the host.
-bool setupVkColorBuffer(uint32_t width, uint32_t height, GLenum internalFormat,
-                        FrameworkFormat frameworkFormat, uint32_t colorBufferHandle,
-                        bool vulkanOnly, uint32_t memoryProperty) {
+
+bool setupVkColorBufferLocked(uint32_t width, uint32_t height, GLenum internalFormat,
+                              FrameworkFormat frameworkFormat, uint32_t colorBufferHandle,
+                              bool vulkanOnly, uint32_t memoryProperty) {
     if (!isFormatVulkanCompatible(internalFormat)) {
         VK_COMMON_VERBOSE("Failed to create Vk ColorBuffer: format:%d not compatible.",
-                        internalFormat);
+                          internalFormat);
         return false;
     }
-
-    AutoLock lock(sVkEmulationLock);
 
     auto infoPtr = android::base::find(sVkEmulation->colorBuffers, colorBufferHandle);
 
@@ -1944,6 +1960,18 @@ bool setupVkColorBuffer(uint32_t width, uint32_t height, GLenum internalFormat,
     return true;
 }
 
+bool setupVkColorBuffer(uint32_t width, uint32_t height, GLenum internalFormat,
+                        FrameworkFormat frameworkFormat, uint32_t colorBufferHandle,
+                        bool vulkanOnly, uint32_t memoryProperty) {
+    if (!sVkEmulation || !sVkEmulation->live) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "VkEmulation not available.";
+    }
+
+    AutoLock lock(sVkEmulationLock);
+    return setupVkColorBufferLocked(width, height, internalFormat, frameworkFormat,
+                                    colorBufferHandle, vulkanOnly, memoryProperty);
+}
+
 std::optional<VkColorBufferMemoryExport> exportColorBufferMemory(uint32_t colorBufferHandle) {
     if (!sVkEmulation || !sVkEmulation->live) {
         return std::nullopt;
@@ -1977,12 +2005,10 @@ std::optional<VkColorBufferMemoryExport> exportColorBufferMemory(uint32_t colorB
     };
 }
 
-bool teardownVkColorBuffer(uint32_t colorBufferHandle) {
+bool teardownVkColorBufferLocked(uint32_t colorBufferHandle) {
     if (!sVkEmulation || !sVkEmulation->live) return false;
 
     auto vk = sVkEmulation->dvk;
-
-    AutoLock lock(sVkEmulationLock);
 
     auto infoPtr = android::base::find(sVkEmulation->colorBuffers, colorBufferHandle);
 
@@ -2006,6 +2032,13 @@ bool teardownVkColorBuffer(uint32_t colorBufferHandle) {
     sVkEmulation->colorBuffers.erase(colorBufferHandle);
 
     return true;
+}
+
+bool teardownVkColorBuffer(uint32_t colorBufferHandle) {
+    if (!sVkEmulation || !sVkEmulation->live) return false;
+
+    AutoLock lock(sVkEmulationLock);
+    return teardownVkColorBufferLocked(colorBufferHandle);
 }
 
 VkEmulation::ColorBufferInfo getColorBufferInfo(uint32_t colorBufferHandle) {
@@ -3226,4 +3259,31 @@ std::unique_ptr<BorrowedImageInfoVk> borrowColorBufferForDisplay(uint32_t colorB
     return compositorInfo;
 }
 
-}  // namespace goldfish_vk
+std::optional<uint32_t> findRepresentativeColorBufferMemoryTypeIndexLocked() {
+    constexpr const uint32_t kArbitraryWidth = 64;
+    constexpr const uint32_t kArbitraryHeight = 64;
+    constexpr const uint32_t kArbitraryHandle = std::numeric_limits<uint32_t>::max();
+    if (!setupVkColorBufferLocked(kArbitraryWidth, kArbitraryHeight, GL_RGBA8,
+                                  FrameworkFormat::FRAMEWORK_FORMAT_GL_COMPATIBLE, kArbitraryHandle,
+                                  true, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+        ERR("Failed to setup memory type index test ColorBuffer.");
+        return std::nullopt;
+    }
+
+    uint32_t memoryTypeIndex = 0;
+    if (!getColorBufferAllocationInfoLocked(kArbitraryHandle, nullptr, &memoryTypeIndex, nullptr,
+                                            nullptr)) {
+        ERR("Failed to lookup memory type index test ColorBuffer.");
+        return std::nullopt;
+    }
+
+    if (!teardownVkColorBufferLocked(kArbitraryHandle)) {
+        ERR("Failed to clean up memory type index test ColorBuffer.");
+        return std::nullopt;
+    }
+
+    return memoryTypeIndex;
+}
+
+}  // namespace vk
+}  // namespace gfxstream

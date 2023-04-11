@@ -36,7 +36,8 @@
 #include "goldfish_vk_extension_structs.h"
 #include "goldfish_vk_private_defs.h"
 
-namespace goldfish_vk {
+namespace gfxstream {
+namespace vk {
 
 void reservedmarshal_extension_struct(VulkanStream* vkStream, VkStructureType rootType,
                                       const void* structExtension, uint8_t** ptr);
@@ -24849,13 +24850,11 @@ void reservedunmarshal_VkImportBufferGOOGLE(VulkanStream* vkStream, VkStructureT
     *ptr += sizeof(uint32_t);
 }
 
-void reservedunmarshal_VkImportPhysicalAddressGOOGLE(VulkanStream* vkStream,
-                                                     VkStructureType rootType,
-                                                     VkImportPhysicalAddressGOOGLE* forUnmarshaling,
-                                                     uint8_t** ptr) {
+void reservedunmarshal_VkCreateBlobGOOGLE(VulkanStream* vkStream, VkStructureType rootType,
+                                          VkCreateBlobGOOGLE* forUnmarshaling, uint8_t** ptr) {
     memcpy((VkStructureType*)&forUnmarshaling->sType, *ptr, sizeof(VkStructureType));
     *ptr += sizeof(VkStructureType);
-    forUnmarshaling->sType = VK_STRUCTURE_TYPE_IMPORT_PHYSICAL_ADDRESS_GOOGLE;
+    forUnmarshaling->sType = VK_STRUCTURE_TYPE_CREATE_BLOB_GOOGLE;
     if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
         rootType = forUnmarshaling->sType;
     }
@@ -24876,16 +24875,12 @@ void reservedunmarshal_VkImportPhysicalAddressGOOGLE(VulkanStream* vkStream,
         reservedunmarshal_extension_struct(vkStream, rootType, (void*)(forUnmarshaling->pNext),
                                            ptr);
     }
-    memcpy((uint64_t*)&forUnmarshaling->physicalAddress, *ptr, sizeof(uint64_t));
-    *ptr += sizeof(uint64_t);
-    memcpy((VkDeviceSize*)&forUnmarshaling->size, *ptr, sizeof(VkDeviceSize));
-    *ptr += sizeof(VkDeviceSize);
-    memcpy((VkFormat*)&forUnmarshaling->format, *ptr, sizeof(VkFormat));
-    *ptr += sizeof(VkFormat);
-    memcpy((VkImageTiling*)&forUnmarshaling->tiling, *ptr, sizeof(VkImageTiling));
-    *ptr += sizeof(VkImageTiling);
-    memcpy((uint32_t*)&forUnmarshaling->tilingParameter, *ptr, sizeof(uint32_t));
+    memcpy((uint32_t*)&forUnmarshaling->blobMem, *ptr, sizeof(uint32_t));
     *ptr += sizeof(uint32_t);
+    memcpy((uint32_t*)&forUnmarshaling->blobFlags, *ptr, sizeof(uint32_t));
+    *ptr += sizeof(uint32_t);
+    memcpy((uint64_t*)&forUnmarshaling->blobId, *ptr, sizeof(uint64_t));
+    *ptr += sizeof(uint64_t);
 }
 
 #endif
@@ -28058,9 +28053,9 @@ void reservedunmarshal_extension_struct(VulkanStream* vkStream, VkStructureType 
                     break;
                 }
                 case VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: {
-                    reservedunmarshal_VkImportPhysicalAddressGOOGLE(
+                    reservedunmarshal_VkCreateBlobGOOGLE(
                         vkStream, rootType,
-                        reinterpret_cast<VkImportPhysicalAddressGOOGLE*>(structExtension_out), ptr);
+                        reinterpret_cast<VkCreateBlobGOOGLE*>(structExtension_out), ptr);
                     break;
                 }
                 default: {
@@ -28844,10 +28839,10 @@ void reservedunmarshal_extension_struct(VulkanStream* vkStream, VkStructureType 
                 ptr);
             break;
         }
-        case VK_STRUCTURE_TYPE_IMPORT_PHYSICAL_ADDRESS_GOOGLE: {
-            reservedunmarshal_VkImportPhysicalAddressGOOGLE(
-                vkStream, rootType,
-                reinterpret_cast<VkImportPhysicalAddressGOOGLE*>(structExtension_out), ptr);
+        case VK_STRUCTURE_TYPE_CREATE_BLOB_GOOGLE: {
+            reservedunmarshal_VkCreateBlobGOOGLE(
+                vkStream, rootType, reinterpret_cast<VkCreateBlobGOOGLE*>(structExtension_out),
+                ptr);
             break;
         }
 #endif
@@ -28970,4 +28965,5 @@ void reservedunmarshal_extension_struct(VulkanStream* vkStream, VkStructureType 
     }
 }
 
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream

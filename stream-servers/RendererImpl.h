@@ -33,7 +33,7 @@ namespace android_studio {
     class EmulatorGLESUsages;
 }
 
-namespace emugl {
+namespace gfxstream {
 
 class RendererImpl final : public Renderer {
 public:
@@ -124,6 +124,9 @@ public:
     void setDisplayConfigs(int configId, int w, int h, int dpiX, int dpiY) override;
     void setDisplayActiveConfig(int configId) override;
 
+    const void* getEglDispatch() override;
+    const void* getGles2Dispatch() override;
+
 private:
     DISALLOW_COPY_ASSIGN_AND_MOVE(RendererImpl);
 
@@ -148,4 +151,4 @@ private:
     std::vector<RenderThread*> mAdditionalPostLoadRenderThreads;
 };
 
-}  // namespace emugl
+}  // namespace gfxstream
