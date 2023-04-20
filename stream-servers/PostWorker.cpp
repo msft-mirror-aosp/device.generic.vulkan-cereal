@@ -30,9 +30,6 @@
 #include "vulkan/DisplayVk.h"
 #include "vulkan/VkCommonOperations.h"
 
-using emugl::ABORT_REASON_OTHER;
-using emugl::FatalError;
-
 #define POST_DEBUG 0
 #if POST_DEBUG >= 1
 #define DD(fmt, ...) \
@@ -54,7 +51,13 @@ static void sDefaultRunOnUiThread(UiUpdateFunc f, void* data, bool wait) {
     (void)wait;
 }
 
+namespace gfxstream {
 namespace {
+
+using emugl::ABORT_REASON_OTHER;
+using emugl::FatalError;
+using gl::DisplayGl;
+using vk::DisplayVk;
 
 hwc_transform_t getTransformFromRotation(int rotation) {
     switch (static_cast<int>(rotation / 90)) {
@@ -304,6 +307,10 @@ void PostWorker::clearImpl() {
 }
 
 std::shared_future<void> PostWorker::composeImpl(const FlatComposeRequest& composeRequest) {
+    std::shared_future<void> completedFuture =
+        std::async(std::launch::deferred, [] {}).share();
+    completedFuture.wait();
+
     if (!isComposeTargetReady(composeRequest.targetHandle)) {
         ERR("The last composition on the target buffer hasn't completed.");
     }
@@ -311,23 +318,32 @@ std::shared_future<void> PostWorker::composeImpl(const FlatComposeRequest& compo
     Compositor::CompositionRequest compositorRequest = {};
     compositorRequest.target = mFb->borrowColorBufferForComposition(composeRequest.targetHandle,
                                                                     /*colorBufferIsTarget=*/true);
+    if (!compositorRequest.target) {
+        ERR("Compose target is null (cb=0x%x).", composeRequest.targetHandle);
+        return completedFuture;
+    }
+
     for (const ComposeLayer& guestLayer : composeRequest.layers) {
         // Skip the ColorBuffer whose id is 0.
         if (!guestLayer.cbHandle) {
             continue;
         }
+        auto source = mFb->borrowColorBufferForComposition(guestLayer.cbHandle,
+                                                           /*colorBufferIsTarget=*/false);
+        if (!source) {
+            continue;
+        }
+
         auto& compositorLayer = compositorRequest.layers.emplace_back();
         compositorLayer.props = guestLayer;
-        compositorLayer.source =
-            mFb->borrowColorBufferForComposition(guestLayer.cbHandle,
-                                                 /*colorBufferIsTarget=*/false);
+        compositorLayer.source = std::move(source);
     }
 
     return m_compositor->compose(compositorRequest);
 }
 
 void PostWorker::screenshot(ColorBuffer* cb, int width, int height, GLenum format, GLenum type,
-                            int rotation, void* pixels, emugl::Rect rect) {
+                            int rotation, void* pixels, Rect rect) {
     if (m_displayVk) {
         GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) <<
                             "Screenshot not supported with native Vulkan swapchain enabled.";
@@ -420,3 +436,5 @@ bool PostWorker::isComposeTargetReady(uint32_t targetHandle) {
     }
     return false;
 }
+
+}  // namespace gfxstream

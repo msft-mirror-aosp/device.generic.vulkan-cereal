@@ -66,6 +66,9 @@
 
 #include <climits>
 
+namespace gfxstream {
+namespace vk {
+
 using android::base::AutoLock;
 using android::base::ConditionVariable;
 using android::base::DescriptorType;
@@ -99,6 +102,17 @@ using emugl::GfxApiLogger;
 #define VKDGS_LOG(fmt, ...)
 #endif
 
+// Blob mem
+#define STREAM_BLOB_MEM_GUEST 1
+#define STREAM_BLOB_MEM_HOST3D 2
+#define STREAM_BLOB_MEM_HOST3D_GUEST 3
+
+// Blob flags
+#define STREAM_BLOB_FLAG_USE_MAPPABLE 1
+#define STREAM_BLOB_FLAG_USE_SHAREABLE 2
+#define STREAM_BLOB_FLAG_USE_CROSS_DEVICE 4
+#define STREAM_BLOB_FLAG_CREATE_GUEST_HANDLE 8
+
 #define VALIDATE_REQUIRED_HANDLE(parameter) \
     validateRequiredHandle(__FUNCTION__, #parameter, parameter)
 
@@ -108,8 +122,6 @@ void validateRequiredHandle(const char* api_name, const char* parameter_name, T 
         GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << api_name << ":" << parameter_name;
     }
 }
-
-namespace goldfish_vk {
 
 // A list of device extensions that should not be passed to the host driver.
 // These will mainly include Vulkan features that we emulate ourselves.
@@ -141,6 +153,8 @@ static constexpr uint32_t kMinVersion = VK_MAKE_VERSION(1, 0, 0);
 
 static constexpr uint64_t kPageSizeforBlob = 4096;
 static constexpr uint64_t kPageMaskForBlob = ~(0xfff);
+
+static uint64_t hostBlobId = 0;
 
 #define DEFINE_BOXED_HANDLE_TYPE_TAG(type) Tag_##type,
 
@@ -292,7 +306,7 @@ static ReadStreamRegistry sReadStreamRegistry;
 class VkDecoderGlobalState::Impl {
    public:
     Impl()
-        : m_vk(emugl::vkDispatch()),
+        : m_vk(vkDispatch()),
           m_emu(getGlobalVkEmulation()),
           mRenderDocWithMultipleVkInstances(m_emu->guestRenderDoc.get()) {
         mSnapshotsEnabled = feature_is_enabled(kFeature_VulkanSnapshots);
@@ -1270,9 +1284,14 @@ class VkDecoderGlobalState::Impl {
             fprintf(stderr, "%s: init vulkan dispatch from device\n", __func__);
         }
 
-        init_vulkan_dispatch_from_device(vk, *pDevice, dispatch_VkDevice(boxed));
+        VulkanDispatch* dispatch = dispatch_VkDevice(boxed);
+        init_vulkan_dispatch_from_device(vk, *pDevice, dispatch);
+        if (m_emu->debugUtilsAvailableAndRequested) {
+            deviceInfo.debugUtilsHelper = DebugUtilsHelper::withUtilsEnabled(*pDevice, dispatch);
+        }
+
         deviceInfo.externalFencePool =
-            std::make_unique<ExternalFencePool<VulkanDispatch>>(dispatch_VkDevice(boxed), *pDevice);
+            std::make_unique<ExternalFencePool<VulkanDispatch>>(dispatch, *pDevice);
 
         if (mLogging) {
             fprintf(stderr, "%s: init vulkan dispatch from device (end)\n", __func__);
@@ -2972,15 +2991,6 @@ class VkDecoderGlobalState::Impl {
         VkMemoryAllocateInfo localAllocInfo = vk_make_orphan_copy(*pAllocateInfo);
         vk_struct_chain_iterator structChainIter = vk_make_chain_iterator(&localAllocInfo);
 
-        // handle type should already be converted in unmarshaling
-        const VkExportMemoryAllocateInfo* exportAllocInfoPtr =
-            vk_find_struct<VkExportMemoryAllocateInfo>(pAllocateInfo);
-
-        if (exportAllocInfoPtr) {
-            GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-                << "Export allocs are to be handled on the guest side / VkCommonOperations.";
-        }
-
         const VkMemoryDedicatedAllocateInfo* dedicatedAllocInfoPtr =
             vk_find_struct<VkMemoryDedicatedAllocateInfo>(pAllocateInfo);
         VkMemoryDedicatedAllocateInfo localDedicatedAllocInfo;
@@ -3001,21 +3011,13 @@ class VkDecoderGlobalState::Impl {
         // originally created with a dedicated allocation.
         bool shouldUseDedicatedAllocInfo = dedicatedAllocInfoPtr != nullptr;
 
-        const VkImportPhysicalAddressGOOGLE* importPhysAddrInfoPtr =
-            vk_find_struct<VkImportPhysicalAddressGOOGLE>(pAllocateInfo);
-
-        if (importPhysAddrInfoPtr) {
-            // TODO: Implement what happens on importing a physical address:
-            // 1 - perform action of vkMapMemoryIntoAddressSpaceGOOGLE if
-            //     host visible
-            // 2 - create color buffer, setup Vk for it,
-            //     and associate it with the physical address
-        }
-
         const VkImportColorBufferGOOGLE* importCbInfoPtr =
             vk_find_struct<VkImportColorBufferGOOGLE>(pAllocateInfo);
         const VkImportBufferGOOGLE* importBufferInfoPtr =
             vk_find_struct<VkImportBufferGOOGLE>(pAllocateInfo);
+
+        const VkCreateBlobGOOGLE* createBlobInfoPtr =
+            vk_find_struct<VkCreateBlobGOOGLE>(pAllocateInfo);
 
 #ifdef _WIN32
         VkImportMemoryWin32HandleInfoKHR importInfo{
@@ -3173,7 +3175,34 @@ class VkDecoderGlobalState::Impl {
 
         bool hostVisible = memoryPropertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         if (hostVisible && feature_is_enabled(kFeature_ExternalBlob)) {
-            localAllocInfo.pNext = &exportAllocate;
+            vk_append_struct(&structChainIter, &exportAllocate);
+        }
+
+        if (createBlobInfoPtr && createBlobInfoPtr->blobMem == STREAM_BLOB_MEM_GUEST &&
+            (createBlobInfoPtr->blobFlags & STREAM_BLOB_FLAG_CREATE_GUEST_HANDLE)) {
+            DescriptorType rawDescriptor;
+            auto descriptorInfoOpt =
+                HostmemIdMapping::get()->removeDescriptorInfo(createBlobInfoPtr->blobId);
+            if (descriptorInfoOpt) {
+                auto rawDescriptorOpt = (*descriptorInfoOpt).descriptor.release();
+                if (rawDescriptorOpt) {
+                    rawDescriptor = *rawDescriptorOpt;
+                } else {
+                    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                }
+            } else {
+                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            }
+#if defined(__linux__) || defined(__QNX__)
+            importInfo.fd = rawDescriptor;
+#endif
+
+#ifdef __linux__
+            if (hasDeviceExtension(device, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+                importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            }
+#endif
+            vk_append_struct(&structChainIter, &importInfo);
         }
 
         VkImportMemoryHostPointerInfoEXT importHostInfo;
@@ -3270,7 +3299,8 @@ class VkDecoderGlobalState::Impl {
         // When external blobs are on, we want to map memory only if a workaround is using it in
         // the gfxstream process. This happens when ASTC CPU emulation is on.
         bool needToMap =
-            !feature_is_enabled(kFeature_ExternalBlob) || instanceInfo->useAstcCpuDecompression;
+            (!feature_is_enabled(kFeature_ExternalBlob) || instanceInfo->useAstcCpuDecompression) &&
+            !createBlobInfoPtr;
 
         // Some cases provide a mappedPtr, so we only map if we still don't have a pointer here.
         if (!mappedPtr && needToMap) {
@@ -3286,6 +3316,11 @@ class VkDecoderGlobalState::Impl {
             // Since we didn't call vkMapMemory, unmapping is not needed (don't own mappedPtr).
             memoryInfo.needUnmap = false;
             memoryInfo.ptr = mappedPtr;
+
+            if (createBlobInfoPtr) {
+                memoryInfo.blobId = createBlobInfoPtr->blobId;
+            }
+
             // Always assign the shared memory into memoryInfo. If it was used, then it will have
             // ownership transferred.
             memoryInfo.sharedMemory = std::exchange(sharedMemory, std::nullopt);
@@ -3578,25 +3613,23 @@ class VkDecoderGlobalState::Impl {
         return VK_SUCCESS;
     }
 
-    VkResult on_vkGetMemoryHostAddressInfoGOOGLE(android::base::BumpPool* pool,
-                                                 VkDevice boxed_device, VkDeviceMemory memory,
-                                                 uint64_t* pAddress, uint64_t* pSize,
-                                                 uint64_t* pHostmemId) {
+    VkResult vkGetBlobInternal(VkDevice boxed_device, VkDeviceMemory memory, uint64_t hostBlobId) {
         std::lock_guard<std::recursive_mutex> lock(mLock);
         struct MemEntry entry = {0};
 
         auto* info = android::base::find(mMemoryInfo, memory);
         if (!info) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
+        hostBlobId = (info->blobId && !hostBlobId) ? info->blobId : hostBlobId;
+
         if (feature_is_enabled(kFeature_SystemBlob) && info->sharedMemory.has_value()) {
             uint32_t handleType = STREAM_MEM_HANDLE_TYPE_SHM;
             // We transfer ownership of the shared memory handle to the descriptor info.
             // The memory itself is destroyed only when all processes unmap / release their
             // handles.
-            *pHostmemId = HostmemIdMapping::get()->addDescriptorInfo(
-                info->sharedMemory->releaseHandle(), handleType, info->caching, std::nullopt);
-            *pSize = info->size;
-            *pAddress = 0;
+            HostmemIdMapping::get()->addDescriptorInfo(hostBlobId,
+                                                       info->sharedMemory->releaseHandle(),
+                                                       handleType, info->caching, std::nullopt);
         } else if (feature_is_enabled(kFeature_ExternalBlob)) {
             VkResult result;
             auto device = unbox_VkDevice(boxed_device);
@@ -3652,12 +3685,23 @@ class VkDecoderGlobalState::Impl {
 #endif
 
             ManagedDescriptor managedHandle(handle);
-            *pHostmemId = HostmemIdMapping::get()->addDescriptorInfo(
-                std::move(managedHandle), handleType, info->caching,
-                std::optional<VulkanInfo>(vulkanInfo));
-            *pSize = info->size;
-            *pAddress = 0;
-        } else {
+            HostmemIdMapping::get()->addDescriptorInfo(hostBlobId, std::move(managedHandle),
+                                                       handleType, info->caching,
+                                                       std::optional<VulkanInfo>(vulkanInfo));
+        } else if (!info->needUnmap) {
+            auto device = unbox_VkDevice(boxed_device);
+            auto vk = dispatch_VkDevice(boxed_device);
+
+            VkResult mapResult = vk->vkMapMemory(device, memory, 0, info->size, 0, &info->ptr);
+            if (mapResult != VK_SUCCESS) {
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+
+            info->needUnmap = true;
+        }
+
+        if (info->needUnmap) {
+            struct MemEntry entry = {0};
             uint64_t hva = (uint64_t)(uintptr_t)(info->ptr);
             uint64_t size = (uint64_t)(uintptr_t)(info->size);
 
@@ -3669,17 +3713,26 @@ class VkDecoderGlobalState::Impl {
             entry.size = alignedSize;
             entry.caching = info->caching;
 
-            auto id = get_emugl_vm_operations().hostmemRegister(&entry);
-
-            *pAddress = hva & (0xfff);  // Don't expose exact hva to guest
-            *pSize = alignedSize;
-            *pHostmemId = id;
-
+            HostmemIdMapping::get()->addMapping(hostBlobId, &entry);
             info->virtioGpuMapped = true;
-            info->hostmemId = id;
+            info->hostmemId = hostBlobId;
         }
 
         return VK_SUCCESS;
+    }
+
+    VkResult on_vkGetBlobGOOGLE(android::base::BumpPool* pool, VkDevice boxed_device,
+                                VkDeviceMemory memory) {
+        return vkGetBlobInternal(boxed_device, memory, 0);
+    }
+
+    VkResult on_vkGetMemoryHostAddressInfoGOOGLE(android::base::BumpPool* pool,
+                                                 VkDevice boxed_device, VkDeviceMemory memory,
+                                                 uint64_t* pAddress, uint64_t* pSize,
+                                                 uint64_t* pHostmemId) {
+        hostBlobId++;
+        *pHostmemId = hostBlobId;
+        return vkGetBlobInternal(boxed_device, memory, hostBlobId);
     }
 
     VkResult on_vkFreeMemorySyncGOOGLE(android::base::BumpPool* pool, VkDevice boxed_device,
@@ -3688,20 +3741,6 @@ class VkDecoderGlobalState::Impl {
         on_vkFreeMemory(pool, boxed_device, memory, pAllocator);
 
         return VK_SUCCESS;
-    }
-
-    VkResult on_vkRegisterImageColorBufferGOOGLE(android::base::BumpPool*, VkDevice, VkImage,
-                                                 uint32_t) {
-        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-            << "Unimplemented deprecated vkRegisterImageColorBufferGOOGLE() called.";
-        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    }
-
-    VkResult on_vkRegisterBufferColorBufferGOOGLE(android::base::BumpPool* pool, VkDevice, VkBuffer,
-                                                  uint32_t) {
-        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
-            << "Unimplemented deprecated on_vkRegisterBufferColorBufferGOOGLE() called.";
-        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
 
     VkResult on_vkAllocateCommandBuffers(android::base::BumpPool* pool, VkDevice boxed_device,
@@ -3717,9 +3756,14 @@ class VkDecoderGlobalState::Impl {
         }
 
         std::lock_guard<std::recursive_mutex> lock(mLock);
+
+        auto* deviceInfo = android::base::find(mDeviceInfo, device);
+        if (!deviceInfo) return VK_ERROR_UNKNOWN;
+
         for (uint32_t i = 0; i < pAllocateInfo->commandBufferCount; i++) {
             mCmdBufferInfo[pCommandBuffers[i]] = CommandBufferInfo();
             mCmdBufferInfo[pCommandBuffers[i]].device = device;
+            mCmdBufferInfo[pCommandBuffers[i]].debugUtilsHelper = deviceInfo->debugUtilsHelper;
             mCmdBufferInfo[pCommandBuffers[i]].cmdPool = pAllocateInfo->commandPool;
             auto boxed = new_boxed_VkCommandBuffer(pCommandBuffers[i], vk,
                                                    false /* does not own dispatch */);
@@ -3866,13 +3910,7 @@ class VkDecoderGlobalState::Impl {
         if (VK_SUCCESS == result) {
             std::lock_guard<std::recursive_mutex> lock(mLock);
             auto& bufferInfo = mCmdBufferInfo[commandBuffer];
-            bufferInfo.preprocessFuncs.clear();
-            bufferInfo.subCmds.clear();
-            bufferInfo.computePipeline = VK_NULL_HANDLE;
-            bufferInfo.firstSet = 0;
-            bufferInfo.descriptorLayout = VK_NULL_HANDLE;
-            bufferInfo.descriptorSets.clear();
-            bufferInfo.dynamicOffsets.clear();
+            bufferInfo.reset();
         }
         return result;
     }
@@ -4156,7 +4194,7 @@ class VkDecoderGlobalState::Impl {
     VkResult on_vkBeginCommandBuffer(android::base::BumpPool* pool,
                                      VkCommandBuffer boxed_commandBuffer,
                                      const VkCommandBufferBeginInfo* pBeginInfo,
-                                     GfxApiLogger& gfxLogger) {
+                                     const VkDecoderContext& context) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
         VkResult result = vk->vkBeginCommandBuffer(commandBuffer, pBeginInfo);
@@ -4166,30 +4204,48 @@ class VkDecoderGlobalState::Impl {
         }
 
         std::lock_guard<std::recursive_mutex> lock(mLock);
-        mCmdBufferInfo[commandBuffer].preprocessFuncs.clear();
-        mCmdBufferInfo[commandBuffer].subCmds.clear();
+
+        auto* commandBufferInfo = android::base::find(mCmdBufferInfo, commandBuffer);
+        if (!commandBufferInfo) return VK_ERROR_UNKNOWN;
+        commandBufferInfo->reset();
+
+        if (context.processName) {
+            commandBufferInfo->debugUtilsHelper.cmdBeginDebugLabel(commandBuffer, "Process %s",
+                                                                   context.processName);
+        }
+
         return VK_SUCCESS;
     }
 
     VkResult on_vkBeginCommandBufferAsyncGOOGLE(android::base::BumpPool* pool,
                                                 VkCommandBuffer boxed_commandBuffer,
                                                 const VkCommandBufferBeginInfo* pBeginInfo,
-                                                GfxApiLogger& gfxLogger) {
-        return this->on_vkBeginCommandBuffer(pool, boxed_commandBuffer, pBeginInfo, gfxLogger);
+                                                const VkDecoderContext& context) {
+        return this->on_vkBeginCommandBuffer(pool, boxed_commandBuffer, pBeginInfo, context);
     }
 
     VkResult on_vkEndCommandBuffer(android::base::BumpPool* pool,
-                                   VkCommandBuffer boxed_commandBuffer, GfxApiLogger& gfxLogger) {
+                                   VkCommandBuffer boxed_commandBuffer,
+                                   const VkDecoderContext& context) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
+
+        std::lock_guard<std::recursive_mutex> lock(mLock);
+
+        auto* commandBufferInfo = android::base::find(mCmdBufferInfo, commandBuffer);
+        if (!commandBufferInfo) return VK_ERROR_UNKNOWN;
+
+        if (context.processName) {
+            commandBufferInfo->debugUtilsHelper.cmdEndDebugLabel(commandBuffer);
+        }
 
         return vk->vkEndCommandBuffer(commandBuffer);
     }
 
     void on_vkEndCommandBufferAsyncGOOGLE(android::base::BumpPool* pool,
                                           VkCommandBuffer boxed_commandBuffer,
-                                          GfxApiLogger& gfxLogger) {
-        on_vkEndCommandBuffer(pool, boxed_commandBuffer, gfxLogger);
+                                          const VkDecoderContext& context) {
+        on_vkEndCommandBuffer(pool, boxed_commandBuffer, context);
     }
 
     void on_vkResetCommandBufferAsyncGOOGLE(android::base::BumpPool* pool,
@@ -4975,14 +5031,13 @@ class VkDecoderGlobalState::Impl {
                 // For AHardwareBufferImage binding, we can't know which ColorBuffer this
                 // to-be-created VkImage will bind to, so we try our best to infer the creation
                 // parameters.
-                colorBufferVkImageCi = goldfish_vk::generateColorBufferVkImageCreateInfo(
+                colorBufferVkImageCi = generateColorBufferVkImageCreateInfo(
                     resolvedFormat, imageCreateInfo.extent.width, imageCreateInfo.extent.height,
                     imageCreateInfo.tiling);
                 importSource = "AHardwareBuffer";
             } else if (pNativeBufferANDROID) {
                 // For native buffer binding, we can query the creation parameters from handle.
-                auto colorBufferInfo =
-                    goldfish_vk::getColorBufferInfo(*pNativeBufferANDROID->handle);
+                auto colorBufferInfo = getColorBufferInfo(*pNativeBufferANDROID->handle);
                 if (colorBufferInfo.handle == *pNativeBufferANDROID->handle) {
                     colorBufferVkImageCi =
                         std::make_unique<VkImageCreateInfo>(colorBufferInfo.imageCreateInfoShallow);
@@ -5316,6 +5371,8 @@ class VkDecoderGlobalState::Impl {
 #endif
 
 #ifdef __linux__
+        // A dma-buf is a Linux kernel construct, commonly used with open-source DRM drivers.
+        // See https://docs.kernel.org/driver-api/dma-buf.html for details.
         if (hasDeviceExtension(properties, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
             res.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
         }
@@ -5339,6 +5396,10 @@ class VkDecoderGlobalState::Impl {
 
         if (m_emu->instanceSupportsExternalSemaphoreCapabilities) {
             res.push_back(VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME);
+        }
+
+        if (m_emu->debugUtilsAvailableAndRequested) {
+            res.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         }
 
         return res;
@@ -5403,7 +5464,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     // Whether the VkInstance associated with this physical device was created by ANGLE
-    bool isAngleInstance(VkPhysicalDevice physicalDevice, goldfish_vk::VulkanDispatch* vk) {
+    bool isAngleInstance(VkPhysicalDevice physicalDevice, VulkanDispatch* vk) {
         std::lock_guard<std::recursive_mutex> lock(mLock);
         VkInstance* instance = android::base::find(mPhysicalDeviceToInstance, physicalDevice);
         if (!instance) return false;
@@ -5412,14 +5473,14 @@ class VkDecoderGlobalState::Impl {
         return instanceInfo->isAngle;
     }
 
-    bool enableEmulatedEtc2(VkPhysicalDevice physicalDevice, goldfish_vk::VulkanDispatch* vk) {
+    bool enableEmulatedEtc2(VkPhysicalDevice physicalDevice, VulkanDispatch* vk) {
         if (!m_emu->enableEtc2Emulation) return false;
 
         // Don't enable ETC2 emulation for ANGLE, let it do its own emulation.
         return !isAngleInstance(physicalDevice, vk);
     }
 
-    bool enableEmulatedAstc(VkPhysicalDevice physicalDevice, goldfish_vk::VulkanDispatch* vk) {
+    bool enableEmulatedAstc(VkPhysicalDevice physicalDevice, VulkanDispatch* vk) {
         if (m_emu->astcLdrEmulationMode == AstcEmulationMode::Disabled) {
             return false;
         }
@@ -5428,7 +5489,7 @@ class VkDecoderGlobalState::Impl {
         return !isAngleInstance(physicalDevice, vk);
     }
 
-    bool needEmulatedEtc2(VkPhysicalDevice physicalDevice, goldfish_vk::VulkanDispatch* vk) {
+    bool needEmulatedEtc2(VkPhysicalDevice physicalDevice, VulkanDispatch* vk) {
         if (!enableEmulatedEtc2(physicalDevice, vk)) {
             return false;
         }
@@ -5437,7 +5498,7 @@ class VkDecoderGlobalState::Impl {
         return !feature.textureCompressionETC2;
     }
 
-    bool needEmulatedAstc(VkPhysicalDevice physicalDevice, goldfish_vk::VulkanDispatch* vk) {
+    bool needEmulatedAstc(VkPhysicalDevice physicalDevice, VulkanDispatch* vk) {
         if (!enableEmulatedAstc(physicalDevice, vk)) {
             return false;
         }
@@ -5447,7 +5508,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     bool isEmulatedCompressedTexture(VkFormat format, VkPhysicalDevice physicalDevice,
-                                     goldfish_vk::VulkanDispatch* vk) {
+                                     VulkanDispatch* vk) {
         return (CompressedImageInfo::isEtc2(format) && needEmulatedEtc2(physicalDevice, vk)) ||
                (CompressedImageInfo::isAstc(format) && needEmulatedAstc(physicalDevice, vk));
     }
@@ -5482,7 +5543,7 @@ class VkDecoderGlobalState::Impl {
     void getPhysicalDeviceFormatPropertiesCore(
         std::function<void(VkPhysicalDevice, VkFormat, VkFormatProperties1or2*)>
             getPhysicalDeviceFormatPropertiesFunc,
-        goldfish_vk::VulkanDispatch* vk, VkPhysicalDevice physicalDevice, VkFormat format,
+        VulkanDispatch* vk, VkPhysicalDevice physicalDevice, VkFormat format,
         VkFormatProperties1or2* pFormatProperties) {
         if (isEmulatedCompressedTexture(format, physicalDevice, vk)) {
             getPhysicalDeviceFormatPropertiesFunc(
@@ -5657,6 +5718,7 @@ class VkDecoderGlobalState::Impl {
         VkDevice device = VK_NULL_HANDLE;
         VkCommandPool cmdPool = VK_NULL_HANDLE;
         VkCommandBuffer boxed = VK_NULL_HANDLE;
+        DebugUtilsHelper debugUtilsHelper = DebugUtilsHelper::withUtilsDisabled();
 
         // Most recently bound compute pipeline and descriptor sets. We save it here so that we can
         // restore it after doing emulated texture decompression.
@@ -5665,6 +5727,16 @@ class VkDecoderGlobalState::Impl {
         VkPipelineLayout descriptorLayout = VK_NULL_HANDLE;
         std::vector<VkDescriptorSet> descriptorSets;
         std::vector<uint32_t> dynamicOffsets;
+
+        void reset() {
+            preprocessFuncs.clear();
+            subCmds.clear();
+            computePipeline = VK_NULL_HANDLE;
+            firstSet = 0;
+            descriptorLayout = VK_NULL_HANDLE;
+            descriptorSets.clear();
+            dynamicOffsets.clear();
+        }
     };
 
     struct CommandPoolInfo {
@@ -5835,6 +5907,9 @@ class VkDecoderGlobalState::Impl {
         uint32_t memoryIndex = 0;
         // Set if the memory is backed by shared memory.
         std::optional<SharedMemory> sharedMemory;
+
+        // virtio-gpu blobs
+        uint64_t blobId = 0;
     };
 
     struct InstanceInfo {
@@ -5859,6 +5934,7 @@ class VkDecoderGlobalState::Impl {
         bool emulateTextureAstc = false;
         VkPhysicalDevice physicalDevice;
         VkDevice boxed = nullptr;
+        DebugUtilsHelper debugUtilsHelper = DebugUtilsHelper::withUtilsDisabled();
         std::unique_ptr<ExternalFencePool<VulkanDispatch>> externalFencePool = nullptr;
 
         // True if this is a compressed image that needs to be decompressed on the GPU (with our
@@ -6798,6 +6874,7 @@ VkResult VkDecoderGlobalState::on_vkMapMemoryIntoAddressSpaceGOOGLE(android::bas
                                                                     uint64_t* pAddress) {
     return mImpl->on_vkMapMemoryIntoAddressSpaceGOOGLE(pool, device, memory, pAddress);
 }
+
 VkResult VkDecoderGlobalState::on_vkGetMemoryHostAddressInfoGOOGLE(
     android::base::BumpPool* pool, VkDevice device, VkDeviceMemory memory, uint64_t* pAddress,
     uint64_t* pSize, uint64_t* pHostmemId) {
@@ -6805,25 +6882,15 @@ VkResult VkDecoderGlobalState::on_vkGetMemoryHostAddressInfoGOOGLE(
                                                       pHostmemId);
 }
 
-// VK_GOOGLE_gfxstream
+VkResult VkDecoderGlobalState::on_vkGetBlobGOOGLE(android::base::BumpPool* pool, VkDevice device,
+                                                  VkDeviceMemory memory) {
+    return mImpl->on_vkGetBlobGOOGLE(pool, device, memory);
+}
+
 VkResult VkDecoderGlobalState::on_vkFreeMemorySyncGOOGLE(android::base::BumpPool* pool,
                                                          VkDevice device, VkDeviceMemory memory,
                                                          const VkAllocationCallbacks* pAllocator) {
     return mImpl->on_vkFreeMemorySyncGOOGLE(pool, device, memory, pAllocator);
-}
-
-// VK_GOOGLE_color_buffer
-VkResult VkDecoderGlobalState::on_vkRegisterImageColorBufferGOOGLE(android::base::BumpPool* pool,
-                                                                   VkDevice device, VkImage image,
-                                                                   uint32_t colorBuffer) {
-    return mImpl->on_vkRegisterImageColorBufferGOOGLE(pool, device, image, colorBuffer);
-}
-
-VkResult VkDecoderGlobalState::on_vkRegisterBufferColorBufferGOOGLE(android::base::BumpPool* pool,
-                                                                    VkDevice device,
-                                                                    VkBuffer buffer,
-                                                                    uint32_t colorBuffer) {
-    return mImpl->on_vkRegisterBufferColorBufferGOOGLE(pool, device, buffer, colorBuffer);
 }
 
 VkResult VkDecoderGlobalState::on_vkAllocateCommandBuffers(
@@ -6948,26 +7015,26 @@ void VkDecoderGlobalState::on_vkUpdateDescriptorSetWithTemplateSizedGOOGLE(
 VkResult VkDecoderGlobalState::on_vkBeginCommandBuffer(android::base::BumpPool* pool,
                                                        VkCommandBuffer commandBuffer,
                                                        const VkCommandBufferBeginInfo* pBeginInfo,
-                                                       GfxApiLogger& gfxLogger) {
-    return mImpl->on_vkBeginCommandBuffer(pool, commandBuffer, pBeginInfo, gfxLogger);
+                                                       const VkDecoderContext& context) {
+    return mImpl->on_vkBeginCommandBuffer(pool, commandBuffer, pBeginInfo, context);
 }
 
 void VkDecoderGlobalState::on_vkBeginCommandBufferAsyncGOOGLE(
     android::base::BumpPool* pool, VkCommandBuffer commandBuffer,
-    const VkCommandBufferBeginInfo* pBeginInfo, GfxApiLogger& gfxLogger) {
-    mImpl->on_vkBeginCommandBuffer(pool, commandBuffer, pBeginInfo, gfxLogger);
+    const VkCommandBufferBeginInfo* pBeginInfo, const VkDecoderContext& context) {
+    mImpl->on_vkBeginCommandBuffer(pool, commandBuffer, pBeginInfo, context);
 }
 
 VkResult VkDecoderGlobalState::on_vkEndCommandBuffer(android::base::BumpPool* pool,
                                                      VkCommandBuffer commandBuffer,
-                                                     GfxApiLogger& gfxLogger) {
-    return mImpl->on_vkEndCommandBuffer(pool, commandBuffer, gfxLogger);
+                                                     const VkDecoderContext& context) {
+    return mImpl->on_vkEndCommandBuffer(pool, commandBuffer, context);
 }
 
 void VkDecoderGlobalState::on_vkEndCommandBufferAsyncGOOGLE(android::base::BumpPool* pool,
                                                             VkCommandBuffer commandBuffer,
-                                                            GfxApiLogger& gfxLogger) {
-    mImpl->on_vkEndCommandBufferAsyncGOOGLE(pool, commandBuffer, gfxLogger);
+                                                            const VkDecoderContext& context) {
+    mImpl->on_vkEndCommandBufferAsyncGOOGLE(pool, commandBuffer, context);
 }
 
 void VkDecoderGlobalState::on_vkResetCommandBufferAsyncGOOGLE(android::base::BumpPool* pool,
@@ -7449,4 +7516,5 @@ GOLDFISH_VK_LIST_DISPATCHABLE_HANDLE_TYPES(
 GOLDFISH_VK_LIST_NON_DISPATCHABLE_HANDLE_TYPES(
     BOXED_NON_DISPATCHABLE_HANDLE_UNWRAP_AND_DELETE_PRESERVE_BOXED_IMPL)
 
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream
