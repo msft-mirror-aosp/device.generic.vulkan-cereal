@@ -34,15 +34,18 @@
 #include "goldfish_vk_private_defs.h"
 #include "vk_android_native_buffer.h"
 #include "vulkan_gfxstream.h"
-namespace goldfish_vk {
+namespace gfxstream {
+namespace vk {
 
 struct VulkanDispatch;
 
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream
 using DlOpenFunc = void*(void);
 using DlSymFunc = void*(void*, const char*);
 
-namespace goldfish_vk {
+namespace gfxstream {
+namespace vk {
 
 void init_vulkan_dispatch_from_system_loader(DlOpenFunc dlOpenFunc, DlSymFunc dlSymFunc,
                                              VulkanDispatch* dispatch_out);
@@ -1096,8 +1099,6 @@ struct VulkanDispatch {
     PFN_vkCmdSetColorWriteEnableEXT vkCmdSetColorWriteEnableEXT;
 #endif
 #ifdef VK_GOOGLE_gfxstream
-    PFN_vkRegisterImageColorBufferGOOGLE vkRegisterImageColorBufferGOOGLE;
-    PFN_vkRegisterBufferColorBufferGOOGLE vkRegisterBufferColorBufferGOOGLE;
     PFN_vkMapMemoryIntoAddressSpaceGOOGLE vkMapMemoryIntoAddressSpaceGOOGLE;
     PFN_vkUpdateDescriptorSetWithTemplateSizedGOOGLE vkUpdateDescriptorSetWithTemplateSizedGOOGLE;
     PFN_vkBeginCommandBufferAsyncGOOGLE vkBeginCommandBufferAsyncGOOGLE;
@@ -1119,6 +1120,7 @@ struct VulkanDispatch {
     PFN_vkCollectDescriptorPoolIdsGOOGLE vkCollectDescriptorPoolIdsGOOGLE;
     PFN_vkQueueSignalReleaseImageANDROIDAsyncGOOGLE vkQueueSignalReleaseImageANDROIDAsyncGOOGLE;
     PFN_vkQueueFlushCommandsFromAuxMemoryGOOGLE vkQueueFlushCommandsFromAuxMemoryGOOGLE;
+    PFN_vkGetBlobGOOGLE vkGetBlobGOOGLE;
 #endif
 #ifdef VK_EXT_global_priority_query
 #endif
@@ -1165,4 +1167,5 @@ struct VulkanDispatch {
 #endif
 };
 
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream
