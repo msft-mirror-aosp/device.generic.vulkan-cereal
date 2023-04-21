@@ -20,6 +20,7 @@
 #include "FrameBuffer.h"
 #include "GfxStreamAgents.h"
 #include "VirtioGpuTimelines.h"
+#include "VkCommonOperations.h"
 #include "aemu/base/AlignedBuf.h"
 #include "aemu/base/ManagedDescriptor.hpp"
 #include "aemu/base/Metrics.h"
@@ -39,6 +40,7 @@
 #include "host-common/opengles.h"
 #include "host-common/refcount-pipe.h"
 #include "host-common/vm_operations.h"
+#include "virgl_hw.h"
 #include "virtgpu_gfxstream_protocol.h"
 #include "vk_util.h"
 
@@ -1316,6 +1318,11 @@ class PipeVirglRenderer {
             capset->protocolVersion = 1;
             capset->ringSize = 12288;
             capset->bufferSize = 1048576;
+
+            auto vk_emu = gfxstream::vk::getGlobalVkEmulation();
+            if (vk_emu && vk_emu->live && vk_emu->representativeColorBufferMemoryTypeIndex) {
+                capset->colorBufferMemoryIndex = *vk_emu->representativeColorBufferMemoryTypeIndex;
+            }
         }
     }
 
@@ -1909,14 +1916,6 @@ VG_EXPORT int stream_renderer_vulkan_info(uint32_t res_handle,
     return sRenderer()->vulkanInfo(res_handle, vulkan_info);
 }
 
-struct renderer_display_info;
-typedef void (*get_pixels_t)(void*, uint32_t, uint32_t);
-static get_pixels_t sGetPixelsFunc = 0;
-typedef void (*post_callback_t)(void*, uint32_t, int, int, int, int, int, unsigned char*);
-
-// For reading back rendered contents to display
-VG_EXPORT void get_pixels(void* pixels, uint32_t bytes);
-
 static const GoldfishPipeServiceOps goldfish_pipe_service_ops = {
     // guest_open()
     [](GoldfishHwPipe* hwPipe) -> GoldfishHostPipe* {
@@ -2017,20 +2016,6 @@ static const GoldfishPipeServiceOps goldfish_pipe_service_ops = {
     // dma_load_mappings()
     [](QEMUFile* file) { (void)file; },
 };
-
-extern const QAndroidVmOperations* const gQAndroidVmOperations;
-
-static void default_post_callback(void* context, uint32_t displayId, int width, int height,
-                                  int ydir, int format, int frame_type, unsigned char* pixels) {
-    (void)context;
-    (void)width;
-    (void)height;
-    (void)ydir;
-    (void)format;
-    (void)frame_type;
-    (void)pixels;
-    // no-op
-}
 
 VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer_params,
                                    uint64_t num_params) {
@@ -2216,9 +2201,6 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
                         fb->logVulkanOutOfMemory(result, function, line, allocationSize);
                     }}));
 
-    gfxstream_backend_init_product_override();
-    // First we make some agents available.
-
     GFXS_LOG("start. display dimensions: width %u height %u, renderer flags: 0x%x", display_width,
              display_height, renderer_flags);
 
@@ -2376,8 +2358,6 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
     android_opengles_pipe_set_recv_mode(2 /* virtio-gpu */);
     android_init_refcount_pipe();
 
-    sGetPixelsFunc = android_getReadPixelsFunc();
-
     pipe_virgl_renderer_init(renderer_cookie, renderer_flags, &virglrenderer_callbacks);
 
     gfxstream::FrameBuffer::waitUntilInitialized();
@@ -2385,66 +2365,6 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
     GFXS_LOG("Started renderer");
 
     return 0;
-}
-
-VG_EXPORT void gfxstream_backend_init(uint32_t display_width, uint32_t display_height,
-                                      uint32_t display_type, void* renderer_cookie,
-                                      int renderer_flags,
-                                      struct virgl_renderer_callbacks* virglrenderer_callbacks,
-                                      struct gfxstream_callbacks* gfxstreamcallbacks) {
-    std::vector<stream_renderer_param> streamRendererParams{
-        {STREAM_RENDERER_PARAM_USER_DATA,
-         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(renderer_cookie))},
-        {STREAM_RENDERER_PARAM_RENDERER_FLAGS, static_cast<uint64_t>(renderer_flags)},
-        {STREAM_RENDERER_PARAM_WRITE_FENCE_CALLBACK,
-         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(virglrenderer_callbacks->write_fence))},
-#ifdef VIRGL_RENDERER_UNSTABLE_APIS
-        {STREAM_RENDERER_PARAM_WRITE_CONTEXT_FENCE_CALLBACK,
-         static_cast<uint64_t>(
-             reinterpret_cast<uintptr_t>(virglrenderer_callbacks->write_context_fence))},
-#endif
-        {STREAM_RENDERER_PARAM_WIN0_WIDTH, display_width},
-        {STREAM_RENDERER_PARAM_WIN0_HEIGHT, display_height}};
-
-    // Convert metrics callbacks.
-    if (gfxstreamcallbacks) {
-        if (gfxstreamcallbacks->add_instant_event) {
-            streamRendererParams.push_back(
-                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT,
-                 static_cast<uint64_t>(
-                     reinterpret_cast<uintptr_t>(gfxstreamcallbacks->add_instant_event))});
-        }
-        if (gfxstreamcallbacks->add_instant_event_with_descriptor) {
-            streamRendererParams.push_back(
-                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR,
-                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
-                     gfxstreamcallbacks->add_instant_event_with_descriptor))});
-        }
-        if (gfxstreamcallbacks->add_instant_event_with_metric) {
-            streamRendererParams.push_back(
-                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC,
-                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
-                     gfxstreamcallbacks->add_instant_event_with_metric))});
-        }
-        if (gfxstreamcallbacks->add_vulkan_out_of_memory_event) {
-            streamRendererParams.push_back(
-                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT,
-                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
-                     gfxstreamcallbacks->add_vulkan_out_of_memory_event))});
-        }
-        if (gfxstreamcallbacks->set_annotation) {
-            streamRendererParams.push_back({STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION,
-                                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
-                                                gfxstreamcallbacks->set_annotation))});
-        }
-        if (gfxstreamcallbacks->abort) {
-            streamRendererParams.push_back(
-                {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT,
-                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(gfxstreamcallbacks->abort))});
-        }
-    }
-
-    stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
 }
 
 VG_EXPORT void gfxstream_backend_setup_window(void* native_window_handle, int32_t window_x,
@@ -2466,28 +2386,6 @@ VG_EXPORT void gfxstream_backend_set_screen_mask(int width, int height,
     android_setOpenglesScreenMask(width, height, rgbaData);
 }
 
-VG_EXPORT void get_pixels(void* pixels, uint32_t bytes) {
-    // TODO: support display > 0
-    sGetPixelsFunc(pixels, bytes, 0);
-}
-
-VG_EXPORT void gfxstream_backend_getrender(char* buf, size_t bufSize, size_t* size) {
-    const char* render = "";
-    auto* pFB = gfxstream::FrameBuffer::getFB();
-    if (pFB) {
-        const char* vendor = nullptr;
-        const char* version = nullptr;
-        pFB->getGLStrings(&vendor, &render, &version);
-    }
-    if (!buf || bufSize == 0) {
-        if (size) *size = strlen(render);
-        return;
-    }
-    *buf = '\0';
-    strncat(buf, render, bufSize - 1);
-    if (size) *size = strlen(buf);
-}
-
 const GoldfishPipeServiceOps* goldfish_pipe_get_service_ops() { return &goldfish_pipe_service_ops; }
 
 #define VIRGLRENDERER_API_PIPE_STRUCT_DEF(api) pipe_##api,
@@ -2499,8 +2397,39 @@ struct virgl_renderer_virtio_interface* get_goldfish_pipe_virgl_renderer_virtio_
     return &s_virtio_interface;
 }
 
-void virtio_goldfish_pipe_reset(void* pipe, void* host_pipe) {
-    sRenderer()->resetPipe((GoldfishHwPipe*)pipe, (GoldfishHostPipe*)host_pipe);
-}
 
+static_assert(sizeof(struct stream_renderer_device_id) == 32,
+              "stream_renderer_device_id must be 32 bytes");
+static_assert(offsetof(struct stream_renderer_device_id, device_uuid) == 0,
+              "stream_renderer_device_id.device_uuid must be at offset 0");
+static_assert(offsetof(struct stream_renderer_device_id, driver_uuid) == 16,
+              "stream_renderer_device_id.driver_uuid must be at offset 16");
+
+static_assert(sizeof(struct stream_renderer_vulkan_info) == 36,
+              "stream_renderer_vulkan_info must be 36 bytes");
+static_assert(offsetof(struct stream_renderer_vulkan_info, memory_index) == 0,
+              "stream_renderer_vulkan_info.memory_index must be at offset 0");
+static_assert(offsetof(struct stream_renderer_vulkan_info, device_id) == 4,
+              "stream_renderer_vulkan_info.device_id must be at offset 4");
+
+static_assert(sizeof(struct stream_renderer_param_host_visible_memory_mask_entry) == 36,
+              "stream_renderer_param_host_visible_memory_mask_entry must be 36 bytes");
+static_assert(offsetof(struct stream_renderer_param_host_visible_memory_mask_entry, device_id) == 0,
+              "stream_renderer_param_host_visible_memory_mask_entry.device_id must be at offset 0");
+static_assert(
+    offsetof(struct stream_renderer_param_host_visible_memory_mask_entry, memory_type_mask) == 32,
+    "stream_renderer_param_host_visible_memory_mask_entry.memory_type_mask must be at offset 32");
+
+static_assert(sizeof(struct stream_renderer_param_host_visible_memory_mask) == 16,
+              "stream_renderer_param_host_visible_memory_mask must be 16 bytes");
+static_assert(offsetof(struct stream_renderer_param_host_visible_memory_mask, entries) == 0,
+              "stream_renderer_param_host_visible_memory_mask.entries must be at offset 0");
+static_assert(offsetof(struct stream_renderer_param_host_visible_memory_mask, num_entries) == 8,
+              "stream_renderer_param_host_visible_memory_mask.num_entries must be at offset 8");
+
+static_assert(sizeof(struct stream_renderer_param) == 16, "stream_renderer_param must be 16 bytes");
+static_assert(offsetof(struct stream_renderer_param, key) == 0,
+              "stream_renderer_param.key must be at offset 0");
+static_assert(offsetof(struct stream_renderer_param, value) == 8,
+              "stream_renderer_param.value must be at offset 8");
 }  // extern "C"

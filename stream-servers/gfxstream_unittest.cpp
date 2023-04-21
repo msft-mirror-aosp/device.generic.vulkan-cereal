@@ -13,12 +13,14 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+
 #include <vector>
 
-#include "virtio-gpu-gfxstream-renderer.h"
-#include "host-common/testing/MockGraphicsAgentFactory.h"
 #include "OSWindow.h"
 #include "aemu/base/system/System.h"
+#include "host-common/testing/MockGraphicsAgentFactory.h"
+#include "virgl_hw.h"
+#include "virtio-gpu-gfxstream-renderer.h"
 
 using android::base::sleepMs;
 
@@ -170,7 +172,6 @@ TEST_F(GfxStreamBackendTest, DISABLED_ApiCallLinkTest) {
     stream_renderer_flush_resource_and_readback(res_id, 0, 0, width, height,
             fb.get(), width * height);
 
-    virtio_goldfish_pipe_reset(0, 0);
     pipe_virgl_renderer_init(0, 0, 0);
     pipe_virgl_renderer_poll();
     pipe_virgl_renderer_get_cursor_data(0, 0, 0);
