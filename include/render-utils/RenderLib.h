@@ -43,7 +43,7 @@ class GLObjectCounter;
 } // namespace base
 } // namespace android
 
-namespace emugl {
+namespace gfxstream {
 
 struct RenderOpt {
     void* display;
@@ -93,10 +93,6 @@ public:
 
     virtual void setGrallocImplementation(GrallocImplementation gralloc) = 0;
 
-    virtual void* getGLESv2Dispatch(void) = 0;
-
-    virtual void* getEGLDispatch(void) = 0;
-
     virtual bool getOpt(RenderOpt* opt) = 0;
 
     // initRenderer - initialize the OpenGL renderer object.
@@ -117,4 +113,4 @@ public:
 
 using RenderLibPtr = std::unique_ptr<RenderLib>;
 
-}  // namespace emugl
+}  // namespace gfxstream

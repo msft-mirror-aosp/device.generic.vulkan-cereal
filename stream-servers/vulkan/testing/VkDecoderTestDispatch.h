@@ -18,7 +18,9 @@
 #include "stream-servers/vulkan/cereal/common/goldfish_vk_dispatch.h"
 #include "vulkan/vulkan.h"
 
-namespace goldfish_vk::testing {
+namespace gfxstream {
+namespace vk {
+namespace testing {
 
 // TODO(gregschlom): This class should be auto-generated
 class VkDecoderTestDispatch {
@@ -47,7 +49,7 @@ class VkDecoderTestDispatch {
     VkResult vkBeginCommandBuffer(VkCommandBuffer commandBuffer,
                                   const VkCommandBufferBeginInfo* pBeginInfo) {
         return mDgs->on_vkBeginCommandBuffer(mBp, commandBuffer, pBeginInfo,
-                                             *mDecoderContext->gfxApiLogger);
+                                             *mDecoderContext);
     }
 
     VkResult vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
@@ -195,7 +197,7 @@ class VkDecoderTestDispatch {
     }
 
     VkResult vkEndCommandBuffer(VkCommandBuffer commandBuffer) {
-        return mDgs->on_vkEndCommandBuffer(mBp, commandBuffer, *mDecoderContext->gfxApiLogger);
+        return mDgs->on_vkEndCommandBuffer(mBp, commandBuffer, *mDecoderContext);
     }
 
     VkResult vkEnumerateInstanceLayerProperties(uint32_t* pPropertyCount,
@@ -288,4 +290,6 @@ class VkDecoderTestDispatch {
     VkDecoderContext* mDecoderContext;
 };
 
-}  // namespace goldfish_vk::testing
+}  // namespace testing
+}  // namespace vk
+}  // namespace gfxstream

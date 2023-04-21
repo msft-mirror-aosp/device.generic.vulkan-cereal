@@ -36,7 +36,8 @@
 #include "goldfish_vk_extension_structs.h"
 #include "goldfish_vk_private_defs.h"
 
-namespace goldfish_vk {
+namespace gfxstream {
+namespace vk {
 
 void checkEqual_extension_struct(const void* structExtension, const void* structExtension2,
                                  OnFailCompareFunc onFail);
@@ -17145,29 +17146,22 @@ void checkEqual_VkImportBufferGOOGLE(const VkImportBufferGOOGLE* a, const VkImpo
     };
 }
 
-void checkEqual_VkImportPhysicalAddressGOOGLE(const VkImportPhysicalAddressGOOGLE* a,
-                                              const VkImportPhysicalAddressGOOGLE* b,
-                                              OnFailCompareFunc onFail) {
+void checkEqual_VkCreateBlobGOOGLE(const VkCreateBlobGOOGLE* a, const VkCreateBlobGOOGLE* b,
+                                   OnFailCompareFunc onFail) {
     if (!((a->sType) == (b->sType))) {
         onFail("a->sType (Error: Value not equal)");
     };
     if (a->pNext) {
         checkEqual_extension_struct(a->pNext, b->pNext, onFail);
     }
-    if (!((a->physicalAddress) == (b->physicalAddress))) {
-        onFail("a->physicalAddress (Error: Value not equal)");
+    if (!((a->blobMem) == (b->blobMem))) {
+        onFail("a->blobMem (Error: Value not equal)");
     };
-    if (!((a->size) == (b->size))) {
-        onFail("a->size (Error: Value not equal)");
+    if (!((a->blobFlags) == (b->blobFlags))) {
+        onFail("a->blobFlags (Error: Value not equal)");
     };
-    if (!((a->format) == (b->format))) {
-        onFail("a->format (Error: Value not equal)");
-    };
-    if (!((a->tiling) == (b->tiling))) {
-        onFail("a->tiling (Error: Value not equal)");
-    };
-    if (!((a->tilingParameter) == (b->tilingParameter))) {
-        onFail("a->tilingParameter (Error: Value not equal)");
+    if (!((a->blobId) == (b->blobId))) {
+        onFail("a->blobId (Error: Value not equal)");
     };
 }
 
@@ -20911,10 +20905,10 @@ void checkEqual_extension_struct(const void* structExtension, const void* struct
                 reinterpret_cast<const VkImportBufferGOOGLE*>(structExtension2), onFail);
             break;
         }
-        case VK_STRUCTURE_TYPE_IMPORT_PHYSICAL_ADDRESS_GOOGLE: {
-            checkEqual_VkImportPhysicalAddressGOOGLE(
-                reinterpret_cast<const VkImportPhysicalAddressGOOGLE*>(structExtension),
-                reinterpret_cast<const VkImportPhysicalAddressGOOGLE*>(structExtension2), onFail);
+        case VK_STRUCTURE_TYPE_CREATE_BLOB_GOOGLE: {
+            checkEqual_VkCreateBlobGOOGLE(
+                reinterpret_cast<const VkCreateBlobGOOGLE*>(structExtension),
+                reinterpret_cast<const VkCreateBlobGOOGLE*>(structExtension2), onFail);
             break;
         }
 #endif
@@ -21047,4 +21041,5 @@ void checkEqual_extension_struct(const void* structExtension, const void* struct
     }
 }
 
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream

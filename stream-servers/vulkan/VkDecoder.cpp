@@ -55,11 +55,11 @@
 
 #define MAX_PACKET_LENGTH (400 * 1024 * 1024)  // 400MB
 
+namespace gfxstream {
+namespace vk {
+
 using android::base::MetricEventBadPacketLength;
 using android::base::MetricEventDuplicateSequenceNum;
-using emugl::vkDispatch;
-
-using namespace goldfish_vk;
 
 class VkDecoder::Impl {
    public:
@@ -2173,14 +2173,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 VkDevice device;
                 VkBuffer buffer;
                 VkMemoryRequirements* pMemoryRequirements;
-                // Begin non wrapped dispatchable handle unboxing for device;
+                // Begin global wrapped dispatchable handle unboxing for device;
                 uint64_t cgen_var_0;
                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
-                auto unboxed_device = unbox_VkDevice(device);
-                auto vk = dispatch_VkDevice(device);
-                // End manual dispatchable handle unboxing for device;
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
@@ -2201,7 +2198,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                             ioStream, (unsigned long long)device, (unsigned long long)buffer,
                             (unsigned long long)pMemoryRequirements);
                 }
-                vk->vkGetBufferMemoryRequirements(unboxed_device, buffer, pMemoryRequirements);
+                m_state->on_vkGetBufferMemoryRequirements(&m_pool, device, buffer,
+                                                          pMemoryRequirements);
                 vkStream->unsetHandleMapping();
                 if (pMemoryRequirements) {
                     transform_fromhost_VkMemoryRequirements(
@@ -5078,8 +5076,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkDescriptorSetLayout*)pSetLayout = (VkDescriptorSetLayout)(
-                    VkDescriptorSetLayout)((VkDescriptorSetLayout)(*&cgen_var_2));
+                *(VkDescriptorSetLayout*)pSetLayout =
+                    (VkDescriptorSetLayout)(VkDescriptorSetLayout)((
+                        VkDescriptorSetLayout)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkDescriptorSetLayoutCreateInfo(
                         m_state, (VkDescriptorSetLayoutCreateInfo*)(pCreateInfo));
@@ -5147,8 +5146,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkDescriptorSetLayout*)&descriptorSetLayout = (VkDescriptorSetLayout)(
-                    VkDescriptorSetLayout)((VkDescriptorSetLayout)(*&cgen_var_1));
+                *(VkDescriptorSetLayout*)&descriptorSetLayout =
+                    (VkDescriptorSetLayout)(VkDescriptorSetLayout)((
+                        VkDescriptorSetLayout)(*&cgen_var_1));
                 boxed_descriptorSetLayout_preserve = descriptorSetLayout;
                 descriptorSetLayout = unbox_VkDescriptorSetLayout(descriptorSetLayout);
                 // WARNING PTR CHECK
@@ -6283,8 +6283,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                             (unsigned long long)pBeginInfo);
                 }
                 VkResult vkBeginCommandBuffer_VkResult_return = (VkResult)0;
-                vkBeginCommandBuffer_VkResult_return = m_state->on_vkBeginCommandBuffer(
-                    &m_pool, commandBuffer, pBeginInfo, gfx_logger);
+                vkBeginCommandBuffer_VkResult_return =
+                    m_state->on_vkBeginCommandBuffer(&m_pool, commandBuffer, pBeginInfo, context);
                 if ((vkBeginCommandBuffer_VkResult_return) == VK_ERROR_DEVICE_LOST)
                     m_state->on_DeviceLost();
                 m_state->on_CheckOutOfMemory(vkBeginCommandBuffer_VkResult_return, opcode, context);
@@ -6320,7 +6320,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 }
                 VkResult vkEndCommandBuffer_VkResult_return = (VkResult)0;
                 vkEndCommandBuffer_VkResult_return =
-                    m_state->on_vkEndCommandBuffer(&m_pool, commandBuffer, gfx_logger);
+                    m_state->on_vkEndCommandBuffer(&m_pool, commandBuffer, context);
                 if ((vkEndCommandBuffer_VkResult_return) == VK_ERROR_DEVICE_LOST)
                     m_state->on_DeviceLost();
                 m_state->on_CheckOutOfMemory(vkEndCommandBuffer_VkResult_return, opcode, context);
@@ -9224,14 +9224,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 VkDevice device;
                 const VkBufferMemoryRequirementsInfo2* pInfo;
                 VkMemoryRequirements2* pMemoryRequirements;
-                // Begin non wrapped dispatchable handle unboxing for device;
+                // Begin global wrapped dispatchable handle unboxing for device;
                 uint64_t cgen_var_0;
                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
-                auto unboxed_device = unbox_VkDevice(device);
-                auto vk = dispatch_VkDevice(device);
-                // End manual dispatchable handle unboxing for device;
                 vkReadStream->alloc((void**)&pInfo, sizeof(const VkBufferMemoryRequirementsInfo2));
                 reservedunmarshal_VkBufferMemoryRequirementsInfo2(
                     vkReadStream, VK_STRUCTURE_TYPE_MAX_ENUM,
@@ -9257,7 +9254,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                         ioStream, (unsigned long long)device, (unsigned long long)pInfo,
                         (unsigned long long)pMemoryRequirements);
                 }
-                vk->vkGetBufferMemoryRequirements2(unboxed_device, pInfo, pMemoryRequirements);
+                m_state->on_vkGetBufferMemoryRequirements2(&m_pool, device, pInfo,
+                                                           pMemoryRequirements);
                 vkStream->unsetHandleMapping();
                 if (pMemoryRequirements) {
                     transform_fromhost_VkMemoryRequirements2(
@@ -10012,8 +10010,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkSamplerYcbcrConversion*)pYcbcrConversion = (VkSamplerYcbcrConversion)(
-                    VkSamplerYcbcrConversion)((VkSamplerYcbcrConversion)(*&cgen_var_2));
+                *(VkSamplerYcbcrConversion*)pYcbcrConversion =
+                    (VkSamplerYcbcrConversion)(VkSamplerYcbcrConversion)((
+                        VkSamplerYcbcrConversion)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkSamplerYcbcrConversionCreateInfo(
                         m_state, (VkSamplerYcbcrConversionCreateInfo*)(pCreateInfo));
@@ -10081,8 +10080,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkSamplerYcbcrConversion*)&ycbcrConversion = (VkSamplerYcbcrConversion)(
-                    VkSamplerYcbcrConversion)((VkSamplerYcbcrConversion)(*&cgen_var_1));
+                *(VkSamplerYcbcrConversion*)&ycbcrConversion =
+                    (VkSamplerYcbcrConversion)(VkSamplerYcbcrConversion)((
+                        VkSamplerYcbcrConversion)(*&cgen_var_1));
                 boxed_ycbcrConversion_preserve = ycbcrConversion;
                 ycbcrConversion = unbox_VkSamplerYcbcrConversion(ycbcrConversion);
                 // WARNING PTR CHECK
@@ -10158,8 +10158,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
                 *(VkDescriptorUpdateTemplate*)pDescriptorUpdateTemplate =
-                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)(
-                        (VkDescriptorUpdateTemplate)(*&cgen_var_2));
+                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)((
+                        VkDescriptorUpdateTemplate)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkDescriptorUpdateTemplateCreateInfo(
                         m_state, (VkDescriptorUpdateTemplateCreateInfo*)(pCreateInfo));
@@ -10231,8 +10231,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkDescriptorUpdateTemplate*)&descriptorUpdateTemplate =
-                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)(
-                        (VkDescriptorUpdateTemplate)(*&cgen_var_1));
+                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)((
+                        VkDescriptorUpdateTemplate)(*&cgen_var_1));
                 boxed_descriptorUpdateTemplate_preserve = descriptorUpdateTemplate;
                 descriptorUpdateTemplate =
                     unbox_VkDescriptorUpdateTemplate(descriptorUpdateTemplate);
@@ -16240,8 +16240,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
                 *(VkDescriptorUpdateTemplate*)pDescriptorUpdateTemplate =
-                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)(
-                        (VkDescriptorUpdateTemplate)(*&cgen_var_2));
+                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)((
+                        VkDescriptorUpdateTemplate)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkDescriptorUpdateTemplateCreateInfo(
                         m_state, (VkDescriptorUpdateTemplateCreateInfo*)(pCreateInfo));
@@ -16313,8 +16313,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkDescriptorUpdateTemplate*)&descriptorUpdateTemplate =
-                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)(
-                        (VkDescriptorUpdateTemplate)(*&cgen_var_1));
+                    (VkDescriptorUpdateTemplate)(VkDescriptorUpdateTemplate)((
+                        VkDescriptorUpdateTemplate)(*&cgen_var_1));
                 boxed_descriptorUpdateTemplate_preserve = descriptorUpdateTemplate;
                 descriptorUpdateTemplate =
                     unbox_VkDescriptorUpdateTemplate(descriptorUpdateTemplate);
@@ -17980,14 +17980,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 VkDevice device;
                 const VkBufferMemoryRequirementsInfo2* pInfo;
                 VkMemoryRequirements2* pMemoryRequirements;
-                // Begin non wrapped dispatchable handle unboxing for device;
+                // Begin global wrapped dispatchable handle unboxing for device;
                 uint64_t cgen_var_0;
                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
-                auto unboxed_device = unbox_VkDevice(device);
-                auto vk = dispatch_VkDevice(device);
-                // End manual dispatchable handle unboxing for device;
                 vkReadStream->alloc((void**)&pInfo, sizeof(const VkBufferMemoryRequirementsInfo2));
                 reservedunmarshal_VkBufferMemoryRequirementsInfo2(
                     vkReadStream, VK_STRUCTURE_TYPE_MAX_ENUM,
@@ -18013,7 +18010,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                         ioStream, (unsigned long long)device, (unsigned long long)pInfo,
                         (unsigned long long)pMemoryRequirements);
                 }
-                vk->vkGetBufferMemoryRequirements2KHR(unboxed_device, pInfo, pMemoryRequirements);
+                m_state->on_vkGetBufferMemoryRequirements2KHR(&m_pool, device, pInfo,
+                                                              pMemoryRequirements);
                 vkStream->unsetHandleMapping();
                 if (pMemoryRequirements) {
                     transform_fromhost_VkMemoryRequirements2(
@@ -18191,8 +18189,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkSamplerYcbcrConversion*)pYcbcrConversion = (VkSamplerYcbcrConversion)(
-                    VkSamplerYcbcrConversion)((VkSamplerYcbcrConversion)(*&cgen_var_2));
+                *(VkSamplerYcbcrConversion*)pYcbcrConversion =
+                    (VkSamplerYcbcrConversion)(VkSamplerYcbcrConversion)((
+                        VkSamplerYcbcrConversion)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkSamplerYcbcrConversionCreateInfo(
                         m_state, (VkSamplerYcbcrConversionCreateInfo*)(pCreateInfo));
@@ -18261,8 +18260,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkSamplerYcbcrConversion*)&ycbcrConversion = (VkSamplerYcbcrConversion)(
-                    VkSamplerYcbcrConversion)((VkSamplerYcbcrConversion)(*&cgen_var_1));
+                *(VkSamplerYcbcrConversion*)&ycbcrConversion =
+                    (VkSamplerYcbcrConversion)(VkSamplerYcbcrConversion)((
+                        VkSamplerYcbcrConversion)(*&cgen_var_1));
                 boxed_ycbcrConversion_preserve = ycbcrConversion;
                 ycbcrConversion = unbox_VkSamplerYcbcrConversion(ycbcrConversion);
                 // WARNING PTR CHECK
@@ -21021,8 +21021,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkDebugReportCallbackEXT*)pCallback = (VkDebugReportCallbackEXT)(
-                    VkDebugReportCallbackEXT)((VkDebugReportCallbackEXT)(*&cgen_var_2));
+                *(VkDebugReportCallbackEXT*)pCallback =
+                    (VkDebugReportCallbackEXT)(VkDebugReportCallbackEXT)((
+                        VkDebugReportCallbackEXT)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkDebugReportCallbackCreateInfoEXT(
                         m_state, (VkDebugReportCallbackCreateInfoEXT*)(pCreateInfo));
@@ -21093,8 +21094,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkDebugReportCallbackEXT*)&callback = (VkDebugReportCallbackEXT)(
-                    VkDebugReportCallbackEXT)((VkDebugReportCallbackEXT)(*&cgen_var_1));
+                *(VkDebugReportCallbackEXT*)&callback =
+                    (VkDebugReportCallbackEXT)(VkDebugReportCallbackEXT)((
+                        VkDebugReportCallbackEXT)(*&cgen_var_1));
                 boxed_callback_preserve = callback;
                 callback = unbox_VkDebugReportCallbackEXT(callback);
                 // WARNING PTR CHECK
@@ -24547,8 +24549,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkDebugUtilsMessengerEXT*)pMessenger = (VkDebugUtilsMessengerEXT)(
-                    VkDebugUtilsMessengerEXT)((VkDebugUtilsMessengerEXT)(*&cgen_var_2));
+                *(VkDebugUtilsMessengerEXT*)pMessenger =
+                    (VkDebugUtilsMessengerEXT)(VkDebugUtilsMessengerEXT)((
+                        VkDebugUtilsMessengerEXT)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkDebugUtilsMessengerCreateInfoEXT(
                         m_state, (VkDebugUtilsMessengerCreateInfoEXT*)(pCreateInfo));
@@ -24619,8 +24622,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkDebugUtilsMessengerEXT*)&messenger = (VkDebugUtilsMessengerEXT)(
-                    VkDebugUtilsMessengerEXT)((VkDebugUtilsMessengerEXT)(*&cgen_var_1));
+                *(VkDebugUtilsMessengerEXT*)&messenger =
+                    (VkDebugUtilsMessengerEXT)(VkDebugUtilsMessengerEXT)((
+                        VkDebugUtilsMessengerEXT)(*&cgen_var_1));
                 boxed_messenger_preserve = messenger;
                 messenger = unbox_VkDebugUtilsMessengerEXT(messenger);
                 // WARNING PTR CHECK
@@ -25087,8 +25091,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkValidationCacheEXT*)pValidationCache = (VkValidationCacheEXT)(
-                    VkValidationCacheEXT)((VkValidationCacheEXT)(*&cgen_var_2));
+                *(VkValidationCacheEXT*)pValidationCache =
+                    (VkValidationCacheEXT)(VkValidationCacheEXT)((
+                        VkValidationCacheEXT)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkValidationCacheCreateInfoEXT(
                         m_state, (VkValidationCacheCreateInfoEXT*)(pCreateInfo));
@@ -25159,8 +25164,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkValidationCacheEXT*)&validationCache = (VkValidationCacheEXT)(
-                    VkValidationCacheEXT)((VkValidationCacheEXT)(*&cgen_var_1));
+                *(VkValidationCacheEXT*)&validationCache =
+                    (VkValidationCacheEXT)(VkValidationCacheEXT)((
+                        VkValidationCacheEXT)(*&cgen_var_1));
                 boxed_validationCache_preserve = validationCache;
                 validationCache = unbox_VkValidationCacheEXT(validationCache);
                 // WARNING PTR CHECK
@@ -25560,8 +25566,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkAccelerationStructureNV*)pAccelerationStructure = (VkAccelerationStructureNV)(
-                    VkAccelerationStructureNV)((VkAccelerationStructureNV)(*&cgen_var_2));
+                *(VkAccelerationStructureNV*)pAccelerationStructure =
+                    (VkAccelerationStructureNV)(VkAccelerationStructureNV)((
+                        VkAccelerationStructureNV)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkAccelerationStructureCreateInfoNV(
                         m_state, (VkAccelerationStructureCreateInfoNV*)(pCreateInfo));
@@ -25634,8 +25641,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkAccelerationStructureNV*)&accelerationStructure = (VkAccelerationStructureNV)(
-                    VkAccelerationStructureNV)((VkAccelerationStructureNV)(*&cgen_var_1));
+                *(VkAccelerationStructureNV*)&accelerationStructure =
+                    (VkAccelerationStructureNV)(VkAccelerationStructureNV)((
+                        VkAccelerationStructureNV)(*&cgen_var_1));
                 boxed_accelerationStructure_preserve = accelerationStructure;
                 accelerationStructure = unbox_VkAccelerationStructureNV(accelerationStructure);
                 // WARNING PTR CHECK
@@ -29440,8 +29448,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
                 *(VkIndirectCommandsLayoutNV*)pIndirectCommandsLayout =
-                    (VkIndirectCommandsLayoutNV)(VkIndirectCommandsLayoutNV)(
-                        (VkIndirectCommandsLayoutNV)(*&cgen_var_2));
+                    (VkIndirectCommandsLayoutNV)(VkIndirectCommandsLayoutNV)((
+                        VkIndirectCommandsLayoutNV)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkIndirectCommandsLayoutCreateInfoNV(
                         m_state, (VkIndirectCommandsLayoutCreateInfoNV*)(pCreateInfo));
@@ -29516,8 +29524,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
                 *(VkIndirectCommandsLayoutNV*)&indirectCommandsLayout =
-                    (VkIndirectCommandsLayoutNV)(VkIndirectCommandsLayoutNV)(
-                        (VkIndirectCommandsLayoutNV)(*&cgen_var_1));
+                    (VkIndirectCommandsLayoutNV)(VkIndirectCommandsLayoutNV)((
+                        VkIndirectCommandsLayoutNV)(*&cgen_var_1));
                 boxed_indirectCommandsLayout_preserve = indirectCommandsLayout;
                 indirectCommandsLayout = unbox_VkIndirectCommandsLayoutNV(indirectCommandsLayout);
                 // WARNING PTR CHECK
@@ -31489,106 +31497,6 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
             }
 #endif
 #ifdef VK_GOOGLE_gfxstream
-            case OP_vkRegisterImageColorBufferGOOGLE: {
-                android::base::beginTrace("vkRegisterImageColorBufferGOOGLE decode");
-                VkDevice device;
-                VkImage image;
-                uint32_t colorBuffer;
-                // Begin global wrapped dispatchable handle unboxing for device;
-                uint64_t cgen_var_0;
-                memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
-                *readStreamPtrPtr += 1 * 8;
-                *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
-                uint64_t cgen_var_1;
-                memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
-                *readStreamPtrPtr += 1 * 8;
-                *(VkImage*)&image = (VkImage)unbox_VkImage((VkImage)(*&cgen_var_1));
-                memcpy((uint32_t*)&colorBuffer, *readStreamPtrPtr, sizeof(uint32_t));
-                *readStreamPtrPtr += sizeof(uint32_t);
-                if (m_logCalls) {
-                    fprintf(
-                        stderr,
-                        "stream %p: call vkRegisterImageColorBufferGOOGLE 0x%llx 0x%llx 0x%llx \n",
-                        ioStream, (unsigned long long)device, (unsigned long long)image,
-                        (unsigned long long)colorBuffer);
-                }
-                VkResult vkRegisterImageColorBufferGOOGLE_VkResult_return = (VkResult)0;
-                vkRegisterImageColorBufferGOOGLE_VkResult_return =
-                    m_state->on_vkRegisterImageColorBufferGOOGLE(&m_pool, device, image,
-                                                                 colorBuffer);
-                if ((vkRegisterImageColorBufferGOOGLE_VkResult_return) == VK_ERROR_DEVICE_LOST)
-                    m_state->on_DeviceLost();
-                m_state->on_CheckOutOfMemory(vkRegisterImageColorBufferGOOGLE_VkResult_return,
-                                             opcode, context);
-                vkStream->unsetHandleMapping();
-                vkStream->write(&vkRegisterImageColorBufferGOOGLE_VkResult_return,
-                                sizeof(VkResult));
-                vkStream->commitWrite();
-                vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
-                                         (uintptr_t)snapshotTraceBegin);
-                size_t snapshotTraceBytes = vkReadStream->endTrace();
-                if (m_state->snapshotsEnabled()) {
-                    m_state->snapshot()->vkRegisterImageColorBufferGOOGLE(
-                        snapshotTraceBegin, snapshotTraceBytes, &m_pool,
-                        vkRegisterImageColorBufferGOOGLE_VkResult_return, device, image,
-                        colorBuffer);
-                }
-                vkReadStream->clearPool();
-                if (queueSubmitWithCommandsEnabled)
-                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
-                android::base::endTrace();
-                break;
-            }
-            case OP_vkRegisterBufferColorBufferGOOGLE: {
-                android::base::beginTrace("vkRegisterBufferColorBufferGOOGLE decode");
-                VkDevice device;
-                VkBuffer buffer;
-                uint32_t colorBuffer;
-                // Begin global wrapped dispatchable handle unboxing for device;
-                uint64_t cgen_var_0;
-                memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
-                *readStreamPtrPtr += 1 * 8;
-                *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
-                uint64_t cgen_var_1;
-                memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
-                *readStreamPtrPtr += 1 * 8;
-                *(VkBuffer*)&buffer = (VkBuffer)unbox_VkBuffer((VkBuffer)(*&cgen_var_1));
-                memcpy((uint32_t*)&colorBuffer, *readStreamPtrPtr, sizeof(uint32_t));
-                *readStreamPtrPtr += sizeof(uint32_t);
-                if (m_logCalls) {
-                    fprintf(
-                        stderr,
-                        "stream %p: call vkRegisterBufferColorBufferGOOGLE 0x%llx 0x%llx 0x%llx \n",
-                        ioStream, (unsigned long long)device, (unsigned long long)buffer,
-                        (unsigned long long)colorBuffer);
-                }
-                VkResult vkRegisterBufferColorBufferGOOGLE_VkResult_return = (VkResult)0;
-                vkRegisterBufferColorBufferGOOGLE_VkResult_return =
-                    m_state->on_vkRegisterBufferColorBufferGOOGLE(&m_pool, device, buffer,
-                                                                  colorBuffer);
-                if ((vkRegisterBufferColorBufferGOOGLE_VkResult_return) == VK_ERROR_DEVICE_LOST)
-                    m_state->on_DeviceLost();
-                m_state->on_CheckOutOfMemory(vkRegisterBufferColorBufferGOOGLE_VkResult_return,
-                                             opcode, context);
-                vkStream->unsetHandleMapping();
-                vkStream->write(&vkRegisterBufferColorBufferGOOGLE_VkResult_return,
-                                sizeof(VkResult));
-                vkStream->commitWrite();
-                vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
-                                         (uintptr_t)snapshotTraceBegin);
-                size_t snapshotTraceBytes = vkReadStream->endTrace();
-                if (m_state->snapshotsEnabled()) {
-                    m_state->snapshot()->vkRegisterBufferColorBufferGOOGLE(
-                        snapshotTraceBegin, snapshotTraceBytes, &m_pool,
-                        vkRegisterBufferColorBufferGOOGLE_VkResult_return, device, buffer,
-                        colorBuffer);
-                }
-                vkReadStream->clearPool();
-                if (queueSubmitWithCommandsEnabled)
-                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
-                android::base::endTrace();
-                break;
-            }
             case OP_vkMapMemoryIntoAddressSpaceGOOGLE: {
                 android::base::beginTrace("vkMapMemoryIntoAddressSpaceGOOGLE decode");
                 VkDevice device;
@@ -31842,7 +31750,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                             (unsigned long long)pBeginInfo);
                 }
                 m_state->on_vkBeginCommandBufferAsyncGOOGLE(&m_pool, commandBuffer, pBeginInfo,
-                                                            gfx_logger);
+                                                            context);
                 vkStream->unsetHandleMapping();
                 vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
                                          (uintptr_t)snapshotTraceBegin);
@@ -31870,7 +31778,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                     fprintf(stderr, "stream %p: call vkEndCommandBufferAsyncGOOGLE 0x%llx \n",
                             ioStream, (unsigned long long)commandBuffer);
                 }
-                m_state->on_vkEndCommandBufferAsyncGOOGLE(&m_pool, commandBuffer, gfx_logger);
+                m_state->on_vkEndCommandBufferAsyncGOOGLE(&m_pool, commandBuffer, context);
                 vkStream->unsetHandleMapping();
                 vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
                                          (uintptr_t)snapshotTraceBegin);
@@ -32945,6 +32853,47 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 android::base::endTrace();
                 break;
             }
+            case OP_vkGetBlobGOOGLE: {
+                android::base::beginTrace("vkGetBlobGOOGLE decode");
+                VkDevice device;
+                VkDeviceMemory memory;
+                // Begin global wrapped dispatchable handle unboxing for device;
+                uint64_t cgen_var_0;
+                memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
+                *readStreamPtrPtr += 1 * 8;
+                *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
+                uint64_t cgen_var_1;
+                memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
+                *readStreamPtrPtr += 1 * 8;
+                *(VkDeviceMemory*)&memory =
+                    (VkDeviceMemory)unbox_VkDeviceMemory((VkDeviceMemory)(*&cgen_var_1));
+                if (m_logCalls) {
+                    fprintf(stderr, "stream %p: call vkGetBlobGOOGLE 0x%llx 0x%llx \n", ioStream,
+                            (unsigned long long)device, (unsigned long long)memory);
+                }
+                VkResult vkGetBlobGOOGLE_VkResult_return = (VkResult)0;
+                vkGetBlobGOOGLE_VkResult_return =
+                    m_state->on_vkGetBlobGOOGLE(&m_pool, device, memory);
+                if ((vkGetBlobGOOGLE_VkResult_return) == VK_ERROR_DEVICE_LOST)
+                    m_state->on_DeviceLost();
+                m_state->on_CheckOutOfMemory(vkGetBlobGOOGLE_VkResult_return, opcode, context);
+                vkStream->unsetHandleMapping();
+                vkStream->write(&vkGetBlobGOOGLE_VkResult_return, sizeof(VkResult));
+                vkStream->commitWrite();
+                vkReadStream->setReadPos((uintptr_t)(*readStreamPtrPtr) -
+                                         (uintptr_t)snapshotTraceBegin);
+                size_t snapshotTraceBytes = vkReadStream->endTrace();
+                if (m_state->snapshotsEnabled()) {
+                    m_state->snapshot()->vkGetBlobGOOGLE(snapshotTraceBegin, snapshotTraceBytes,
+                                                         &m_pool, vkGetBlobGOOGLE_VkResult_return,
+                                                         device, memory);
+                }
+                vkReadStream->clearPool();
+                if (queueSubmitWithCommandsEnabled)
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
+                android::base::endTrace();
+                break;
+            }
 #endif
 #ifdef VK_EXT_global_priority_query
 #endif
@@ -33184,8 +33133,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_2;
                 memcpy((uint64_t*)&cgen_var_2, *readStreamPtrPtr, 8);
                 *readStreamPtrPtr += 8;
-                *(VkAccelerationStructureKHR*)pAccelerationStructure = (VkAccelerationStructureKHR)(
-                    VkAccelerationStructureKHR)((VkAccelerationStructureKHR)(*&cgen_var_2));
+                *(VkAccelerationStructureKHR*)pAccelerationStructure =
+                    (VkAccelerationStructureKHR)(VkAccelerationStructureKHR)((
+                        VkAccelerationStructureKHR)(*&cgen_var_2));
                 if (pCreateInfo) {
                     transform_tohost_VkAccelerationStructureCreateInfoKHR(
                         m_state, (VkAccelerationStructureCreateInfoKHR*)(pCreateInfo));
@@ -33259,8 +33209,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 uint64_t cgen_var_1;
                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
                 *readStreamPtrPtr += 1 * 8;
-                *(VkAccelerationStructureKHR*)&accelerationStructure = (VkAccelerationStructureKHR)(
-                    VkAccelerationStructureKHR)((VkAccelerationStructureKHR)(*&cgen_var_1));
+                *(VkAccelerationStructureKHR*)&accelerationStructure =
+                    (VkAccelerationStructureKHR)(VkAccelerationStructureKHR)((
+                        VkAccelerationStructureKHR)(*&cgen_var_1));
                 boxed_accelerationStructure_preserve = accelerationStructure;
                 accelerationStructure = unbox_VkAccelerationStructureKHR(accelerationStructure);
                 // WARNING PTR CHECK
@@ -34633,3 +34584,6 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
     return ptr - (unsigned char*)buf;
     ;
 }
+
+}  // namespace vk
+}  // namespace gfxstream

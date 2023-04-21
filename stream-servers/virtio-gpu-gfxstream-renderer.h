@@ -5,10 +5,8 @@
  * implement an actual virtio goldfish pipe, but this hijacking of virgl  is
  * done in order to avoid any guest kernel changes. */
 
-#include <assert.h>
 #include <stddef.h>
 
-#include "virgl_hw.h"
 #include "virglrenderer.h"
 
 #ifdef __cplusplus
@@ -26,8 +24,6 @@ void virgl_write_fence(void* opaque, uint32_t fence);
 #else
 #define VG_EXPORT __attribute__((visibility("default")))
 #endif
-
-VG_EXPORT void virtio_goldfish_pipe_reset(void* hwpipe, void* hostpipe);
 
 #define VIRTIO_GOLDFISH_EXPORT_API
 #ifdef VIRTIO_GOLDFISH_EXPORT_API
@@ -52,8 +48,8 @@ VG_EXPORT int pipe_virgl_renderer_transfer_write_iov(uint32_t handle, uint32_t c
                                                      uint32_t stride, uint32_t layer_stride,
                                                      struct virgl_box* box, uint64_t offset,
                                                      struct iovec* iovec, unsigned int iovec_cnt);
-VG_EXPORT void pipe_virgl_renderer_get_cap_set(uint32_t, uint32_t*, uint32_t*);
-VG_EXPORT void pipe_virgl_renderer_fill_caps(uint32_t, uint32_t, void* caps);
+VG_EXPORT void pipe_virgl_renderer_get_cap_set(uint32_t set, uint32_t* max_ver, uint32_t* max_size);
+VG_EXPORT void pipe_virgl_renderer_fill_caps(uint32_t set, uint32_t version, void* caps);
 
 VG_EXPORT int pipe_virgl_renderer_resource_attach_iov(int res_handle, struct iovec* iov,
                                                       int num_iovs);
@@ -75,9 +71,11 @@ VG_EXPORT void stream_renderer_flush_resource_and_readback(uint32_t res_handle, 
 #define STREAM_MEM_HANDLE_TYPE_DMABUF 0x2
 #define STREAM_MEM_HANDLE_TYPE_OPAQUE_WIN32 0x3
 #define STREAM_MEM_HANDLE_TYPE_SHM 0x4
-#define STREAM_FENCE_HANDLE_TYPE_OPAQUE_FD 0x10
-#define STREAM_FENCE_HANDLE_TYPE_SYNC_FD 0x11
-#define STREAM_FENCE_HANDLE_TYPE_OPAQUE_WIN32 0x12
+#define STREAM_MEM_HANDLE_TYPE_ZIRCON 0x5
+#define STREAM_FENCE_HANDLE_TYPE_OPAQUE_FD 0x6
+#define STREAM_FENCE_HANDLE_TYPE_SYNC_FD 0x7
+#define STREAM_FENCE_HANDLE_TYPE_OPAQUE_WIN32 0x8
+#define STREAM_FENCE_HANDLE_TYPE_ZIRCON 0x9
 struct stream_renderer_handle {
     int64_t os_handle;
     uint32_t handle_type;
@@ -147,24 +145,10 @@ struct stream_renderer_device_id {
     uint8_t driver_uuid[16];
 };
 
-static_assert(sizeof(stream_renderer_device_id) == 32,
-              "stream_renderer_device_id must be 32 bytes");
-static_assert(offsetof(stream_renderer_device_id, device_uuid) == 0,
-              "stream_renderer_device_id.device_uuid must be at offset 0");
-static_assert(offsetof(stream_renderer_device_id, driver_uuid) == 16,
-              "stream_renderer_device_id.driver_uuid must be at offset 16");
-
 struct stream_renderer_vulkan_info {
     uint32_t memory_index;
     struct stream_renderer_device_id device_id;
 };
-
-static_assert(sizeof(stream_renderer_vulkan_info) == 36,
-              "stream_renderer_vulkan_info must be 36 bytes");
-static_assert(offsetof(stream_renderer_vulkan_info, memory_index) == 0,
-              "stream_renderer_vulkan_info.memory_index must be at offset 0");
-static_assert(offsetof(stream_renderer_vulkan_info, device_id) == 4,
-              "stream_renderer_vulkan_info.device_id must be at offset 4");
 
 VG_EXPORT int stream_renderer_vulkan_info(uint32_t res_handle,
                                           struct stream_renderer_vulkan_info* vulkan_info);
@@ -214,14 +198,6 @@ struct stream_renderer_param_host_visible_memory_mask_entry {
     uint32_t memory_type_mask;
 };
 
-static_assert(sizeof(stream_renderer_param_host_visible_memory_mask_entry) == 36,
-              "stream_renderer_param_host_visible_memory_mask_entry must be 36 bytes");
-static_assert(offsetof(stream_renderer_param_host_visible_memory_mask_entry, device_id) == 0,
-              "stream_renderer_param_host_visible_memory_mask_entry.device_id must be at offset 0");
-static_assert(
-    offsetof(stream_renderer_param_host_visible_memory_mask_entry, memory_type_mask) == 32,
-    "stream_renderer_param_host_visible_memory_mask_entry.memory_type_mask must be at offset 32");
-
 // Information about the devices in the system with host visible memory type constraints.
 struct stream_renderer_param_host_visible_memory_mask {
     // Points to a stream_renderer_param_host_visible_memory_mask_entry array.
@@ -229,13 +205,6 @@ struct stream_renderer_param_host_visible_memory_mask {
     // Length of the entries array.
     uint64_t num_entries;
 };
-
-static_assert(sizeof(stream_renderer_param_host_visible_memory_mask) == 16,
-              "stream_renderer_param_host_visible_memory_mask must be 16 bytes");
-static_assert(offsetof(stream_renderer_param_host_visible_memory_mask, entries) == 0,
-              "stream_renderer_param_host_visible_memory_mask.entries must be at offset 0");
-static_assert(offsetof(stream_renderer_param_host_visible_memory_mask, num_entries) == 8,
-              "stream_renderer_param_host_visible_memory_mask.num_entries must be at offset 8");
 
 // Enables the host to control which GPU is used for rendering.
 #define STREAM_RENDERER_PARAM_RENDERING_GPU 9
@@ -274,12 +243,6 @@ struct stream_renderer_param {
     uint64_t value;
 };
 
-static_assert(sizeof(stream_renderer_param) == 16, "stream_renderer_param must be 16 bytes");
-static_assert(offsetof(stream_renderer_param, key) == 0,
-              "stream_renderer_param.key must be at offset 0");
-static_assert(offsetof(stream_renderer_param, value) == 8,
-              "stream_renderer_param.value must be at offset 8");
-
 // Entry point for the stream renderer.
 // Pass a list of parameters to configure the renderer. The available ones are listed above. If a
 // parameter is not supported, the renderer will ignore it and warn in stderr.
@@ -287,51 +250,12 @@ static_assert(offsetof(stream_renderer_param, value) == 8,
 VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer_params,
                                    uint64_t num_params);
 
-struct gfxstream_callbacks {
-    /* Metrics callbacks */
-    void (*add_instant_event)(int64_t event_code);
-    void (*add_instant_event_with_descriptor)(int64_t event_code, int64_t descriptor);
-    void (*add_instant_event_with_metric)(int64_t event_code, int64_t metric_value);
-    void (*add_vulkan_out_of_memory_event)(int64_t result_code, uint32_t op_code,
-                                           const char* function, uint32_t line,
-                                           uint64_t allocation_size, bool is_host_side_result,
-                                           bool is_allocation);
-    void (*set_annotation)(const char* key, const char* value);
-    void (*abort)();
-};
-
-// Deprecated, use stream_renderer_init instead.
-VG_EXPORT void gfxstream_backend_init(uint32_t display_width, uint32_t display_height,
-                                      uint32_t display_type, void* renderer_cookie,
-                                      int renderer_flags,
-                                      struct virgl_renderer_callbacks* virglrenderer_callbacks,
-                                      struct gfxstream_callbacks* gfxstreamcallbacks);
-
 VG_EXPORT void gfxstream_backend_setup_window(void* native_window_handle, int32_t window_x,
                                               int32_t window_y, int32_t window_width,
                                               int32_t window_height, int32_t fb_width,
                                               int32_t fb_height);
 
 VG_EXPORT void gfxstream_backend_teardown(void);
-
-// Get the gfxstream backend render information.
-// example:
-//      /* Get the render string size */
-//      size_t size = 0
-//      gfxstream_backend_getrender(nullptr, 0, &size);
-//
-//      /* add extra space for '\0' */
-//      char * buf = malloc(size + 1);
-//
-//      /* Get the result render string */
-//      gfxstream_backend_getrender(buf, size+1, nullptr);
-//
-// if bufSize is less or equal the render string length, only bufSize-1 char copied.
-VG_EXPORT void gfxstream_backend_getrender(char* buf, size_t bufSize, size_t* size);
-
-// A customization point that allows the downstream to call their own functions when
-// gfxstream_backend_init is called.
-void gfxstream_backend_init_product_override();
 
 #else
 
