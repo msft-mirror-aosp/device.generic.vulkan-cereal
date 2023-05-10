@@ -46,11 +46,13 @@
 
 #include <unordered_map>
 
+namespace gfxstream {
+
 using android::base::AutoLock;
 using android::base::EventHangMetadata;
 using android::base::MessageChannel;
-
-namespace emugl {
+using emugl::GfxApiLogger;
+using vk::VkDecoderContext;
 
 struct RenderThread::SnapshotObjects {
     RenderThreadInfo* threadInfo;
@@ -292,9 +294,11 @@ intptr_t RenderThread::main() {
     // Framebuffer initialization is asynchronous, so we need to make sure
     // it's completely initialized before running any GL commands.
     FrameBuffer::waitUntilInitialized();
-    if (goldfish_vk::getGlobalVkEmulation()) {
+    if (vk::getGlobalVkEmulation()) {
         tInfo.m_vkInfo.emplace();
     }
+
+    tInfo.m_magmaInfo.emplace();
 
     // This is the only place where we try loading from snapshot.
     // But the context bind / restoration will be delayed after receiving
@@ -419,13 +423,17 @@ intptr_t RenderThread::main() {
         do {
             std::unique_ptr<EventHangMetadata::HangAnnotations> renderThreadData =
                 std::make_unique<EventHangMetadata::HangAnnotations>();
+
             const char* processName = nullptr;
+            if (tInfo.m_processName) {
+                processName = tInfo.m_processName.value().c_str();
+            }
+
             auto* healthMonitor = FrameBuffer::getFB()->getHealthMonitor();
             if (healthMonitor) {
-                if (tInfo.m_processName) {
+                if (processName) {
                     renderThreadData->insert(
-                        {{"renderthread_guest_process", tInfo.m_processName.value()}});
-                    processName = tInfo.m_processName.value().c_str();
+                        {{"renderthread_guest_process", processName}});
                 }
                 if (readBuf.validData() >= 4) {
                     renderThreadData->insert(
@@ -531,6 +539,20 @@ intptr_t RenderThread::main() {
                 }
             }
 
+            //
+            // try to process some of the command buffer using the Magma
+            // decoder
+            //
+            if (tInfo.m_magmaInfo && tInfo.m_magmaInfo->m_magmaDec)
+            {
+                last = tInfo.m_magmaInfo->m_magmaDec->decode(readBuf.buf(), readBuf.validData(),
+                                            ioStream, &checksumCalc);
+                if (last > 0) {
+                    readBuf.consume(last);
+                    progress = true;
+                }
+            }
+
             if (mRunInLimitedMode) {
                 sThreadRunLimiter.unlock();
             }
@@ -552,4 +574,4 @@ intptr_t RenderThread::main() {
     return 0;
 }
 
-}  // namespace emugl
+}  // namespace gfxstream

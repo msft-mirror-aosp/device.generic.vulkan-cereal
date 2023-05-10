@@ -2586,14 +2586,6 @@ class VkDecoderSnapshot {
                                      uint32_t attachmentCount, const VkBool32* pColorWriteEnables);
 #endif
 #ifdef VK_GOOGLE_gfxstream
-    void vkRegisterImageColorBufferGOOGLE(const uint8_t* snapshotTraceBegin,
-                                          size_t snapshotTraceBytes, android::base::BumpPool* pool,
-                                          VkResult input_result, VkDevice device, VkImage image,
-                                          uint32_t colorBuffer);
-    void vkRegisterBufferColorBufferGOOGLE(const uint8_t* snapshotTraceBegin,
-                                           size_t snapshotTraceBytes, android::base::BumpPool* pool,
-                                           VkResult input_result, VkDevice device, VkBuffer buffer,
-                                           uint32_t colorBuffer);
     void vkMapMemoryIntoAddressSpaceGOOGLE(const uint8_t* snapshotTraceBegin,
                                            size_t snapshotTraceBytes, android::base::BumpPool* pool,
                                            VkResult input_result, VkDevice device,
@@ -2690,6 +2682,9 @@ class VkDecoderSnapshot {
                                                  VkCommandBuffer commandBuffer,
                                                  VkDeviceMemory deviceMemory,
                                                  VkDeviceSize dataOffset, VkDeviceSize dataSize);
+    void vkGetBlobGOOGLE(const uint8_t* snapshotTraceBegin, size_t snapshotTraceBytes,
+                         android::base::BumpPool* pool, VkResult input_result, VkDevice device,
+                         VkDeviceMemory memory);
 #endif
 #ifdef VK_EXT_global_priority_query
 #endif

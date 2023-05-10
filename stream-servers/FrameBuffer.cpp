@@ -56,6 +56,8 @@
 #include "vulkan/VkCommonOperations.h"
 #include "vulkan/VkDecoderGlobalState.h"
 
+namespace gfxstream {
+
 using android::base::AutoLock;
 using android::base::ManagedDescriptor;
 using android::base::MetricEventVulkanOutOfMemory;
@@ -65,19 +67,31 @@ using emugl::ABORT_REASON_OTHER;
 using emugl::CreateHealthMonitor;
 using emugl::FatalError;
 using emugl::GfxApiLogger;
-using gfxstream::EmulatedEglContext;
-using gfxstream::EmulatedEglContextMap;
-using gfxstream::EmulatedEglContextPtr;
-using gfxstream::EmulatedEglFenceSync;
-using gfxstream::EmulatedEglWindowSurface;
-using gfxstream::EmulatedEglWindowSurfaceMap;
-using gfxstream::EmulatedEglWindowSurfacePtr;
-using gfxstream::GLESApi;
-using gfxstream::GLESApi_CM;
-using gfxstream::GLESApi_2;
-using gfxstream::ReadbackWorker;
-using goldfish_vk::VkEmulationFeatures;
-using goldfish_vk::AstcEmulationMode;
+using gl::DisplaySurfaceGl;
+using gl::EmulatedEglConfig;
+using gl::EmulatedEglConfigList;
+using gl::EmulatedEglContext;
+using gl::EmulatedEglContextMap;
+using gl::EmulatedEglContextPtr;
+using gl::EmulatedEglFenceSync;
+using gl::EmulatedEglWindowSurface;
+using gl::EmulatedEglWindowSurfaceMap;
+using gl::EmulatedEglWindowSurfacePtr;
+using gl::EmulationGl;
+using gl::GLES_DISPATCH_MAX_VERSION_2;
+using gl::GLESApi;
+using gl::GLESApi_2;
+using gl::GLESApi_CM;
+using gl::GLESDispatchMaxVersion;
+using gl::RenderThreadInfoGl;
+using gl::s_egl;
+using gl::s_gles2;
+using gl::TextureDraw;
+using gl::YUVConverter;
+using gl::YUVPlane;
+
+using vk::AstcEmulationMode;
+using vk::VkEmulationFeatures;
 
 // static std::string getTimeStampString() {
 //     const time_t timestamp = android::base::getUnixTimeUs();
@@ -223,11 +237,11 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow, bool egl2
     // used by underlying EGL driver might become invalid,
     // preventing new contexts from being created that share
     // against those contexts.
-    goldfish_vk::VkEmulation* vkEmu = nullptr;
-    goldfish_vk::VulkanDispatch* vkDispatch = nullptr;
+    vk::VkEmulation* vkEmu = nullptr;
+    vk::VulkanDispatch* vkDispatch = nullptr;
     if (feature_is_enabled(kFeature_Vulkan)) {
-        vkDispatch = emugl::vkDispatch(false /* not for testing */);
-        vkEmu = goldfish_vk::createGlobalVkEmulation(vkDispatch);
+        vkDispatch = vk::vkDispatch(false /* not for testing */);
+        vkEmu = vk::createGlobalVkEmulation(vkDispatch);
         if (!vkEmu) {
             ERR("Failed to initialize global Vulkan emulation. Disable the Vulkan support.");
         }
@@ -248,18 +262,9 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow, bool egl2
         }
     }
 
-    // Use ANGLE's EGL null backend to prevent from accidentally calling into EGL.
-    if (s_egl.eglUseOsEglApi) {
-        EGLBoolean useNullBackend = EGL_FALSE;
-        if (egl2egl && feature_is_enabled(kFeature_VulkanNativeSwapchain)) {
-            useNullBackend = EGL_TRUE;
-        }
-        s_egl.eglUseOsEglApi(egl2egl, useNullBackend);
-    }
-
     // Do not initialize GL emulation if the guest is using ANGLE.
     if (!feature_is_enabled(kFeature_GuestUsesAngle)) {
-        fb->m_emulationGl = gfxstream::EmulationGl::create(width, height, useSubWindow);
+        fb->m_emulationGl = EmulationGl::create(width, height, useSubWindow, egl2egl);
         if (!fb->m_emulationGl) {
             ERR("Failed to initialize GL emulation.");
             return false;
@@ -388,8 +393,8 @@ bool FrameBuffer::initialize(int width, int height, bool useSubWindow, bool egl2
     GL_LOG("glvk interop final: %d", fb->m_vulkanInteropSupported);
     vkEmulationFeatures->glInteropSupported = fb->m_vulkanInteropSupported;
     if (feature_is_enabled(kFeature_Vulkan)) {
-        goldfish_vk::initVkEmulationFeatures(std::move(vkEmulationFeatures));
-        if (vkEmu->displayVk) {
+        vk::initVkEmulationFeatures(std::move(vkEmulationFeatures));
+        if (vkEmu && vkEmu->displayVk) {
             fb->m_displayVk = vkEmu->displayVk.get();
             fb->m_displaySurfaceUsers.push_back(fb->m_displayVk);
         }
@@ -526,7 +531,7 @@ FrameBuffer::~FrameBuffer() {
         destroySharedTrivialContext(it.second.context, it.second.surface);
     }
 
-    goldfish_vk::teardownGlobalVkEmulation();
+    vk::teardownGlobalVkEmulation();
 
     sInitialized.store(false, std::memory_order_relaxed);
 }
@@ -632,17 +637,15 @@ WorkerProcessingResult FrameBuffer::postWorkerFunc(Post& post) {
 }
 
 std::future<void> FrameBuffer::sendPostWorkerCmd(Post post) {
-    bool postOnlyOnMainThread = ::postOnlyOnMainThread();
+    bool shouldPostOnlyOnMainThread = postOnlyOnMainThread();
     bool expectedPostThreadStarted = false;
     if (m_postThreadStarted.compare_exchange_strong(expectedPostThreadStarted, true)) {
         if (m_emulationGl) {
             m_emulationGl->setUseBoundSurfaceContextForDisplay(true);
         }
 
-        m_postWorker.reset(new PostWorker(postOnlyOnMainThread,
-                                          m_compositor,
-                                          m_displayGl,
-                                          m_displayVk));
+        m_postWorker.reset(
+            new PostWorker(shouldPostOnlyOnMainThread, m_compositor, m_displayGl, m_displayVk));
         m_postThread.start();
     }
 
@@ -654,7 +657,7 @@ std::future<void> FrameBuffer::sendPostWorkerCmd(Post post) {
     // For now, this fixes a screenshot issue on macOS.
     std::future<void> res = std::async(std::launch::deferred, [] {});
     res.wait();
-    if (postOnlyOnMainThread && (PostCmd::Screenshot == post.cmd) &&
+    if (shouldPostOnlyOnMainThread && (PostCmd::Screenshot == post.cmd) &&
         emugl::get_emugl_window_operations().isRunningInUiThread()) {
         post.cb->readToBytesScaled(post.screenshot.screenwidth, post.screenshot.screenheight,
                                    post.screenshot.format, post.screenshot.type,
@@ -663,7 +666,7 @@ std::future<void> FrameBuffer::sendPostWorkerCmd(Post post) {
     } else {
         std::future<void> completeFuture =
             m_postThread.enqueue(Post(std::move(post)));
-        if (!postOnlyOnMainThread ||
+        if (!shouldPostOnlyOnMainThread ||
             (PostCmd::Screenshot == post.cmd &&
              !emugl::get_emugl_window_operations().isRunningInUiThread())) {
             res = std::move(completeFuture);
@@ -672,11 +675,8 @@ std::future<void> FrameBuffer::sendPostWorkerCmd(Post post) {
     return res;
 }
 
-void FrameBuffer::setPostCallback(
-        emugl::Renderer::OnPostCallback onPost,
-        void* onPostContext,
-        uint32_t displayId,
-        bool useBgraReadback) {
+void FrameBuffer::setPostCallback(Renderer::OnPostCallback onPost, void* onPostContext,
+                                  uint32_t displayId, bool useBgraReadback) {
     AutoLock lock(m_lock);
     if (onPost) {
         uint32_t w, h;
@@ -744,7 +744,7 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
     // Do a quick check before even taking the lock - maybe we don't need to
     // do anything here.
 
-    const bool createSubWindow = !m_subWin || deleteExisting;
+    const bool shouldCreateSubWindow = !m_subWin || deleteExisting;
 
     // On Mac, since window coordinates are Y-up and not Y-down, the
     // subwindow may not change dimensions, but because the main window
@@ -754,17 +754,17 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
     // because the functions used to resize a native window on those hosts
     // will block if the shape doesn't actually change, freezing the
     // emulator.
-    const bool moveSubWindow =
-            !createSubWindow && !(m_x == wx && m_y == wy &&
-                                  m_windowWidth == ww && m_windowHeight == wh
+    const bool shouldMoveSubWindow =
+        !shouldCreateSubWindow &&
+        !(m_x == wx && m_y == wy && m_windowWidth == ww && m_windowHeight == wh
 #if defined(__APPLE__)
-                                  && m_zRot == zRot
+          && m_zRot == zRot
 #endif
-                                );
+        );
 
     const bool redrawSubwindow =
-            createSubWindow || moveSubWindow || m_zRot != zRot || m_dpr != dpr;
-    if (!createSubWindow && !moveSubWindow && !redrawSubwindow) {
+        shouldCreateSubWindow || shouldMoveSubWindow || m_zRot != zRot || m_dpr != dpr;
+    if (!shouldCreateSubWindow && !shouldMoveSubWindow && !redrawSubwindow) {
         assert(sInitialized.load(std::memory_order_relaxed));
         GL_LOG("Exit setupSubWindow (nothing to do)");
 #if SNAPSHOT_PROFILE > 1
@@ -784,7 +784,6 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
     // blockPostWorker resolves the race condition in AEMU but we still need to
     // verify it after turning on guest ANGLE and Vulkan swapchain.
     // TODO: b/264458932
-    AutoLock mutex(m_lock);
     class ScopedPromise {
        public:
         ~ScopedPromise() { mPromise.set_value(); }
@@ -819,6 +818,7 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
     auto lockWatchdog =
         WATCHDOG_BUILDER(m_healthMonitor.get(), "Wait for the FrameBuffer global lock").build();
     auto lockWatchdogId = lockWatchdog->release();
+    AutoLock mutex(m_lock);
     if (lockWatchdogId.has_value()) {
         m_healthMonitor->stopMonitoringTask(lockWatchdogId.value());
     }
@@ -842,18 +842,18 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
         m_windowWidth = ww;
         m_windowHeight = wh;
 
-        m_subWin = ::createSubWindow(p_window, m_x, m_y, m_windowWidth,
-                                     m_windowHeight, dpr, subWindowRepaint, this,
-                                     hideWindow);
+        if (!hideWindow) {
+            m_subWin = createSubWindow(p_window, m_x, m_y, m_windowWidth, m_windowHeight, dpr,
+                                       subWindowRepaint, this, hideWindow);
+        }
         if (m_subWin) {
             m_nativeWindow = p_window;
 
 
 
             if (m_displayVk) {
-                m_displaySurface = goldfish_vk::createDisplaySurface(m_subWin,
-                                                                     m_windowWidth,
-                                                                     m_windowHeight);
+                m_displaySurface =
+                    vk::createDisplaySurface(m_subWin, m_windowWidth, m_windowHeight);
             } else if (m_emulationGl) {
                 m_displaySurface = m_emulationGl->createWindowSurface(m_windowWidth,
                                                                       m_windowHeight,
@@ -904,7 +904,7 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
     // couldn't be created
     // in the first place or the EGLSurface couldn't be created.
     if (m_subWin) {
-        if (!moveSubWindow) {
+        if (!shouldMoveSubWindow) {
             // Ensure that at least viewport parameters are properly updated.
             success = true;
         } else {
@@ -917,8 +917,8 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
 
             {
                 auto watchdog = WATCHDOG_BUILDER(m_healthMonitor.get(), "Moving subwindow").build();
-                success = ::moveSubWindow(m_nativeWindow, m_subWin, m_x, m_y, m_windowWidth,
-                                          m_windowHeight);
+                success = moveSubWindow(m_nativeWindow, m_subWin, m_x, m_y, m_windowWidth,
+                                        m_windowHeight);
             }
             m_displaySurface->updateSize(m_windowWidth, m_windowHeight);
         }
@@ -1123,8 +1123,7 @@ HandleType FrameBuffer::createBufferWithHandleLocked(int p_size, HandleType hand
             << "Buffer already exists with handle " << handle;
     }
 
-    gfxstream::BufferPtr buffer(
-        gfxstream::Buffer::create(m_emulationGl.get(), m_emulationVk, p_size, handle));
+    BufferPtr buffer(Buffer::create(m_emulationGl.get(), m_emulationVk, p_size, handle));
     if (!buffer) {
         ERR("Create buffer failed.\n");
         return 0;
@@ -1259,13 +1258,7 @@ void FrameBuffer::destroyEmulatedEglWindowSurface(HandleType p_surface) {
         return;
     }
     AutoLock mutex(m_lock);
-    auto colorBuffersToCleanup = destroyEmulatedEglWindowSurfaceLocked(p_surface);
-
-    mutex.unlock();
-
-    for (auto handle : colorBuffersToCleanup) {
-        goldfish_vk::teardownVkColorBuffer(handle);
-    }
+    destroyEmulatedEglWindowSurfaceLocked(p_surface);
 }
 
 std::vector<HandleType> FrameBuffer::destroyEmulatedEglWindowSurfaceLocked(HandleType p_surface) {
@@ -1424,12 +1417,6 @@ void FrameBuffer::drainGlRenderThreadSurfaces() {
         }
     }
     tinfo->m_windowSet.clear();
-
-    m_lock.unlock();
-
-    for (auto handle: colorBuffersToCleanup) {
-        goldfish_vk::teardownVkColorBuffer(handle);
-    }
 }
 
 int FrameBuffer::openColorBuffer(HandleType p_colorbuffer) {
@@ -1490,12 +1477,6 @@ void FrameBuffer::closeColorBuffer(HandleType p_colorbuffer) {
         if (closeColorBufferLocked(p_colorbuffer)) {
             toCleanup.push_back(p_colorbuffer);
         }
-    }
-
-    mutex.unlock();
-
-    for (auto handle : toCleanup) {
-        goldfish_vk::teardownVkColorBuffer(handle);
     }
 }
 
@@ -1654,11 +1635,8 @@ void FrameBuffer::cleanupProcGLObjects(uint64_t puid) {
 
 
     AutoLock mutex(m_lock);
-    if (!hasEmulationGl() || !getDisplay()) {
-        return;
-    }
 
-    auto colorBuffersToCleanup = cleanupProcGLObjects_locked(puid);
+    cleanupProcGLObjects_locked(puid);
 
     // Run other cleanup callbacks
     // Avoid deadlock by first storing a separate list of callbacks
@@ -1676,10 +1654,6 @@ void FrameBuffer::cleanupProcGLObjects(uint64_t puid) {
 
     mutex.unlock();
 
-    for (auto handle : colorBuffersToCleanup) {
-        goldfish_vk::teardownVkColorBuffer(handle);
-    }
-
     for (auto cb : callbacks) {
         cb();
     }
@@ -1693,7 +1667,7 @@ std::vector<HandleType> FrameBuffer::cleanupProcGLObjects_locked(uint64_t puid, 
             bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
         }
         // Clean up window surfaces
-        {
+        if (m_emulationGl) {
             auto procIte = m_procOwnedEmulatedEglWindowSurfaces.find(puid);
             if (procIte != m_procOwnedEmulatedEglWindowSurfaces.end()) {
                 for (auto whndl : procIte->second) {
@@ -1737,7 +1711,7 @@ std::vector<HandleType> FrameBuffer::cleanupProcGLObjects_locked(uint64_t puid, 
         }
 
         // Clean up EGLImage handles
-        {
+        if (m_emulationGl) {
             auto procImagesIt = m_procOwnedEmulatedEglImages.find(puid);
             if (procImagesIt != m_procOwnedEmulatedEglImages.end()) {
                 for (auto image : procImagesIt->second) {
@@ -1749,7 +1723,7 @@ std::vector<HandleType> FrameBuffer::cleanupProcGLObjects_locked(uint64_t puid, 
     }
     // Unbind before cleaning up contexts
     // Cleanup render contexts
-    {
+    if (m_emulationGl) {
         auto procIte = m_procOwnedEmulatedEglContexts.find(puid);
         if (procIte != m_procOwnedEmulatedEglContexts.end()) {
             for (auto ctx : procIte->second) {
@@ -1842,7 +1816,7 @@ bool FrameBuffer::setEmulatedEglWindowSurfaceColorBuffer(HandleType p_surface,
 void FrameBuffer::readBuffer(HandleType handle, uint64_t offset, uint64_t size, void* bytes) {
     AutoLock mutex(m_lock);
 
-    gfxstream::BufferPtr buffer = findBuffer(handle);
+    BufferPtr buffer = findBuffer(handle);
     if (!buffer) {
         ERR("Failed to read buffer: buffer %d not found.", handle);
         return;
@@ -1972,7 +1946,7 @@ void FrameBuffer::swapTexturesAndUpdateColorBuffer(uint32_t p_colorbuffer,
 bool FrameBuffer::updateBuffer(HandleType p_buffer, uint64_t offset, uint64_t size, void* bytes) {
     AutoLock mutex(m_lock);
 
-    gfxstream::BufferPtr buffer = findBuffer(p_buffer);
+    BufferPtr buffer = findBuffer(p_buffer);
     if (!buffer) {
         ERR("Failed to update buffer: buffer %d not found.", p_buffer);
         return false;
@@ -2390,8 +2364,12 @@ AsyncResult FrameBuffer::postImpl(HandleType p_colorbuffer,
                            Post::CompletionCallback callback,
                            bool needLockAndBind,
                            bool repaint) {
+    std::unique_ptr<RecursiveScopedContextBind> bind;
     if (needLockAndBind) {
         m_lock.lock();
+        if (m_emulationGl) {
+            bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
+        }
     }
     AsyncResult ret = AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
 
@@ -2487,6 +2465,7 @@ AsyncResult FrameBuffer::postImpl(HandleType p_colorbuffer,
 
 EXIT:
     if (needLockAndBind) {
+        bind.reset();
         m_lock.unlock();
     }
     return ret;
@@ -2552,12 +2531,11 @@ bool FrameBuffer::asyncReadbackSupported() {
     return m_emulationGl && m_emulationGl->isAsyncReadbackSupported();
 }
 
-emugl::Renderer::ReadPixelsCallback
-FrameBuffer::getReadPixelsCallback() {
+Renderer::ReadPixelsCallback FrameBuffer::getReadPixelsCallback() {
     return sFrameBuffer_ReadPixelsCallback;
 }
 
-emugl::Renderer::FlushReadPixelPipeline FrameBuffer::getFlushReadPixelPipeline() {
+Renderer::FlushReadPixelPipeline FrameBuffer::getFlushReadPixelPipeline() {
     return sFrameBuffer_FlushReadPixelPipeline;
 }
 
@@ -2613,7 +2591,7 @@ static void loadProcOwnedCollection(Stream* stream, Collection* c) {
 
 int FrameBuffer::getScreenshot(unsigned int nChannels, unsigned int* width, unsigned int* height,
                                uint8_t* pixels, size_t* cPixels, int displayId, int desiredWidth,
-                               int desiredHeight, int desiredRotation, emugl::Rect rect) {
+                               int desiredHeight, int desiredRotation, Rect rect) {
     AutoLock mutex(m_lock);
     uint32_t w, h, cb, screenWidth, screenHeight;
     if (!emugl::get_emugl_multi_display_operations().getMultiDisplay(displayId,
@@ -2720,8 +2698,8 @@ int FrameBuffer::getScreenshot(unsigned int nChannels, unsigned int* width, unsi
     Post scrCmd;
     scrCmd.cmd = PostCmd::Screenshot;
     scrCmd.screenshot.cb = colorBuffer.get();
-    scrCmd.screenshot.screenwidth = *width;
-    scrCmd.screenshot.screenheight = *height;
+    scrCmd.screenshot.screenwidth = screenWidth;
+    scrCmd.screenshot.screenheight = screenHeight;
     scrCmd.screenshot.format = format;
     scrCmd.screenshot.type = GL_UNSIGNED_BYTE;
     scrCmd.screenshot.rotation = desiredRotation;
@@ -2773,19 +2751,16 @@ bool FrameBuffer::compose(uint32_t bufferSize, void* buffer, bool needPost) {
     if (needPost) {
         // AEMU with -no-window mode uses this code path.
         ComposeDevice* composeDevice = (ComposeDevice*)buffer;
-        AutoLock mutex(m_lock);
 
         switch (composeDevice->version) {
             case 1: {
-                RecursiveScopedContextBind scopedBind(getPbufferSurfaceContextHelper());
-                post(composeDevice->targetHandle, false);
+                post(composeDevice->targetHandle, true);
                 break;
             }
             case 2: {
                 ComposeDevice_v2* composeDeviceV2 = (ComposeDevice_v2*)buffer;
                 if (composeDeviceV2->displayId == 0) {
-                    RecursiveScopedContextBind scopedBind(getPbufferSurfaceContextHelper());
-                    post(composeDeviceV2->targetHandle, false);
+                    post(composeDeviceV2->targetHandle, true);
                 }
                 break;
             }
@@ -2932,9 +2907,8 @@ void FrameBuffer::onSave(Stream* stream,
     saveProcOwnedCollection(stream, m_procOwnedEmulatedEglContexts);
 
     // Save Vulkan state
-    if (feature_is_enabled(kFeature_VulkanSnapshots) &&
-        goldfish_vk::VkDecoderGlobalState::get()) {
-        goldfish_vk::VkDecoderGlobalState::get()->save(stream);
+    if (feature_is_enabled(kFeature_VulkanSnapshots) && vk::VkDecoderGlobalState::get()) {
+        vk::VkDecoderGlobalState::get()->save(stream);
     }
 
     if (m_emulationGl) {
@@ -3033,10 +3007,6 @@ bool FrameBuffer::onLoad(Stream* stream,
             performDelayedColorBufferCloseLocked(true);
 
             lock.unlock();
-
-            for (auto colorBufferHandle : colorBuffersToCleanup) {
-                goldfish_vk::teardownVkColorBuffer(colorBufferHandle);
-            }
 
             for (auto cb : cleanupCallbacks) {
                 cb();
@@ -3178,14 +3148,11 @@ bool FrameBuffer::onLoad(Stream* stream,
     }
 
     // Restore Vulkan state
-    if (feature_is_enabled(kFeature_VulkanSnapshots) &&
-        goldfish_vk::VkDecoderGlobalState::get()) {
-
+    if (feature_is_enabled(kFeature_VulkanSnapshots) && vk::VkDecoderGlobalState::get()) {
         lock.unlock();
         GfxApiLogger gfxLogger;
-        goldfish_vk::VkDecoderGlobalState::get()->load(stream, gfxLogger, m_healthMonitor.get());
+        vk::VkDecoderGlobalState::get()->load(stream, gfxLogger, m_healthMonitor.get());
         lock.lock();
-
     }
 
     repost(false);
@@ -3224,7 +3191,7 @@ ColorBufferPtr FrameBuffer::findColorBuffer(HandleType p_colorbuffer) {
     }
 }
 
-gfxstream::BufferPtr FrameBuffer::findBuffer(HandleType p_buffer) {
+BufferPtr FrameBuffer::findBuffer(HandleType p_buffer) {
     AutoLock colorBufferMapLock(m_colorBufferMapLock);
     BufferMap::iterator b(m_buffers.find(p_buffer));
     if (b == m_buffers.end()) {
@@ -3316,12 +3283,7 @@ int FrameBuffer::setDisplayPose(uint32_t displayId,
 void FrameBuffer::sweepColorBuffersLocked() {
     HandleType handleToDestroy;
     while (mOutstandingColorBufferDestroys.tryReceive(&handleToDestroy)) {
-        bool needCleanup = decColorBufferRefCountLocked(handleToDestroy);
-        if (needCleanup) {
-            m_lock.unlock();
-            goldfish_vk::teardownVkColorBuffer(handleToDestroy);
-            m_lock.lock();
-        }
+        decColorBufferRefCountLocked(handleToDestroy);
     }
 }
 
@@ -3494,7 +3456,7 @@ std::unique_ptr<BorrowedImageInfo> FrameBuffer::borrowColorBufferForDisplay(
     return colorBufferPtr->borrowForDisplay(api);
 }
 
-gfxstream::EmulationGl& FrameBuffer::getEmulationGl() {
+EmulationGl& FrameBuffer::getEmulationGl() {
     if (!m_emulationGl) {
         GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
             << "GL/EGL emulation not enabled.";
@@ -3697,11 +3659,6 @@ const int FrameBuffer::getDisplayActiveConfig() {
 }
 
 bool FrameBuffer::flushColorBufferFromGl(HandleType colorBufferHandle) {
-    AutoLock mutex(m_lock);
-    return flushColorBufferFromGlLocked(colorBufferHandle);
-}
-
-bool FrameBuffer::flushColorBufferFromGlLocked(HandleType colorBufferHandle) {
     auto colorBuffer = findColorBuffer(colorBufferHandle);
     if (!colorBuffer) {
         ERR("Failed to find ColorBuffer:%d", colorBufferHandle);
@@ -3711,8 +3668,6 @@ bool FrameBuffer::flushColorBufferFromGlLocked(HandleType colorBufferHandle) {
 }
 
 bool FrameBuffer::flushColorBufferFromVk(HandleType colorBufferHandle) {
-    AutoLock mutex(m_lock);
-
     auto colorBuffer = findColorBuffer(colorBufferHandle);
     if (!colorBuffer) {
         ERR("Failed to find ColorBuffer:%d", colorBufferHandle);
@@ -3722,8 +3677,6 @@ bool FrameBuffer::flushColorBufferFromVk(HandleType colorBufferHandle) {
 }
 
 bool FrameBuffer::flushColorBufferFromVkBytes(HandleType colorBufferHandle, const void* bytes, size_t bytesSize) {
-    AutoLock mutex(m_lock);
-
     auto colorBuffer = findColorBuffer(colorBufferHandle);
     if (!colorBuffer) {
         ERR("Failed to find ColorBuffer:%d", colorBufferHandle);
@@ -3733,8 +3686,6 @@ bool FrameBuffer::flushColorBufferFromVkBytes(HandleType colorBufferHandle, cons
 }
 
 bool FrameBuffer::invalidateColorBufferForGl(HandleType colorBufferHandle) {
-    AutoLock mutex(m_lock);
-
     auto colorBuffer = findColorBuffer(colorBufferHandle);
     if (!colorBuffer) {
         ERR("Failed to find ColorBuffer:%d", colorBufferHandle);
@@ -3744,8 +3695,6 @@ bool FrameBuffer::invalidateColorBufferForGl(HandleType colorBufferHandle) {
 }
 
 bool FrameBuffer::invalidateColorBufferForVk(HandleType colorBufferHandle) {
-    AutoLock mutex(m_lock);
-
     auto colorBuffer = findColorBuffer(colorBufferHandle);
     if (!colorBuffer) {
         ERR("Failed to find ColorBuffer:%d", colorBufferHandle);
@@ -3753,3 +3702,23 @@ bool FrameBuffer::invalidateColorBufferForVk(HandleType colorBufferHandle) {
     }
     return colorBuffer->invalidateForVk();
 }
+
+const gl::EGLDispatch* FrameBuffer::getEglDispatch() {
+    if (!m_emulationGl) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+            << "EGL emulation not enabled.";
+    }
+
+    return m_emulationGl->getEglDispatch();
+}
+
+const gl::GLESv2Dispatch* FrameBuffer::getGles2Dispatch() {
+    if (!m_emulationGl) {
+        GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER))
+            << "EGL emulation not enabled.";
+    }
+
+    return m_emulationGl->getGles2Dispatch();
+}
+
+}  // namespace gfxstream

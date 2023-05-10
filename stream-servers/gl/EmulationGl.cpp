@@ -24,6 +24,7 @@
 #include "OpenGLESDispatch/DispatchTables.h"
 #include "OpenGLESDispatch/EGLDispatch.h"
 #include "OpenGLESDispatch/GLESv2Dispatch.h"
+#include "OpenGLESDispatch/OpenGLDispatchLoader.h"
 #include "RenderThreadInfoGl.h"
 #include "aemu/base/misc/StringUtils.h"
 #include "host-common/GfxstreamFatalError.h"
@@ -32,6 +33,7 @@
 #include "host-common/opengl/misc.h"
 
 namespace gfxstream {
+namespace gl {
 namespace {
 
 static void EGLAPIENTRY EglDebugCallback(EGLenum error,
@@ -202,7 +204,25 @@ static std::optional<EGLConfig> getEmulationEglConfig(EGLDisplay display, bool a
 }  // namespace
 
 std::unique_ptr<EmulationGl> EmulationGl::create(uint32_t width, uint32_t height,
-                                                 bool allowWindowSurface) {
+                                                 bool allowWindowSurface, bool egl2egl) {
+    // Loads the glestranslator function pointers.
+    if (!LazyLoadedEGLDispatch::get()) {
+        ERR("Failed to load EGL dispatch.");
+        return nullptr;
+    }
+    if (!LazyLoadedGLESv1Dispatch::get()) {
+        ERR("Failed to load GLESv1 dispatch.");
+        return nullptr;
+    }
+    if (!LazyLoadedGLESv2Dispatch::get()) {
+        ERR("Failed to load GLESv2 dispatch.");
+        return nullptr;
+    }
+
+    if (s_egl.eglUseOsEglApi) {
+        s_egl.eglUseOsEglApi(egl2egl, EGL_FALSE);
+    }
+
     std::unique_ptr<EmulationGl> emulationGl(new EmulationGl());
 
     emulationGl->mEglDisplay = s_egl.eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -528,6 +548,14 @@ EmulationGl::~EmulationGl() {
     }
 }
 
+const EGLDispatch* EmulationGl::getEglDispatch() {
+    return &s_egl;
+}
+
+const GLESv2Dispatch* EmulationGl::getGles2Dispatch() {
+    return &s_gles2;
+}
+
 GLESDispatchMaxVersion EmulationGl::getGlesMaxDispatchVersion() const {
     return mGlesDispatchMaxVersion;
 }
@@ -700,4 +728,5 @@ std::unique_ptr<EmulatedEglWindowSurface> EmulationGl::loadEmulatedEglWindowSurf
     return EmulatedEglWindowSurface::onLoad(stream, mEglDisplay, colorBuffers, contexts);
 }
 
+}  // namespace gl
 }  // namespace gfxstream

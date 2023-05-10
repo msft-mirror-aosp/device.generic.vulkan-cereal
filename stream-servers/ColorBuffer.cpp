@@ -24,6 +24,7 @@ using android::base::ManagedDescriptor;
 using emugl::ABORT_REASON_OTHER;
 using emugl::FatalError;
 
+namespace gfxstream {
 namespace {
 
 // ColorBufferVk natively supports YUV images. However, ColorBufferGl
@@ -32,9 +33,7 @@ namespace {
 // memory should not be shared between the VK YUV image and the GL RGBA
 // texture.
 bool shouldAttemptExternalMemorySharing(FrameworkFormat format) {
-    // TODO(b/271030190): this doesn't work on certain Intel GPU
-    //return format == FrameworkFormat::FRAMEWORK_FORMAT_GL_COMPATIBLE;
-    return false;
+    return format == FrameworkFormat::FRAMEWORK_FORMAT_GL_COMPATIBLE;
 }
 
 }  // namespace
@@ -48,9 +47,9 @@ ColorBuffer::ColorBuffer(HandleType handle, uint32_t width, uint32_t height, GLe
       mFrameworkFormat(frameworkFormat) {}
 
 /*static*/
-std::shared_ptr<ColorBuffer> ColorBuffer::create(gfxstream::EmulationGl* emulationGl,
-                                                 goldfish_vk::VkEmulation* emulationVk,
-                                                 uint32_t width, uint32_t height, GLenum format,
+std::shared_ptr<ColorBuffer> ColorBuffer::create(gl::EmulationGl* emulationGl,
+                                                 vk::VkEmulation* emulationVk, uint32_t width,
+                                                 uint32_t height, GLenum format,
                                                  FrameworkFormat frameworkFormat,
                                                  HandleType handle) {
     std::shared_ptr<ColorBuffer> colorBuffer(
@@ -69,8 +68,8 @@ std::shared_ptr<ColorBuffer> ColorBuffer::create(gfxstream::EmulationGl* emulati
         const bool vulkanOnly = colorBuffer->mColorBufferGl == nullptr;
 
         colorBuffer->mColorBufferVk =
-            gfxstream::ColorBufferVk::create(handle, width, height, format, frameworkFormat,
-                                             vulkanOnly, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            vk::ColorBufferVk::create(handle, width, height, format, frameworkFormat, vulkanOnly,
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (!colorBuffer->mColorBufferVk) {
             if (emulationGl) {
                 // Historically, ColorBufferVk setup was deferred until the first actual Vulkan
@@ -82,9 +81,11 @@ std::shared_ptr<ColorBuffer> ColorBuffer::create(gfxstream::EmulationGl* emulati
         }
     }
 
+    bool b271028352Workaround = emulationGl && strstr(emulationGl->getGlesRenderer().c_str(), "Intel");
+
     if (colorBuffer->mColorBufferGl && colorBuffer->mColorBufferVk &&
-        shouldAttemptExternalMemorySharing(frameworkFormat)) {
-        auto memoryExport = goldfish_vk::exportColorBufferMemory(handle);
+        !b271028352Workaround && shouldAttemptExternalMemorySharing(frameworkFormat)) {
+        auto memoryExport = vk::exportColorBufferMemory(handle);
         if (memoryExport) {
             if (colorBuffer->mColorBufferGl->importMemory(
                     std::move(memoryExport->descriptor), memoryExport->size,
@@ -101,8 +102,7 @@ std::shared_ptr<ColorBuffer> ColorBuffer::create(gfxstream::EmulationGl* emulati
 }
 
 /*static*/
-std::shared_ptr<ColorBuffer> ColorBuffer::onLoad(gfxstream::EmulationGl* emulationGl,
-                                                 goldfish_vk::VkEmulation*,
+std::shared_ptr<ColorBuffer> ColorBuffer::onLoad(gl::EmulationGl* emulationGl, vk::VkEmulation*,
                                                  android::base::Stream* stream) {
     const auto handle = static_cast<HandleType>(stream->getBe32());
     const auto width = static_cast<uint32_t>(stream->getBe32());
@@ -161,7 +161,7 @@ void ColorBuffer::readToBytes(int x, int y, int width, int height, GLenum pixels
 }
 
 void ColorBuffer::readToBytesScaled(int pixelsWidth, int pixelsHeight, GLenum pixelsFormat,
-                                    GLenum pixelsType, int pixelsRotation, emugl::Rect rect,
+                                    GLenum pixelsType, int pixelsRotation, Rect rect,
                                     void* outPixels) {
     touch();
 
@@ -245,7 +245,7 @@ std::unique_ptr<BorrowedImageInfo> ColorBuffer::borrowForComposition(UsedApi api
             if (!mColorBufferVk) {
                 GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "ColorBufferGl not available.";
             }
-            return goldfish_vk::borrowColorBufferForComposition(getHndl(), isTarget);
+            return vk::borrowColorBufferForComposition(getHndl(), isTarget);
         }
     }
     GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "Unimplemented";
@@ -264,7 +264,7 @@ std::unique_ptr<BorrowedImageInfo> ColorBuffer::borrowForDisplay(UsedApi api) {
             if (!mColorBufferVk) {
                 GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "ColorBufferGl not available.";
             }
-            return goldfish_vk::borrowColorBufferForDisplay(getHndl());
+            return vk::borrowColorBufferForDisplay(getHndl());
         }
     }
     GFXSTREAM_ABORT(FatalError(ABORT_REASON_OTHER)) << "Unimplemented";
@@ -295,7 +295,7 @@ bool ColorBuffer::flushFromVk() {
     }
 
     std::vector<uint8_t> contents;
-    if (!goldfish_vk::readColorBufferToBytes(mHandle, &contents)) {
+    if (!vk::readColorBufferToBytes(mHandle, &contents)) {
         ERR("Failed to get VK contents for ColorBuffer:%d", mHandle);
         return false;
     }
@@ -322,7 +322,7 @@ bool ColorBuffer::flushFromVkBytes(const void* bytes, size_t bytesSize) {
     }
 
     if (mColorBufferGl) {
-        if (mColorBufferGl->replaceContents(bytes, bytesSize)) {
+        if (!mColorBufferGl->replaceContents(bytes, bytesSize)) {
             ERR("Failed to update ColorBuffer:%d GL backing from VK bytes.", mHandle);
             return false;
         }
@@ -505,3 +505,5 @@ void ColorBuffer::glOpPostViewportScaledWithOverlay(float rotation, float dx, fl
 
     mColorBufferGl->postViewportScaledWithOverlay(rotation, dx, dy);
 }
+
+}  // namespace gfxstream
