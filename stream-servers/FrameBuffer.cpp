@@ -1258,13 +1258,7 @@ void FrameBuffer::destroyEmulatedEglWindowSurface(HandleType p_surface) {
         return;
     }
     AutoLock mutex(m_lock);
-    auto colorBuffersToCleanup = destroyEmulatedEglWindowSurfaceLocked(p_surface);
-
-    mutex.unlock();
-
-    for (auto handle : colorBuffersToCleanup) {
-        vk::teardownVkColorBuffer(handle);
-    }
+    destroyEmulatedEglWindowSurfaceLocked(p_surface);
 }
 
 std::vector<HandleType> FrameBuffer::destroyEmulatedEglWindowSurfaceLocked(HandleType p_surface) {
@@ -1423,12 +1417,6 @@ void FrameBuffer::drainGlRenderThreadSurfaces() {
         }
     }
     tinfo->m_windowSet.clear();
-
-    m_lock.unlock();
-
-    for (auto handle: colorBuffersToCleanup) {
-        vk::teardownVkColorBuffer(handle);
-    }
 }
 
 int FrameBuffer::openColorBuffer(HandleType p_colorbuffer) {
@@ -1489,12 +1477,6 @@ void FrameBuffer::closeColorBuffer(HandleType p_colorbuffer) {
         if (closeColorBufferLocked(p_colorbuffer)) {
             toCleanup.push_back(p_colorbuffer);
         }
-    }
-
-    mutex.unlock();
-
-    for (auto handle : toCleanup) {
-        vk::teardownVkColorBuffer(handle);
     }
 }
 
@@ -1653,11 +1635,8 @@ void FrameBuffer::cleanupProcGLObjects(uint64_t puid) {
 
 
     AutoLock mutex(m_lock);
-    if (!hasEmulationGl() || !getDisplay()) {
-        return;
-    }
 
-    auto colorBuffersToCleanup = cleanupProcGLObjects_locked(puid);
+    cleanupProcGLObjects_locked(puid);
 
     // Run other cleanup callbacks
     // Avoid deadlock by first storing a separate list of callbacks
@@ -1675,10 +1654,6 @@ void FrameBuffer::cleanupProcGLObjects(uint64_t puid) {
 
     mutex.unlock();
 
-    for (auto handle : colorBuffersToCleanup) {
-        vk::teardownVkColorBuffer(handle);
-    }
-
     for (auto cb : callbacks) {
         cb();
     }
@@ -1692,7 +1667,7 @@ std::vector<HandleType> FrameBuffer::cleanupProcGLObjects_locked(uint64_t puid, 
             bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
         }
         // Clean up window surfaces
-        {
+        if (m_emulationGl) {
             auto procIte = m_procOwnedEmulatedEglWindowSurfaces.find(puid);
             if (procIte != m_procOwnedEmulatedEglWindowSurfaces.end()) {
                 for (auto whndl : procIte->second) {
@@ -1736,7 +1711,7 @@ std::vector<HandleType> FrameBuffer::cleanupProcGLObjects_locked(uint64_t puid, 
         }
 
         // Clean up EGLImage handles
-        {
+        if (m_emulationGl) {
             auto procImagesIt = m_procOwnedEmulatedEglImages.find(puid);
             if (procImagesIt != m_procOwnedEmulatedEglImages.end()) {
                 for (auto image : procImagesIt->second) {
@@ -1748,7 +1723,7 @@ std::vector<HandleType> FrameBuffer::cleanupProcGLObjects_locked(uint64_t puid, 
     }
     // Unbind before cleaning up contexts
     // Cleanup render contexts
-    {
+    if (m_emulationGl) {
         auto procIte = m_procOwnedEmulatedEglContexts.find(puid);
         if (procIte != m_procOwnedEmulatedEglContexts.end()) {
             for (auto ctx : procIte->second) {
@@ -2723,8 +2698,8 @@ int FrameBuffer::getScreenshot(unsigned int nChannels, unsigned int* width, unsi
     Post scrCmd;
     scrCmd.cmd = PostCmd::Screenshot;
     scrCmd.screenshot.cb = colorBuffer.get();
-    scrCmd.screenshot.screenwidth = *width;
-    scrCmd.screenshot.screenheight = *height;
+    scrCmd.screenshot.screenwidth = screenWidth;
+    scrCmd.screenshot.screenheight = screenHeight;
     scrCmd.screenshot.format = format;
     scrCmd.screenshot.type = GL_UNSIGNED_BYTE;
     scrCmd.screenshot.rotation = desiredRotation;
@@ -3033,10 +3008,6 @@ bool FrameBuffer::onLoad(Stream* stream,
 
             lock.unlock();
 
-            for (auto colorBufferHandle : colorBuffersToCleanup) {
-                vk::teardownVkColorBuffer(colorBufferHandle);
-            }
-
             for (auto cb : cleanupCallbacks) {
                 cb();
             }
@@ -3312,12 +3283,7 @@ int FrameBuffer::setDisplayPose(uint32_t displayId,
 void FrameBuffer::sweepColorBuffersLocked() {
     HandleType handleToDestroy;
     while (mOutstandingColorBufferDestroys.tryReceive(&handleToDestroy)) {
-        bool needCleanup = decColorBufferRefCountLocked(handleToDestroy);
-        if (needCleanup) {
-            m_lock.unlock();
-            vk::teardownVkColorBuffer(handleToDestroy);
-            m_lock.lock();
-        }
+        decColorBufferRefCountLocked(handleToDestroy);
     }
 }
 
