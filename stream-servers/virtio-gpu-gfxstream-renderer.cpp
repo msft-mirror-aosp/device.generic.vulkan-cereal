@@ -17,6 +17,7 @@
 #include <type_traits>
 #include <unordered_map>
 
+#include "BlobManager.h"
 #include "FrameBuffer.h"
 #include "GfxStreamAgents.h"
 #include "VirtioGpuTimelines.h"
@@ -29,7 +30,6 @@
 #include "aemu/base/synchronization/Lock.h"
 #include "host-common/AddressSpaceService.h"
 #include "host-common/GfxstreamFatalError.h"
-#include "host-common/HostmemIdMapping.h"
 #include "host-common/address_space_device.h"
 #include "host-common/android_pipe_common.h"
 #include "host-common/android_pipe_device.h"
@@ -163,10 +163,10 @@ using android::base::ManagedDescriptor;
 using android::base::MetricsLogger;
 using android::base::SharedMemory;
 
-using android::emulation::HostmemIdMapping;
-using android::emulation::ManagedDescriptorInfo;
 using emugl::ABORT_REASON_OTHER;
 using emugl::FatalError;
+using gfxstream::BlobManager;
+using gfxstream::ManagedDescriptorInfo;
 
 using VirtioGpuResId = uint32_t;
 
@@ -774,6 +774,15 @@ class PipeVirglRenderer {
             }
             case GFXSTREAM_CREATE_EXPORT_SYNC_VK:
             case GFXSTREAM_CREATE_IMPORT_SYNC_VK: {
+                // The guest sync export assumes fence context support and always uses
+                // VIRTGPU_EXECBUF_RING_IDX. With this, the task created here must use
+                // the same ring as the fence created for the virtio gpu command or the
+                // fence may be signaled without properly waiting for the task to complete.
+                ring = VirtioGpuRingContextSpecific{
+                    .mCtxId = ctxId,
+                    .mRingIdx = 0,
+                };
+
                 DECODE(exportSyncVK, gfxstream::gfxstreamCreateExportSyncVK, buffer)
 
                 uint64_t device_handle =
@@ -856,7 +865,7 @@ class PipeVirglRenderer {
         if (!callback) {
             return -EINVAL;
         }
-        mVirtioGpuTimelines->enqueueFence(ring, fence_id, callback);
+        mVirtioGpuTimelines->enqueueFence(ring, fence_id, std::move(callback));
 
         return 0;
     }
@@ -1307,6 +1316,15 @@ class PipeVirglRenderer {
             if (vk_emu && vk_emu->live && vk_emu->representativeColorBufferMemoryTypeIndex) {
                 capset->colorBufferMemoryIndex = *vk_emu->representativeColorBufferMemoryTypeIndex;
             }
+
+            if (vk_emu && vk_emu->live) {
+                capset->deferredMapping = 1;
+#if defined(__APPLE__) && defined(__arm64__)
+		capset->blobAlignment = 16384;
+#else
+		capset->blobAlignment = 4096;
+#endif
+            }
         }
     }
 
@@ -1467,9 +1485,9 @@ class PipeVirglRenderer {
                 (create_blob->blob_flags & STREAM_BLOB_FLAG_CREATE_GUEST_HANDLE)) {
 #if defined(__linux__) || defined(__QNX__)
                 ManagedDescriptor managedHandle(handle->os_handle);
-                HostmemIdMapping::get()->addDescriptorInfo(create_blob->blob_id,
-                                                           std::move(managedHandle),
-                                                           handle->handle_type, 0, std::nullopt);
+                BlobManager::get()->addDescriptorInfo(ctx_id, create_blob->blob_id,
+                                                      std::move(managedHandle), handle->handle_type,
+                                                      0, std::nullopt);
 
                 e.caching = STREAM_RENDERER_MAP_CACHE_CACHED;
 #else
@@ -1477,7 +1495,7 @@ class PipeVirglRenderer {
 #endif
             } else {
                 auto descriptorInfoOpt =
-                    HostmemIdMapping::get()->removeDescriptorInfo(create_blob->blob_id);
+                    BlobManager::get()->removeDescriptorInfo(ctx_id, create_blob->blob_id);
                 if (descriptorInfoOpt) {
                     e.descriptorInfo =
                         std::make_shared<ManagedDescriptorInfo>(std::move(*descriptorInfoOpt));
@@ -1488,11 +1506,14 @@ class PipeVirglRenderer {
                 e.caching = e.descriptorInfo->caching;
             }
         } else {
-            auto entry = HostmemIdMapping::get()->get(create_blob->blob_id);
-            e.hva = entry.hva;
-            e.hvaSize = entry.size;
-            e.args.width = entry.size;
-            e.caching = entry.caching;
+            auto entryOpt = BlobManager::get()->removeMapping(ctx_id, create_blob->blob_id);
+            if (entryOpt) {
+                e.hva = entryOpt->addr;
+                e.caching = entryOpt->caching;
+                e.hvaSize = create_blob->size;
+            } else {
+                return -EINVAL;
+            }
         }
 
         e.blobId = create_blob->blob_id;

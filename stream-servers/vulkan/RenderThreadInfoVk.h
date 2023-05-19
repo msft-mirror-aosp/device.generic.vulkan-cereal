@@ -23,6 +23,18 @@ namespace gfxstream {
 namespace vk {
 
 struct RenderThreadInfoVk {
+    // Create new instance. Only call this once per thread.
+    // Future calls to get() will return this instance until
+    // it is destroyed.
+    RenderThreadInfoVk();
+
+    // Destructor.
+    ~RenderThreadInfoVk();
+
+    // Return the current thread's instance, if any, or NULL.
+    static RenderThreadInfoVk* get();
+
+    uint32_t ctx_id;
     VkDecoder m_vkDec;
 };
 

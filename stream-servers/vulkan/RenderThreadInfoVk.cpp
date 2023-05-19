@@ -12,25 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "RenderThreadInfoMagma.h"
+#include "RenderThreadInfoVk.h"
 
 #include "host-common/GfxstreamFatalError.h"
 
-static thread_local RenderThreadInfoMagma* tlThreadInfo = nullptr;
+namespace gfxstream {
+namespace vk {
 
-RenderThreadInfoMagma::RenderThreadInfoMagma(uint32_t context_id) {
+static thread_local RenderThreadInfoVk* tlThreadInfo = nullptr;
+
+RenderThreadInfoVk::RenderThreadInfoVk() {
     if (tlThreadInfo != nullptr) {
-      GFXSTREAM_ABORT(emugl::FatalError(emugl::ABORT_REASON_OTHER))
-        << "Attempted to set thread local Magma render thread info twice.";
+        GFXSTREAM_ABORT(emugl::FatalError(emugl::ABORT_REASON_OTHER))
+            << "Attempted to set thread local Vk render thread info twice.";
     }
     tlThreadInfo = this;
-    mMagmaDec = gfxstream::magma::Decoder::create(context_id);
 }
 
-RenderThreadInfoMagma::~RenderThreadInfoMagma() {
-    tlThreadInfo = nullptr;
-}
+RenderThreadInfoVk::~RenderThreadInfoVk() { tlThreadInfo = nullptr; }
 
-RenderThreadInfoMagma* RenderThreadInfoMagma::get() {
-    return tlThreadInfo;
-}
+RenderThreadInfoVk* RenderThreadInfoVk::get() { return tlThreadInfo; }
+
+}  // namespace vk
+}  // namespace gfxstream
