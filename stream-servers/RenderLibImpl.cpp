@@ -27,7 +27,7 @@
 #include "host-common/opengl/misc.h"
 #include "host-common/sync_device.h"
 
-namespace emugl {
+namespace gfxstream {
 
 void RenderLibImpl::setRenderer(SelectedRenderer renderer) {
     emugl::setRenderer(renderer);
@@ -66,17 +66,17 @@ void RenderLibImpl::setSyncDevice
      emugl_sync_destroy_timeline_t destroy_timeline,
      emugl_sync_register_trigger_wait_t register_trigger_wait,
      emugl_sync_device_exists_t device_exists) {
-    set_emugl_sync_create_timeline(create_timeline);
-    set_emugl_sync_create_fence(create_fence);
-    set_emugl_sync_timeline_inc(timeline_inc);
-    set_emugl_sync_destroy_timeline(destroy_timeline);
-    set_emugl_sync_register_trigger_wait(register_trigger_wait);
-    set_emugl_sync_device_exists(device_exists);
+    emugl::set_emugl_sync_create_timeline(create_timeline);
+    emugl::set_emugl_sync_create_fence(create_fence);
+    emugl::set_emugl_sync_timeline_inc(timeline_inc);
+    emugl::set_emugl_sync_destroy_timeline(destroy_timeline);
+    emugl::set_emugl_sync_register_trigger_wait(register_trigger_wait);
+    emugl::set_emugl_sync_device_exists(device_exists);
 }
 
 void RenderLibImpl::setDmaOps(emugl_dma_ops ops) {
-    set_emugl_dma_get_host_addr(ops.get_host_addr);
-    set_emugl_dma_unlock(ops.unlock);
+    emugl::set_emugl_dma_get_host_addr(ops.get_host_addr);
+    emugl::set_emugl_dma_unlock(ops.unlock);
 }
 
 void RenderLibImpl::setVmOps(const QAndroidVmOperations &vm_operations) {
@@ -89,8 +89,8 @@ void RenderLibImpl::setAddressSpaceDeviceControlOps(struct address_space_device_
 
 void RenderLibImpl::setWindowOps(const QAndroidEmulatorWindowAgent &window_operations,
                                  const QAndroidMultiDisplayAgent &multi_display_operations) {
-    set_emugl_window_operations(window_operations);
-    set_emugl_multi_display_operations(multi_display_operations);
+    emugl::set_emugl_window_operations(window_operations);
+    emugl::set_emugl_multi_display_operations(multi_display_operations);
 }
 
 void RenderLibImpl::setUsageTracker(android::base::CpuUsage* cpuUsage,
@@ -102,14 +102,6 @@ void RenderLibImpl::setUsageTracker(android::base::CpuUsage* cpuUsage,
 void RenderLibImpl::setGrallocImplementation(GrallocImplementation gralloc) {
     // TODO(joshuaduong): need a full CP of go/oag/1950399
     (void) gralloc;
-}
-
-void* RenderLibImpl::getGLESv2Dispatch(void) {
-    return &s_gles2;
-}
-
-void* RenderLibImpl::getEGLDispatch(void) {
-    return &s_egl;
 }
 
 bool RenderLibImpl::getOpt(RenderOpt* opt) {
@@ -149,4 +141,4 @@ OnLastColorBufferRef RenderLibImpl::getOnLastColorBufferRef() {
     return (OnLastColorBufferRef)impl_onLastCbRef;
 }
 
-}  // namespace emugl
+}  // namespace gfxstream

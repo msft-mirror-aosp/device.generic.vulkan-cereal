@@ -28,7 +28,7 @@
 #include "host-common/logging.h"
 #include "snapshot/common.h"
 
-namespace emugl {
+namespace gfxstream {
 
 // kUseSubwindowThread is used to determine whether the RenderWindow should use
 // a separate thread to manage its subwindow GL/GLES context.
@@ -368,7 +368,7 @@ bool RendererImpl::load(android::base::Stream* stream,
     bool res = true;
 
     res = fb->onLoad(stream, textureLoader);
-    gfxstream::EmulatedEglFenceSync::onLoad(stream);
+    gl::EmulatedEglFenceSync::onLoad(stream);
 
     return res;
 }
@@ -688,4 +688,12 @@ void RendererImpl::setDisplayActiveConfig(int configId) {
     }
 }
 
-}  // namespace emugl
+const void* RendererImpl::getEglDispatch() {
+    return FrameBuffer::getFB()->getEglDispatch();
+}
+
+const void* RendererImpl::getGles2Dispatch() {
+    return FrameBuffer::getFB()->getGles2Dispatch();
+}
+
+}  // namespace gfxstream

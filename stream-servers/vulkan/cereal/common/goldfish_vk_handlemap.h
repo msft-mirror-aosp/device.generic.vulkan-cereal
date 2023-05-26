@@ -36,7 +36,9 @@
 #include "vk_android_native_buffer.h"
 #include "vulkan_gfxstream.h"
 
-namespace goldfish_vk {
+namespace gfxstream {
+namespace vk {
+
 #ifdef VK_VERSION_1_0
 void handlemap_VkExtent2D(VulkanHandleMapping* handlemap, VkExtent2D* toMap);
 
@@ -2877,8 +2879,7 @@ void handlemap_VkImportColorBufferGOOGLE(VulkanHandleMapping* handlemap,
 
 void handlemap_VkImportBufferGOOGLE(VulkanHandleMapping* handlemap, VkImportBufferGOOGLE* toMap);
 
-void handlemap_VkImportPhysicalAddressGOOGLE(VulkanHandleMapping* handlemap,
-                                             VkImportPhysicalAddressGOOGLE* toMap);
+void handlemap_VkCreateBlobGOOGLE(VulkanHandleMapping* handlemap, VkCreateBlobGOOGLE* toMap);
 
 #endif
 #ifdef VK_EXT_global_priority_query
@@ -3002,4 +3003,5 @@ void handlemap_VkPhysicalDeviceRayQueryFeaturesKHR(VulkanHandleMapping* handlema
 
 #endif
 
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream

@@ -36,7 +36,8 @@
 #include "goldfish_vk_extension_structs.h"
 #include "goldfish_vk_private_defs.h"
 
-namespace goldfish_vk {
+namespace gfxstream {
+namespace vk {
 
 void handlemap_extension_struct(VulkanHandleMapping* handlemap, void* structExtension_out);
 
@@ -7794,8 +7795,7 @@ void handlemap_VkImportBufferGOOGLE(VulkanHandleMapping* handlemap, VkImportBuff
     }
 }
 
-void handlemap_VkImportPhysicalAddressGOOGLE(VulkanHandleMapping* handlemap,
-                                             VkImportPhysicalAddressGOOGLE* toMap) {
+void handlemap_VkCreateBlobGOOGLE(VulkanHandleMapping* handlemap, VkCreateBlobGOOGLE* toMap) {
     (void)handlemap;
     (void)toMap;
     if (toMap->pNext) {
@@ -10484,9 +10484,9 @@ void handlemap_extension_struct(VulkanHandleMapping* handlemap, void* structExte
                 handlemap, reinterpret_cast<VkImportBufferGOOGLE*>(structExtension_out));
             break;
         }
-        case VK_STRUCTURE_TYPE_IMPORT_PHYSICAL_ADDRESS_GOOGLE: {
-            handlemap_VkImportPhysicalAddressGOOGLE(
-                handlemap, reinterpret_cast<VkImportPhysicalAddressGOOGLE*>(structExtension_out));
+        case VK_STRUCTURE_TYPE_CREATE_BLOB_GOOGLE: {
+            handlemap_VkCreateBlobGOOGLE(
+                handlemap, reinterpret_cast<VkCreateBlobGOOGLE*>(structExtension_out));
             break;
         }
 #endif
@@ -10588,4 +10588,5 @@ void handlemap_extension_struct(VulkanHandleMapping* handlemap, void* structExte
     }
 }
 
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream

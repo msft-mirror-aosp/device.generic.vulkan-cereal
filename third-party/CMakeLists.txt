@@ -20,8 +20,6 @@ endif ()
 add_subdirectory(renderdoc)
 add_subdirectory(stb)
 
-set(PROJECT_TO_FETCH)
-
 if(ENABLE_VKCEREAL_TESTS)
     set(AEMU_BASE_USE_LZ4 ON CACHE BOOL "" FORCE)
 endif()
@@ -47,7 +45,7 @@ if(NOT TARGET lz4_static AND AEMU_BASE_USE_LZ4)
             GIT_PROGRESS TRUE
             SOURCE_SUBDIR build/cmake
         )
-        list(APPEND PROJECT_TO_FETCH lz4)
+        FetchContent_MakeAvailable(lz4)
     endif()
 endif()
 
@@ -78,7 +76,7 @@ if(NOT TARGET gtest_main AND ENABLE_VKCEREAL_TESTS)
             GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
             GIT_PROGRESS TRUE
         )
-        list(APPEND PROJECT_TO_FETCH googletest)
+        FetchContent_MakeAvailable(googletest)
     endif()
 endif()
 
@@ -127,10 +125,13 @@ if(NOT TARGET aemu_common)
             INTERFACE
             PkgConfig::aemu_base
             logging-base
-            lz4_static
-            perfetto-tracing-only
             ${aemu-base-platform-deps})
-
+        if(TARGET lz4_static)
+            target_link_libraries(aemu-base INTERFACE lz4_static)
+        endif()
+        if(TARGET perfetto-tracing-only)
+            target_link_libraries(aemu-base INTERFACE perfetto-tracing-only)
+        endif()
         add_library(aemu-host-common INTERFACE)
         target_link_libraries(aemu-host-common INTERFACE PkgConfig::aemu_host_common aemu-base)
 
@@ -151,10 +152,15 @@ if(NOT TARGET aemu_common)
             PkgConfig::aemu_host_common
             PkgConfig::aemu_base
             PkgConfig::logging_base
-            lz4_static
-            perfetto-tracing-only
             gmock
             gtest)
+        if(TARGET lz4_static)
+            target_link_libraries(aemu-host-common-testing-support INTERFACE lz4_static)
+        endif()
+
+        if(TARGET perfetto-tracing-only)
+            target_link_libraries(aemu-host-common-testing-support INTERFACE perfetto-tracing-only)
+        endif()
         add_library(aemu_common INTERFACE)
         target_link_libraries(aemu_common INTERFACE aemu-base aemu-host-common)
         target_include_directories(aemu_common INTERFACE aemu-base.headers aemu-host-common.headers)
@@ -167,7 +173,7 @@ if(NOT TARGET aemu_common)
             GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
             GIT_PROGRESS TRUE
         )
-        list(APPEND PROJECT_TO_FETCH aemu_common)
+        FetchContent_MakeAvailable(aemu_common)
     endif()
 endif()
 
@@ -192,7 +198,7 @@ if(NOT TARGET gfxstream_vulkan_headers)
             GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
             GIT_PROGRESS TRUE
         )
-        list(APPEND PROJECT_TO_FETCH gfxstream_protocols)
+        FetchContent_MakeAvailable(gfxstream_protocols)
     endif()
 endif()
 
@@ -221,7 +227,7 @@ if(NOT TARGET flatbuffers)
             GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
             GIT_PROGRESS TRUE
         )
-        list(APPEND PROJECT_TO_FETCH flatbuffers)
+        FetchContent_MakeAvailable(flatbuffers)
     endif()
 endif()
 
@@ -246,7 +252,7 @@ if(NOT TARGET gfxstream_egl_headers)
             GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
             GIT_PROGRESS TRUE
         )
-        list(APPEND PROJECT_TO_FETCH egl)
+        FetchContent_MakeAvailable(egl)
         add_library(gfxstream_egl_headers INTERFACE)
         target_include_directories(gfxstream_egl_headers INTERFACE ${egl_SOURCE_DIR}/api)
     endif()
@@ -272,12 +278,8 @@ if(WITH_BENCHMARK)
             GIT_TAG v1.7.0
             GIT_PROGRESS TRUE
         )
-        list(APPEND PROJECT_TO_FETCH google_benchmark)
+        FetchContent_MakeAvailable(google_benchmark)
     endif()
-endif()
-
-if(PROJECT_TO_FETCH)
-    FetchContent_MakeAvailable(${PROJECT_TO_FETCH})
 endif()
 
 if(NOT TARGET aemu_common)
