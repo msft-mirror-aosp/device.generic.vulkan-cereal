@@ -30,7 +30,7 @@ namespace android_studio {
 class EmulatorGLESUsages;
 }
 
-namespace emugl {
+namespace gfxstream {
 
 typedef struct {
     int x, y;
@@ -313,10 +313,14 @@ public:
     virtual void setVsyncHz(int vsyncHz) = 0;
     virtual void setDisplayConfigs(int configId, int w, int h, int dpiX, int dpiY) = 0;
     virtual void setDisplayActiveConfig(int configId) = 0;
+
+    virtual const void* getEglDispatch() = 0;
+    virtual const void* getGles2Dispatch() = 0;
+
 protected:
     ~Renderer() = default;
 };
 
 using RendererPtr = std::shared_ptr<Renderer>;
 
-}  // namespace emugl
+}  // namespace gfxstream

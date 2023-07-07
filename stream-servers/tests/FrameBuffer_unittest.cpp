@@ -43,12 +43,17 @@
 #include "X11TestingSupport.h"
 #endif
 
+namespace gfxstream {
+namespace {
+
 using android::base::StdioStream;
 using android::snapshot::TextureLoader;
 using android::snapshot::TextureSaver;
-using gfxstream::GLESApi_3_0;
-
-namespace emugl {
+using gl::EGLDispatch;
+using gl::EmulatedEglConfigList;
+using gl::GLESApi_3_0;
+using gl::LazyLoadedEGLDispatch;
+using gl::LazyLoadedGLESv2Dispatch;
 
 class FrameBufferTest : public ::testing::Test {
 public:
@@ -553,25 +558,6 @@ TEST_F(FrameBufferTest, SnapshotFastBlitRestore) {
     mFb->closeColorBuffer(handle);
 }
 
-// Tests the API to completely replace a ColorBuffer.
-TEST_F(FrameBufferTest, ReplaceContentsTest) {
-    HandleType handle =
-        mFb->createColorBuffer(mWidth, mHeight, GL_RGBA, FRAMEWORK_FORMAT_GL_COMPATIBLE);
-
-    EXPECT_NE(0, handle);
-    EXPECT_EQ(0, mFb->openColorBuffer(handle));
-
-    TestTexture forUpdate = createTestPatternRGBA8888(mWidth, mHeight);
-    mFb->replaceColorBufferContents(handle, forUpdate.data(), mWidth * mHeight * 4);
-
-    TestTexture forRead = createTestTextureRGBA8888SingleColor(mWidth, mHeight, 0.0f, 0.0f, 0.0f, 0.0f);
-    mFb->readColorBuffer(handle, 0, 0, mWidth, mHeight, GL_RGBA, GL_UNSIGNED_BYTE, forRead.data());
-
-    EXPECT_TRUE(ImageMatches(mWidth, mHeight, 4, mWidth, forUpdate.data(), forRead.data()));
-
-    mFb->closeColorBuffer(handle);
-}
-
 // Tests rate of draw calls with no guest/host communication, but with translator.
 static constexpr uint32_t kDrawCallLimit = 50000;
 
@@ -1000,4 +986,6 @@ TEST_F(FrameBufferTest, PixmapImport_Blit) {
     freeNativePixmap(pixmap);
 }
 #endif
-}  // namespace emugl
+
+}  // namespace
+}  // namespace gfxstream

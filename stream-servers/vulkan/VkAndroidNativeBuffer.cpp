@@ -27,6 +27,9 @@
 #include "stream-servers/FrameBuffer.h"
 #include "vulkan/vk_enum_string_helper.h"
 
+namespace gfxstream {
+namespace vk {
+
 #define VK_ANB_ERR(fmt, ...) fprintf(stderr, "%s:%d " fmt "\n", __func__, __LINE__, ##__VA_ARGS__);
 
 #define ENABLE_VK_ANB_DEBUG 0
@@ -45,8 +48,6 @@ using android::base::AutoLock;
 using android::base::Lock;
 using emugl::ABORT_REASON_OTHER;
 using emugl::FatalError;
-
-namespace goldfish_vk {
 
 AndroidNativeBufferInfo::QsriWaitFencePool::QsriWaitFencePool(VulkanDispatch* vk, VkDevice device)
     : mVk(vk), mDevice(device) {}
@@ -746,7 +747,7 @@ VkResult syncImageToColorBuffer(VulkanDispatch* vk, uint32_t queueFamilyIndex, V
     // TODO(kaiyili): initiate ownership transfer to DisplayVk here.
     VkFence qsriFence = anbInfo->qsriWaitFencePool->getFenceFromPool();
     AutoLock qLock(*queueLock);
-    vk->vkQueueSubmit(queueState.queue, 1, &submitInfo, qsriFence);
+    VK_CHECK(vk->vkQueueSubmit(queueState.queue, 1, &submitInfo, qsriFence));
     auto waitForQsriFenceTask = [anbInfoPtr, anbInfo, vk, device = anbInfo->device, qsriFence] {
         (void)anbInfoPtr;
         VK_ANB_DEBUG_OBJ(anbInfoPtr, "wait callback: enter");
@@ -805,7 +806,7 @@ VkResult syncImageToColorBuffer(VulkanDispatch* vk, uint32_t queueFamilyIndex, V
                 break;
         }
 
-        FrameBuffer::getFB()->replaceColorBufferContents(
+        FrameBuffer::getFB()->flushColorBufferFromVkBytes(
             colorBufferHandle, anbInfo->mappedStagingPtr,
             bpp * anbInfo->extent.width * anbInfo->extent.height);
         anbInfo->qsriTimeline->signalNextPresentAndPoll();
@@ -814,4 +815,5 @@ VkResult syncImageToColorBuffer(VulkanDispatch* vk, uint32_t queueFamilyIndex, V
     return VK_SUCCESS;
 }
 
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream

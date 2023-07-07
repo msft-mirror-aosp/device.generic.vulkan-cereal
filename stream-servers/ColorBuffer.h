@@ -26,22 +26,29 @@
 #include "snapshot/LazySnapshotObj.h"
 
 namespace gfxstream {
+namespace gl {
 class EmulationGl;
-class ColorBufferVk;
+}  // namespace gl
 }  // namespace gfxstream
-namespace goldfish_vk {
+
+namespace gfxstream {
+namespace vk {
+class ColorBufferVk;
 struct VkEmulation;
-}  // namespace goldfish_vk
+}  // namespace vk
+}  // namespace gfxstream
+
+namespace gfxstream {
 
 class ColorBuffer : public android::snapshot::LazySnapshotObj<ColorBuffer> {
    public:
-    static std::shared_ptr<ColorBuffer> create(gfxstream::EmulationGl* emulationGl,
-                                               goldfish_vk::VkEmulation* emulationVk,
-                                               uint32_t width, uint32_t height, GLenum format,
+    static std::shared_ptr<ColorBuffer> create(gl::EmulationGl* emulationGl,
+                                               vk::VkEmulation* emulationVk, uint32_t width,
+                                               uint32_t height, GLenum format,
                                                FrameworkFormat frameworkFormat, HandleType handle);
 
-    static std::shared_ptr<ColorBuffer> onLoad(gfxstream::EmulationGl* emulationGl,
-                                               goldfish_vk::VkEmulation* emulationVk,
+    static std::shared_ptr<ColorBuffer> onLoad(gl::EmulationGl* emulationGl,
+                                               vk::VkEmulation* emulationVk,
                                                android::base::Stream* stream);
     void onSave(android::base::Stream* stream);
     void restore();
@@ -55,8 +62,7 @@ class ColorBuffer : public android::snapshot::LazySnapshotObj<ColorBuffer> {
     void readToBytes(int x, int y, int width, int height, GLenum pixelsFormat, GLenum pixelsType,
                      void* outPixels);
     void readToBytesScaled(int pixelsWidth, int pixelsHeight, GLenum pixelsFormat,
-                           GLenum pixelsType, int pixelsRotation, emugl::Rect rect,
-                           void* outPixels);
+                           GLenum pixelsType, int pixelsRotation, Rect rect, void* outPixels);
     void readYuvToBytes(int x, int y, int width, int height, void* outPixels, uint32_t pixelsSize);
 
     bool updateFromBytes(int x, int y, int width, int height, GLenum pixelsFormat,
@@ -72,8 +78,11 @@ class ColorBuffer : public android::snapshot::LazySnapshotObj<ColorBuffer> {
     std::unique_ptr<BorrowedImageInfo> borrowForComposition(UsedApi api, bool isTarget);
     std::unique_ptr<BorrowedImageInfo> borrowForDisplay(UsedApi api);
 
-    void updateFromGl();
-    void updateFromVk();
+    bool flushFromGl();
+    bool flushFromVk();
+    bool flushFromVkBytes(const void* bytes, size_t bytesSize);
+    bool invalidateForGl();
+    bool invalidateForVk();
 
     GLuint glOpGetTexture();
     bool glOpBlitFromCurrentReadBuffer();
@@ -87,7 +96,6 @@ class ColorBuffer : public android::snapshot::LazySnapshotObj<ColorBuffer> {
     void glOpSwapYuvTexturesAndUpdate(GLenum format, GLenum type, FrameworkFormat frameworkFormat,
                                       GLuint* textures);
     bool glOpReadContents(size_t* outNumBytes, void* outContents);
-    bool glOpReplaceContents(size_t numBytes, const void* contents);
     bool glOpIsFastBlitSupported() const;
     void glOpPostLayer(const ComposeLayer& l, int frameWidth, int frameHeight);
     void glOpPostViewportScaledWithOverlay(float rotation, float dx, float dy);
@@ -103,10 +111,10 @@ class ColorBuffer : public android::snapshot::LazySnapshotObj<ColorBuffer> {
     const FrameworkFormat mFrameworkFormat;
 
     // If GL emulation is enabled.
-    std::unique_ptr<gfxstream::ColorBufferGl> mColorBufferGl;
+    std::unique_ptr<gl::ColorBufferGl> mColorBufferGl;
 
     // If Vk emulation is enabled.
-    std::unique_ptr<gfxstream::ColorBufferVk> mColorBufferVk;
+    std::unique_ptr<vk::ColorBufferVk> mColorBufferVk;
 
     bool mGlAndVkAreSharingExternalMemory = false;
 };
@@ -129,3 +137,5 @@ struct ColorBufferRef {
 
 typedef std::unordered_map<HandleType, ColorBufferRef> ColorBufferMap;
 typedef std::unordered_multiset<HandleType> ColorBufferSet;
+
+}  // namespace gfxstream

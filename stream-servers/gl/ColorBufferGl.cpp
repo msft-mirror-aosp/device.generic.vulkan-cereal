@@ -36,11 +36,9 @@
 using android::base::ManagedDescriptor;
 using emugl::ABORT_REASON_OTHER;
 using emugl::FatalError;
-using gfxstream::GLESApi;
-using gfxstream::GLESApi_CM;
-using gfxstream::GLESApi_2;
 
 namespace gfxstream {
+namespace gl {
 namespace {
 
 // Lazily create and bind a framebuffer object to the current host context.
@@ -63,6 +61,7 @@ bool bindFbo(GLuint* fbo, GLuint tex, bool ensureTextureAttached) {
     s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
     s_gles2.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0_OES,
                                    GL_TEXTURE_2D, tex, 0);
+
 #if DEBUG_CB_FBO
     GLenum status = s_gles2.glCheckFramebufferStatus(GL_FRAMEBUFFER);
     if (status != GL_FRAMEBUFFER_COMPLETE_OES) {
@@ -392,7 +391,7 @@ void ColorBufferGl::readPixels(int x, int y, int width, int height, GLenum p_for
 }
 
 void ColorBufferGl::readPixelsScaled(int width, int height, GLenum p_format, GLenum p_type,
-                                     int rotation, emugl::Rect rect, void* pixels) {
+                                     int rotation, Rect rect, void* pixels) {
     RecursiveScopedContextBind context(m_helper);
     if (!context.isOk()) {
         return;
@@ -433,6 +432,8 @@ void ColorBufferGl::readPixelsScaled(int width, int height, GLenum p_format, GLe
         if (useSnipping) {
             s_gles2.glReadPixels(rect.pos.x, rect.pos.y, rect.size.w,
                                  rect.size.h, p_format, p_type, readPixelsDst);
+            width = rect.size.w;
+            height = rect.size.h;
         } else {
             s_gles2.glReadPixels(0, 0, width, height, p_format, p_type,
                                  readPixelsDst);
@@ -1031,6 +1032,12 @@ bool ColorBufferGl::importMemory(ManagedDescriptor externalDescriptor, uint64_t 
     readContents(&bytes, prevContents.data());
 
     s_gles2.glDeleteTextures(1, &m_tex);
+    s_gles2.glDeleteFramebuffers(1, &m_fbo);
+    m_fbo = 0;
+    s_gles2.glDeleteFramebuffers(1, &m_scaleRotationFbo);
+    m_scaleRotationFbo = 0;
+    s_gles2.glDeleteFramebuffers(1, &m_yuv_conversion_fbo);
+    m_yuv_conversion_fbo = 0;
     s_egl.eglDestroyImageKHR(m_display, m_eglImage);
 
     s_gles2.glGenTextures(1, &m_tex);
@@ -1154,4 +1161,5 @@ std::unique_ptr<BorrowedImageInfo> ColorBufferGl::getBorrowedImageInfo() {
     return info;
 }
 
+}  // namespace gl
 }  // namespace gfxstream
