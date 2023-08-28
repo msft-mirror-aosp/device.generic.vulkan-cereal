@@ -9854,10 +9854,10 @@ void checkEqual_VkNativeBufferANDROID(const VkNativeBufferANDROID* a,
     if (!((a->usage) == (b->usage))) {
         onFail("a->usage (Error: Value not equal)");
     };
-    if (!((a->consumer) == (b->consumer))) {
+    if (!((a->usage2.consumer) == (b->usage2.consumer))) {
         onFail("a->consumer (Error: Value not equal)");
     };
-    if (!((a->producer) == (b->producer))) {
+    if (!((a->usage2.producer) == (b->usage2.producer))) {
         onFail("a->producer (Error: Value not equal)");
     };
 }
