@@ -17409,8 +17409,8 @@ void marshal_VkNativeBufferANDROID(VulkanStream* vkStream, VkStructureType rootT
     vkStream->write((int*)&forMarshaling->stride, sizeof(int));
     vkStream->write((int*)&forMarshaling->format, sizeof(int));
     vkStream->write((int*)&forMarshaling->usage, sizeof(int));
-    vkStream->write((uint64_t*)&forMarshaling->consumer, sizeof(uint64_t));
-    vkStream->write((uint64_t*)&forMarshaling->producer, sizeof(uint64_t));
+    vkStream->write((uint64_t*)&forMarshaling->usage2.consumer, sizeof(uint64_t));
+    vkStream->write((uint64_t*)&forMarshaling->usage2.producer, sizeof(uint64_t));
 }
 
 void unmarshal_VkNativeBufferANDROID(VulkanStream* vkStream, VkStructureType rootType,
@@ -17442,8 +17442,8 @@ void unmarshal_VkNativeBufferANDROID(VulkanStream* vkStream, VkStructureType roo
     vkStream->read((int*)&forUnmarshaling->stride, sizeof(int));
     vkStream->read((int*)&forUnmarshaling->format, sizeof(int));
     vkStream->read((int*)&forUnmarshaling->usage, sizeof(int));
-    vkStream->read((uint64_t*)&forUnmarshaling->consumer, sizeof(uint64_t));
-    vkStream->read((uint64_t*)&forUnmarshaling->producer, sizeof(uint64_t));
+    vkStream->read((uint64_t*)&forUnmarshaling->usage2.consumer, sizeof(uint64_t));
+    vkStream->read((uint64_t*)&forUnmarshaling->usage2.producer, sizeof(uint64_t));
 }
 
 #endif

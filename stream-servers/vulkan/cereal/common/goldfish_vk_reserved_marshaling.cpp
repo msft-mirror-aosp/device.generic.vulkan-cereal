@@ -13555,9 +13555,9 @@ void reservedunmarshal_VkNativeBufferANDROID(VulkanStream* vkStream, VkStructure
     *ptr += sizeof(int);
     memcpy((int*)&forUnmarshaling->usage, *ptr, sizeof(int));
     *ptr += sizeof(int);
-    memcpy((uint64_t*)&forUnmarshaling->consumer, *ptr, sizeof(uint64_t));
+    memcpy((uint64_t*)&forUnmarshaling->usage2.consumer, *ptr, sizeof(uint64_t));
     *ptr += sizeof(uint64_t);
-    memcpy((uint64_t*)&forUnmarshaling->producer, *ptr, sizeof(uint64_t));
+    memcpy((uint64_t*)&forUnmarshaling->usage2.producer, *ptr, sizeof(uint64_t));
     *ptr += sizeof(uint64_t);
 }
 
